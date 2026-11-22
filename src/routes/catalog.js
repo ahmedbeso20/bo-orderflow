@@ -193,6 +193,172 @@ module.exports = (r, { q, model, cfg, limiter }) => {
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="omniarab-products.csv"', 'Cache-Control': 'no-store' });
     res.end(toCsv(rows));
   });
+
+  /** محلل CSV قياسي (RFC 4180) يدعم UTF-8 BOM والاقتباسات والفواصل داخل النص */
+  function parseCsvRows(csvText) {
+    const src = String(csvText || '').replace(/^\uFEFF/, '');
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (inQuotes) {
+        if (ch === '"' && src[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else if (ch === '"') {
+          inQuotes = false;
+        } else {
+          field += ch;
+        }
+      } else if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        row.push(field.trim());
+        field = '';
+      } else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && src[i + 1] === '\n') i++;
+        row.push(field.trim());
+        if (row.some((cell) => cell !== '')) rows.push(row);
+        row = [];
+        field = '';
+      } else {
+        field += ch;
+      }
+    }
+    row.push(field.trim());
+    if (row.some((cell) => cell !== '')) rows.push(row);
+    return rows;
+  }
+
+  function normalizeMarketTokens(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return 'a';
+    const set = new Set();
+    const lower = s.toLowerCase();
+    if (/أمازون|امازون|amazon/.test(lower)) set.add('a');
+    if (/نون|noon/.test(lower)) set.add('n');
+    if (/جوميا|jumia/.test(lower)) set.add('j');
+    if (/ترينديول|trendyol/.test(lower)) set.add('t');
+    if (/كنز|kenzz/.test(lower)) set.add('k');
+    if (!set.size) {
+      for (const ch of lower.replace(/[^anjtk]/g, '')) set.add(ch);
+    }
+    const out = Object.keys(MARKETS).filter((k) => set.has(k)).join('');
+    return out || 'a';
+  }
+
+  const HEADER_ALIASES = {
+    name: ['name', 'title', 'product', 'المنتج', 'اسم المنتج', 'الاسم', 'اسم'],
+    sku: ['sku', 'code', 'كود', 'كود sku', 'رمز المنتج'],
+    cat: ['cat', 'category', 'الفئة', 'التصنيف'],
+    markets: ['markets', 'market', 'channels', 'الأسواق', 'الاسواق', 'المنصات'],
+    cost: ['cost', 'buy_price', 'التكلفة', 'تكلفة الشراء'],
+    price: ['price', 'sale_price', 'السعر', 'سعر البيع'],
+    stock: ['stock', 'qty', 'quantity', 'المخزون', 'الكمية'],
+    image: ['image', 'image_url', 'الصورة']
+  };
+
+  function mapHeaderKey(h) {
+    const norm = String(h || '').trim().toLowerCase();
+    for (const [key, list] of Object.entries(HEADER_ALIASES)) {
+      if (list.includes(norm)) return key;
+    }
+    return null;
+  }
+
+  // استيراد وتحديث المنتجات بالجملة عبر CSV مع احترام حد الباقة والتحقق من كل صف
+  r.post('/api/products/import', ({ user, body }) => {
+    let rawItems = [];
+    if (typeof body.csv === 'string' && body.csv.trim()) {
+      const parsed = parseCsvRows(body.csv);
+      if (parsed.length < 2) throw bad('ملف CSV يجب أن يحتوي على صف العناوين وصف منتج واحد على الأقل');
+      const headers = parsed[0].map(mapHeaderKey);
+      if (!headers.includes('name') || !headers.includes('sku') || !headers.includes('price')) {
+        throw bad('يجب أن يحتوي ملف CSV على أعمدة: المنتج (name)، SKU (sku)، السعر (price)');
+      }
+      for (let i = 1; i < parsed.length; i++) {
+        const obj = { __row: i + 1 };
+        headers.forEach((key, idx) => {
+          if (key) obj[key] = parsed[i][idx] ?? '';
+        });
+        rawItems.push(obj);
+      }
+    } else if (Array.isArray(body.rows)) {
+      rawItems = body.rows.map((rItem, idx) => ({ ...(rItem || {}), __row: idx + 1 }));
+    } else {
+      throw bad('أرسل محتوى CSV في حقل csv أو مصفوفة منتجات في حقل rows');
+    }
+
+    if (!rawItems.length) throw bad('لا توجد صفوف منتجات للاستيراد');
+    if (rawItems.length > 500) throw bad('الحد الأقصى للاستيراد في الدفعة الواحدة هو ٥٠٠ منتج');
+
+    const plan = model.planOf(user);
+    let currentCount = q('SELECT COUNT(*) n FROM products WHERE user_id = ?').get(user.id).n;
+    const now = nowIso();
+    const approvalStatus = user.role === 'owner' ? 'approved' : 'pending';
+
+    let imported = 0;
+    let updated = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const item of rawItems) {
+      const rowNo = item.__row;
+      try {
+        const normalized = {
+          name: item.name,
+          sku: item.sku,
+          cat: item.cat || 'عام',
+          markets: normalizeMarketTokens(item.markets),
+          price: item.price,
+          cost: item.cost === '' || item.cost === undefined ? 0 : item.cost,
+          stock: item.stock === '' || item.stock === undefined ? 0 : item.stock,
+          image: item.image || ''
+        };
+        const p = read(normalized, false);
+        const existing = q('SELECT id FROM products WHERE user_id = ? AND sku = ?').get(user.id, p.sku);
+        if (existing) {
+          q('UPDATE products SET name = ?, cat = ?, markets = ?, price = ?, cost = ?, stock = ?, image = COALESCE(NULLIF(?, \'\'), image), updated_at = ? WHERE id = ? AND user_id = ?')
+            .run(p.name, p.cat, p.markets, p.price, p.cost, p.stock, p.image, now, existing.id, user.id);
+          updated++;
+        } else {
+          if (plan.limit != null && currentCount >= plan.limit) {
+            skipped++;
+            errors.push({
+              row: rowNo,
+              sku: p.sku,
+              error: `وصلت للحد الأقصى (${plan.limit} منتج) في ${plan.name}`
+            });
+            continue;
+          }
+          q('INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,reject_reason,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+            .run(user.id, p.name, p.sku, p.cat, p.markets, p.price, p.cost, p.stock, p.image, approvalStatus, '', now, now);
+          currentCount++;
+          imported++;
+        }
+      } catch (err) {
+        skipped++;
+        errors.push({
+          row: rowNo,
+          sku: String(item.sku || '').slice(0, 40),
+          error: err instanceof HttpError ? err.message : 'بيانات الصف غير صالحة'
+        });
+      }
+    }
+
+    return {
+      ok: true,
+      imported,
+      updated,
+      skipped,
+      totalRows: rawItems.length,
+      errors,
+      products: model.productsOf(user.id),
+      ...model.meta(user)
+    };
+  });
 };
 
 

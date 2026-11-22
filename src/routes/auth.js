@@ -36,6 +36,12 @@ module.exports = (r, app) => {
   app.issueOneTimeToken = issueOneTimeToken;
   app.consumeOneTimeToken = consumeOneTimeToken;
 
+  // فحص صامت لحالة الجلسة عبر كوكي HttpOnly بدون أخطاء 401 في الصفحات العامة
+  r.get('/api/auth/session', ({ req }) => {
+    const uid = session.read(req);
+    return { authenticated: Boolean(uid) };
+  }, { auth: false });
+
   // تسجيل حساب عميل جديد — يُحفظ تلقائيًا بحالة قيد المراجعة (pending) ولا يُمنح جلسة دخول حتى تتم الموافقة
   r.post('/api/auth/register', async ({ body, res, ip }) => {
     if (!limiter.hit(`reg:${ip}`, 15, 3600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول لاحقًا');
@@ -266,9 +272,9 @@ module.exports = (r, app) => {
     }
     const id = tx(() => {
       const tag = crypto.randomBytes(6).toString('hex');
-      const info = q(`INSERT INTO users (phone,pass_hash,store_name,full_name,role,status,plan,is_demo,integrations,tax_id,instapay,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(`demo-${tag}`, '!', 'متجر النور للإلكترونيات', 'متجر النور للإلكترونيات', 'client', 'active', 'pro', 1,
-        JSON.stringify({ a: 1, n: 1, j: 1, bs: 1, ar: 1, my: 0, fw: 1, vc: 1, eta: 1 }), cipher.encrypt('412-890-115'), cipher.encrypt('elnoor.store@instapay'), nowIso());
+      const info = q(`INSERT INTO users (phone,pass_hash,store_name,full_name,role,status,plan,is_demo,integrations,tax_id,tax_id_hash,instapay,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(`demo-${tag}`, '!', 'متجر النور للإلكترونيات', 'متجر النور للإلكترونيات', 'client', 'active', 'pro', 1,
+        JSON.stringify({ a: 1, n: 1, j: 1, bs: 1, ar: 1, my: 0, fw: 1, vc: 1, eta: 1 }), cipher.encrypt('412-890-115'), cipher.blindIndex('412-890-115'), cipher.encrypt('elnoor.store@instapay'), nowIso());
       seedDemo(app, Number(info.lastInsertRowid));
       return info.lastInsertRowid;
     });

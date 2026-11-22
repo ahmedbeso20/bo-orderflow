@@ -67,7 +67,26 @@ function createFieldCipher(keyMaterial) {
     }
   }
 
-  return Object.freeze({ encrypt, decrypt, isEncrypted });
+  const blindKey = deriveSubkey(key, 'blind-index-hmac-v1', 32);
+
+  function computeBlindIndex(value) {
+    return blindIndex(blindKey, value);
+  }
+
+  return Object.freeze({ encrypt, decrypt, isEncrypted, blindIndex: computeBlindIndex });
+}
+
+/** فهرس أعمى حتمي (HMAC-SHA256) يتيح البحث الدقيق عن الحقول المشفّرة مثل الرقم الضريبي دون كشف النص الصريح */
+function blindIndex(keyMaterial, value) {
+  const normalized = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\-]+/g, '');
+  if (!normalized) return '';
+  const key = Buffer.isBuffer(keyMaterial) && keyMaterial.length === 32
+    ? keyMaterial
+    : deriveSubkey(keyMaterial, 'blind-index-hmac-v1', 32);
+  return crypto.createHmac('sha256', key).update(normalized, 'utf8').digest('hex');
 }
 
 /** تنظيف كائنات JSON لمنع هجمات تلوث النموذج الأولي (Prototype Pollution) وهجمات التعشيش العميق */
@@ -124,6 +143,7 @@ module.exports = {
   ENC_PREFIX,
   deriveSubkey,
   createFieldCipher,
+  blindIndex,
   sanitizePayload,
   isWeakPassword,
   isDownloadTokenAllowedPath

@@ -107,6 +107,16 @@ module.exports = (r, app) => {
         COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) totalRevenue
       FROM plan_payments WHERE user_id IN (SELECT id FROM users WHERE is_demo = 0)`).get();
 
+    const ticketStats = q(`SELECT
+        COUNT(*) totalTickets,
+        COALESCE(SUM(status IN ('open', 'in_progress')), 0) openTickets
+      FROM support_tickets`).get();
+
+    const serviceStats = q(`SELECT
+        COUNT(*) totalServices,
+        COALESCE(SUM(status IN ('pending', 'scheduled', 'in_progress')), 0) pendingServices
+      FROM service_requests`).get();
+
     const pendingQueue = q(`SELECT u.*, r.full_name AS reviewer_name
       FROM users u LEFT JOIN users r ON r.id = u.reviewed_by
       WHERE u.role = 'client' AND u.is_demo = 0 AND u.status = 'pending'
@@ -132,7 +142,11 @@ module.exports = (r, app) => {
         totalOrders: ordStats.totalOrders,
         totalGmv: round2(ordStats.totalGmv),
         totalRevenue: round2(payStats.totalRevenue),
-        paidSubscriptions: payStats.paidCount
+        paidSubscriptions: payStats.paidCount,
+        totalTickets: ticketStats.totalTickets,
+        openTickets: ticketStats.openTickets,
+        totalServices: serviceStats.totalServices,
+        pendingServices: serviceStats.pendingServices
       },
       planBreakdown: {
         free: stats.freeCount,
@@ -276,8 +290,14 @@ module.exports = (r, app) => {
     const search = String(query.q ?? '').trim().slice(0, 60);
     if (search) {
       const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
-      where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.full_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\')`);
-      args.push(like, like, like, like);
+      const taxHash = cipher ? cipher.blindIndex(latin(search)) : '';
+      if (taxHash) {
+        where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.full_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\' OR u.tax_id_hash = ?)`);
+        args.push(like, like, like, like, taxHash);
+      } else {
+        where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.full_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\')`);
+        args.push(like, like, like, like);
+      }
     }
 
     const counts = q(`SELECT
@@ -564,5 +584,168 @@ module.exports = (r, app) => {
     q('DELETE FROM coupons WHERE id = ?').run(cur.id);
     logAudit(user.id, 'coupon.delete', 'coupon', cur.id, { code: cur.code }, ip);
     return { ok: true };
+  }, { owner: true });
+
+  // 7. إدارة تذاكر الدعم الفني ورسائل تواصل معنا (حصريًا للمالك)
+  const ticketRowOf = (t) => ({
+    id: t.id,
+    userId: t.user_id || null,
+    storeName: t.store_name || t.name,
+    name: t.name,
+    contact: t.contact,
+    subject: t.subject,
+    message: t.message,
+    status: t.status || 'open',
+    reply: t.reply || '',
+    repliedBy: t.replied_by || null,
+    repliedByName: t.replier_name || '',
+    createdAt: t.created_at,
+    updatedAt: t.updated_at || null
+  });
+
+  r.get('/api/owner/tickets', ({ query }) => {
+    const where = ['1 = 1'];
+    const args = [];
+    if (query.status && ['open', 'in_progress', 'resolved', 'closed'].includes(query.status)) {
+      where.push('t.status = ?');
+      args.push(query.status);
+    }
+    const search = String(query.q ?? '').trim().slice(0, 60);
+    if (search) {
+      const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+      where.push(`(t.name LIKE ? ESCAPE '\\' OR t.contact LIKE ? ESCAPE '\\' OR t.subject LIKE ? ESCAPE '\\' OR t.message LIKE ? ESCAPE '\\')`);
+      args.push(like, like, like, like);
+    }
+    const tickets = q(`SELECT t.*, u.store_name, rep.full_name AS replier_name
+      FROM support_tickets t
+      LEFT JOIN users u ON u.id = t.user_id
+      LEFT JOIN users rep ON rep.id = t.replied_by
+      WHERE ${where.join(' AND ')}
+      ORDER BY CASE WHEN t.status = 'open' THEN 0 WHEN t.status = 'in_progress' THEN 1 ELSE 2 END, t.id DESC
+      LIMIT 150`).all(...args).map(ticketRowOf);
+    const counts = q(`SELECT
+        COUNT(*) allCount,
+        COALESCE(SUM(status = 'open'), 0) open,
+        COALESCE(SUM(status = 'in_progress'), 0) inProgress,
+        COALESCE(SUM(status = 'resolved'), 0) resolved,
+        COALESCE(SUM(status = 'closed'), 0) closed
+      FROM support_tickets`).get();
+    return { tickets, counts };
+  }, { owner: true });
+
+  r.post('/api/owner/tickets/:id/reply', ({ user, params, body, ip }) => {
+    const id = integer(params.id, 'رقم التذكرة', { min: 1 });
+    const ticket = q('SELECT * FROM support_tickets WHERE id = ?').get(id);
+    if (!ticket) throw new HttpError(404, 'تذكرة الدعم غير موجودة');
+    const reply = text(body.reply, 'نص الرد', { min: 2, max: 2000 });
+    const status = body.status !== undefined
+      ? oneOf(body.status, ['open', 'in_progress', 'resolved', 'closed'], 'حالة التذكرة')
+      : 'resolved';
+    const now = nowIso();
+    q('UPDATE support_tickets SET reply = ?, replied_by = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(reply, user.id, status, now, ticket.id);
+    logAudit(user.id, 'ticket.reply', 'ticket', ticket.id, { subject: ticket.subject, status, userId: ticket.user_id }, ip);
+    if (ticket.user_id) {
+      notify(
+        ticket.user_id,
+        status === 'resolved' || status === 'closed' ? 'ok' : 'info',
+        `تم الرد على تذكرة الدعم #${ticket.id}`,
+        reply.slice(0, 300),
+        '#/help'
+      );
+    }
+    const fresh = q(`SELECT t.*, u.store_name, rep.full_name AS replier_name
+      FROM support_tickets t
+      LEFT JOIN users u ON u.id = t.user_id
+      LEFT JOIN users rep ON rep.id = t.replied_by
+      WHERE t.id = ?`).get(ticket.id);
+    return { ok: true, ticket: ticketRowOf(fresh) };
+  }, { owner: true });
+
+  // 8. إدارة طلبات خدمات الخبراء والاستشارات (حصريًا للمالك)
+  const serviceRowOf = (s) => ({
+    id: s.id,
+    userId: s.user_id || null,
+    refCode: s.ref_code,
+    serviceKey: s.service_key,
+    serviceTitle: s.service_title,
+    name: s.name,
+    phone: s.phone,
+    storeName: s.store_name || s.user_store_name || '',
+    platforms: s.platforms || '',
+    monthlyOrders: s.monthly_orders || '',
+    notes: s.notes || '',
+    adminNotes: s.admin_notes || '',
+    status: s.status || 'pending',
+    createdAt: s.created_at,
+    updatedAt: s.updated_at || null
+  });
+
+  r.get('/api/owner/services', ({ query }) => {
+    const where = ['1 = 1'];
+    const args = [];
+    if (query.status && ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled'].includes(query.status)) {
+      where.push('s.status = ?');
+      args.push(query.status);
+    }
+    const search = String(query.q ?? '').trim().slice(0, 60);
+    if (search) {
+      const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
+      where.push(`(s.ref_code LIKE ? ESCAPE '\\' OR s.name LIKE ? ESCAPE '\\' OR s.phone LIKE ? ESCAPE '\\' OR s.store_name LIKE ? ESCAPE '\\' OR s.service_title LIKE ? ESCAPE '\\')`);
+      args.push(like, like, like, like, like);
+    }
+    const requests = q(`SELECT s.*, u.store_name AS user_store_name
+      FROM service_requests s
+      LEFT JOIN users u ON u.id = s.user_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY CASE WHEN s.status = 'pending' THEN 0 WHEN s.status IN ('scheduled', 'in_progress') THEN 1 ELSE 2 END, s.id DESC
+      LIMIT 150`).all(...args).map(serviceRowOf);
+    const counts = q(`SELECT
+        COUNT(*) allCount,
+        COALESCE(SUM(status = 'pending'), 0) pending,
+        COALESCE(SUM(status = 'scheduled'), 0) scheduled,
+        COALESCE(SUM(status = 'in_progress'), 0) inProgress,
+        COALESCE(SUM(status = 'completed'), 0) completed,
+        COALESCE(SUM(status = 'cancelled'), 0) cancelled
+      FROM service_requests`).get();
+    return { requests, services: requests, counts };
+  }, { owner: true });
+
+  r.post('/api/owner/services/:id/status', ({ user, params, body, ip }) => {
+    const id = integer(params.id, 'رقم طلب الخدمة', { min: 1 });
+    const reqRow = q('SELECT * FROM service_requests WHERE id = ?').get(id);
+    if (!reqRow) throw new HttpError(404, 'طلب الخدمة غير موجود');
+    const status = oneOf(body.status, ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled'], 'حالة الطلب');
+    const adminNotes = body.adminNotes !== undefined || body.admin_notes !== undefined
+      ? text(body.adminNotes ?? body.admin_notes, 'ملاحظات الإدارة', { max: 1000, optional: true })
+      : (reqRow.admin_notes || '');
+    const now = nowIso();
+    q('UPDATE service_requests SET status = ?, admin_notes = ?, updated_at = ? WHERE id = ?')
+      .run(status, adminNotes, now, reqRow.id);
+    logAudit(user.id, 'service_request.status', 'service_request', reqRow.id, {
+      refCode: reqRow.ref_code,
+      serviceTitle: reqRow.service_title,
+      status,
+      adminNotes,
+      userId: reqRow.user_id
+    }, ip);
+    if (reqRow.user_id) {
+      const statusLabels = {
+        pending: 'قيد المراجعة',
+        scheduled: 'تم جدولة الموعد',
+        in_progress: 'قيد التنفيذ',
+        completed: 'مكتمل ✓',
+        cancelled: 'ملغى'
+      };
+      notify(
+        reqRow.user_id,
+        status === 'completed' ? 'ok' : (status === 'cancelled' ? 'warning' : 'info'),
+        `تحديث طلب الخدمة (${reqRow.ref_code}): ${statusLabels[status] || status}`,
+        adminNotes || `تم تحديث حالة طلب «${reqRow.service_title}» إلى ${statusLabels[status] || status}.`,
+        '#/services'
+      );
+    }
+    const fresh = q('SELECT s.*, u.store_name AS user_store_name FROM service_requests s LEFT JOIN users u ON u.id = s.user_id WHERE s.id = ?').get(reqRow.id);
+    return { ok: true, request: serviceRowOf(fresh) };
   }, { owner: true });
 };

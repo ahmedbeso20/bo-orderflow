@@ -185,13 +185,40 @@ module.exports = (r, app) => {
         if (!p) throw new HttpError(404, 'المنتج غير موجود');
         q('UPDATE products SET approval_status = ?, reject_reason = ?, updated_at = ? WHERE id = ?')
           .run(decision, reason, nowIso(), p.id);
-        logAudit(modUser.id, decision === 'approved' ? 'product.approve' : 'product.reject', 'product', p.id, { name: p.name, sku: p.sku, reason }, ip);
+        logAudit(modUser.id, decision === 'approved' ? 'product.approve' : 'product.reject', 'product', p.id, { name: p.name, sku: p.sku, userId: p.user_id, reason }, ip);
+        notify(
+          p.user_id,
+          decision === 'approved' ? 'ok' : 'warning',
+          decision === 'approved' ? `تم اعتماد منتجك «${p.name}» ✓` : `تم رفض منتجك «${p.name}»`,
+          decision === 'approved' ? 'المنتج الآن نشط ويدخل ضمن المخزون المتزامن مع الأسواق.' : `سبب الرفض: ${reason}`,
+          '#/prod'
+        );
         return { ok: true, type: 'product', item: model.productOf(q('SELECT * FROM products WHERE id = ?').get(p.id)) };
       }
       const o = q("SELECT o.* FROM orders o JOIN users u ON u.id = o.user_id WHERE o.id = ? AND u.role = 'client' AND u.is_demo = 0").get(id);
       if (!o) throw new HttpError(404, 'الطلب غير موجود');
+      const prevApproval = o.approval_status;
       q('UPDATE orders SET approval_status = ?, reject_reason = ? WHERE id = ?').run(decision, reason, o.id);
-      logAudit(modUser.id, decision === 'approved' ? 'order.approve' : 'order.reject', 'order', o.id, { no: o.no, customer: o.customer, reason }, ip);
+
+      // استعادة كميات المخزون تلقائيًا عند رفض الطلب (وخصمها مجددًا عند إعادة الاعتماد بعد الرفض)
+      if (decision === 'rejected' && prevApproval !== 'rejected' && o.status !== 3 && o.status !== 4) {
+        for (const it of q('SELECT * FROM order_items WHERE order_id = ? AND product_id IS NOT NULL').all(o.id)) {
+          q('UPDATE products SET stock = stock + ?, updated_at = ? WHERE id = ?').run(it.qty, nowIso(), it.product_id);
+        }
+      } else if (decision === 'approved' && prevApproval === 'rejected' && o.status !== 3 && o.status !== 4) {
+        for (const it of q('SELECT * FROM order_items WHERE order_id = ? AND product_id IS NOT NULL').all(o.id)) {
+          q('UPDATE products SET stock = MAX(0, stock - ?), updated_at = ? WHERE id = ?').run(it.qty, nowIso(), it.product_id);
+        }
+      }
+
+      logAudit(modUser.id, decision === 'approved' ? 'order.approve' : 'order.reject', 'order', o.id, { no: o.no, customer: o.customer, userId: o.user_id, reason }, ip);
+      notify(
+        o.user_id,
+        decision === 'approved' ? 'ok' : 'warning',
+        decision === 'approved' ? `تم اعتماد الطلب #${o.no} ✓` : `تم رفض الطلب #${o.no}`,
+        decision === 'approved' ? `الطلب الخاص بالعميل ${o.customer} معتمد وجاهز للمزامنة والشحن.` : `سبب الرفض: ${reason} — تم استرجاع كميات المخزون تلقائيًا.`,
+        '#/ord'
+      );
       return { ok: true, type: 'order', item: model.orderOf(q('SELECT * FROM orders WHERE id = ?').get(o.id)) };
     });
   };

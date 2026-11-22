@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "node --disable-warning=ExperimentalWarning server.js",
     "start": "node --disable-warning=ExperimentalWarning server.js",
-    "build": "node --check server.js && node --check public/js/app.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/api.test.js",
-    "lint": "node --check server.js && node --check public/js/app.js"
+    "build": "node --check server.js && node --check src/app.js && node --check src/mailer.js && node --check src/ai.js && node --check public/js/app.js && node --check public/js/rbac-panels.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "lint": "node --check server.js && node --check src/app.js && node --check src/mailer.js && node --check src/ai.js && node --check public/js/app.js && node --check public/js/rbac-panels.js"
   },
   "dependencies": {
     "@google/genai": "^3.6.1",

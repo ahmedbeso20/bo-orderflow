@@ -444,7 +444,18 @@ INSERT OR IGNORE INTO platform_settings (key, value, updated_at) VALUES
       linkOrder.run(cid, o.id);
     }
   }
-}];
+}, `
+-- الترحيل 9: الفهرس الأعمى للرقم الضريبي (tax_id_hash) وأعمدة الرد والمتابعة لتذاكر الدعم وطلبات خدمات الخبراء
+ALTER TABLE users ADD COLUMN tax_id_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX users_tax_id_hash ON users(tax_id_hash) WHERE tax_id_hash <> '';
+
+ALTER TABLE support_tickets ADD COLUMN reply TEXT NOT NULL DEFAULT '';
+ALTER TABLE support_tickets ADD COLUMN replied_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE support_tickets ADD COLUMN updated_at TEXT;
+
+ALTER TABLE service_requests ADD COLUMN admin_notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE service_requests ADD COLUMN updated_at TEXT;
+`];
 
 const fs = require('node:fs');
 const path = require('node:path');

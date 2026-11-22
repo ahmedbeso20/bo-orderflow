@@ -1,0 +1,22 @@
+{
+  "name": "OrderFlow — إدارة متاجر أمازون ونون وجوميا",
+  "short_name": "OrderFlow",
+  "description": "لوحة تحكم موحّدة لإدارة متاجرك على أمازون مصر ونون وجوميا وترينديول وكنز بالجنيه المصري — مخزون موحّد، أرباح حقيقية، تحصيلات COD وفواتير وذكاء اصطناعي.",
+  "dir": "rtl",
+  "lang": "ar",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#F8FAFC",
+  "theme_color": "#0C5CA4",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

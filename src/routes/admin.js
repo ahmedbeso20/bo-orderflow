@@ -128,8 +128,14 @@ module.exports = (r, app) => {
     const search = String(query.q ?? '').trim().slice(0, 60);
     if (search) {
       const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
-      where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\' OR u.tax_id LIKE ? ESCAPE '\\')`);
-      args.push(like, like, like, like);
+      const taxHash = cipher ? cipher.blindIndex(latin(search)) : '';
+      if (taxHash) {
+        where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\' OR u.tax_id_hash = ?)`);
+        args.push(like, like, like, taxHash);
+      } else {
+        where.push(`(u.store_name LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR COALESCE(u.email, '') LIKE ? ESCAPE '\\')`);
+        args.push(like, like, like);
+      }
     }
     const perPage = Math.min(100, Math.max(5, Number(query.limit) || 25));
     const total = q(`SELECT COUNT(*) n FROM users u WHERE ${where.join(' AND ')}`).get(...args).n;

@@ -10,6 +10,8 @@
     ownerClientStatus: 'all',
     ownerClientPlan: 'all',
     ownerClientQuery: '',
+    ownerTicketStatus: 'all',
+    ownerServiceStatus: 'all',
     ownerAuditRole: '',
     ownerAuditActorId: '',
     ownerAuditAction: '',
@@ -50,7 +52,10 @@
     'order.reject': 'رفض طلب',
     'coupon.create': 'إنشاء كوبون',
     'coupon.update': 'تعديل كوبون',
-    'coupon.delete': 'حذف كوبون'
+    'coupon.delete': 'حذف كوبون',
+    'ticket.reply': 'الرد على تذكرة دعم',
+    'service_request.status': 'تحديث حالة طلب خبير',
+    'plan.expired_downgrade': 'تحويل تلقائي للباقة المجانية عند انتهاء الاشتراك'
   };
 
   const PERM_LABELS = [
@@ -65,6 +70,8 @@
     { id: 'owner/moderators', icon: 'customers', title: 'إدارة المشرفين' },
     { id: 'owner/clients', icon: 'store', title: 'إدارة العملاء' },
     { id: 'owner/approvals', icon: 'checkCircle', title: 'المنتجات والطلبات' },
+    { id: 'owner/tickets', icon: 'message', title: 'تذاكر الدعم' },
+    { id: 'owner/services', icon: 'briefcase', title: 'طلبات الخبراء' },
     { id: 'owner/payments', icon: 'pay', title: 'المدفوعات والاشتراكات' },
     { id: 'owner/coupons', icon: 'ticket', title: 'الكوبونات' },
     { id: 'owner/settings', icon: 'set', title: 'إعدادات المنصة' },
@@ -252,6 +259,12 @@
       q: ctx.state.adminPaymentQuery || ''
     })}`);
     loaders['owner/coupons'] = () => api('GET', '/api/owner/coupons');
+    loaders['owner/tickets'] = () => api('GET', `/api/owner/tickets?${new URLSearchParams({
+      status: rbacState.ownerTicketStatus === 'all' ? '' : rbacState.ownerTicketStatus
+    })}`);
+    loaders['owner/services'] = () => api('GET', `/api/owner/services?${new URLSearchParams({
+      status: rbacState.ownerServiceStatus === 'all' ? '' : rbacState.ownerServiceStatus
+    })}`);
     loaders['owner/settings'] = () => api('GET', '/api/owner/settings');
     loaders['owner/audit'] = () => api('GET', `/api/owner/audit?${new URLSearchParams({
       actorRole: rbacState.ownerAuditRole,
@@ -470,7 +483,7 @@
       return `
         <div class="card">
           <div class="row-wrap" style="margin-bottom:16px;gap:10px">
-            <input type="search" style="width:260px;margin:0" placeholder="ابحث باسم المتجر أو البريد أو الموبايل..." value="${esc(rbacState.ownerClientQuery)}" data-i="owner-client-search" aria-label="بحث في العملاء">
+            <input type="search" style="width:300px;margin:0" placeholder="ابحث بالاسم أو المتجر أو البريد أو الهاتف أو الرقم الضريبي..." value="${esc(rbacState.ownerClientQuery)}" data-i="owner-client-search" aria-label="بحث في العملاء">
             <div class="seg-rail" role="group" aria-label="تصفية حالة العميل">
               ${[
                 ['all', `الكل (${fmtNum(counts.allCount || 0)})`],
@@ -568,6 +581,104 @@
     views['owner/approvals'] = (d) => views['admin/approvals'] ? adaptOwnerReuse(views['admin/approvals'](d)) : '';
     views['owner/payments'] = (d) => views['admin/payments'] ? adaptOwnerReuse(views['admin/payments'](d)) : '';
     views['owner/coupons'] = (d) => views['admin/coupons'] ? adaptOwnerReuse(views['admin/coupons'](d)) : '';
+
+    // --- Owner Support Tickets (#/owner/tickets) ---
+    const TICKET_STATUS_META = {
+      open: { label: 'مفتوحة', cls: 'wn' },
+      in_progress: { label: 'قيد المتابعة', cls: 'pr' },
+      resolved: { label: 'تم الحل', cls: 'ok' },
+      closed: { label: 'مغلقة', cls: '' }
+    };
+    views['owner/tickets'] = (d) => {
+      const list = (d && d.tickets) || [];
+      const counts = (d && d.counts) || {};
+      return `
+        <div class="card">
+          <div class="row-wrap" style="margin-bottom:16px;gap:10px;justify-content:space-between">
+            <div>
+              <h3 style="margin:0 0 4px">إدارة تذاكر الدعم الفني</h3>
+              <p class="mu" style="font-size:13px;margin:0">الرد على تذاكر التجار وإرسال إشعار فوري لهم داخل لوحة التحكم.</p>
+            </div>
+            <div class="seg-rail" role="group" aria-label="تصفية التذاكر">
+              ${[
+                ['all', `الكل (${fmtNum(counts.allCount || 0)})`],
+                ['open', `مفتوحة (${fmtNum(counts.open || 0)})`],
+                ['in_progress', `قيد المتابعة (${fmtNum(counts.inProgress || 0)})`],
+                ['resolved', `تم الحل (${fmtNum(counts.resolved || 0)})`],
+                ['closed', `مغلقة (${fmtNum(counts.closed || 0)})`]
+              ].map(([k, lbl]) => `
+                <button type="button" class="pill ${rbacState.ownerTicketStatus === k ? 'on' : ''}" data-a="owner-ticket-flt" data-v="${k}">${lbl}</button>
+              `).join('')}
+            </div>
+          </div>
+          ${list.length ? renderTable(
+            ['#', 'التاجر / المتجر', 'الموضوع والرسالة', 'الرد الحالي', 'الحالة', 'التاريخ', 'إجراء'],
+            list.map((t) => {
+              const st = TICKET_STATUS_META[t.status] || { label: t.status, cls: '' };
+              return [
+                `<b>#${t.id}</b>`,
+                `<div><b>${esc(t.storeName || t.name || 'تاجر')}</b><br><small class="mu" dir="ltr">${esc(t.contact || '')}</small></div>`,
+                `<div style="max-width:300px"><b>${esc(t.subject)}</b><br><small class="mu">${esc(t.message)}</small></div>`,
+                `<div style="max-width:260px">${t.reply ? `<span>${esc(t.reply)}</span>` : '<span class="mu">لم يُرد بعد</span>'}</div>`,
+                `<span class="rbac-status ${st.cls}">${st.label}</span>`,
+                `<small class="mu">${fmtDate(t.createdAt)}</small>`,
+                `<button type="button" class="btn btn-ac btn-sm" data-a="owner-ticket-reply-modal" data-id="${t.id}" data-subject="${esc(t.subject)}" data-reply="${esc(t.reply || '')}" data-status="${esc(t.status || 'open')}">رد / تحديث</button>`
+              ];
+            })
+          ) : emptyState('message', 'لا توجد تذاكر دعم مطابقة', 'عندما يفتح أحد التجار تذكرة دعم ستظهر هنا للرد عليها.')}
+        </div>
+      `;
+    };
+
+    // --- Owner Expert Service Requests (#/owner/services) ---
+    const SERVICE_STATUS_META = {
+      pending: { label: 'قيد المراجعة', cls: 'wn' },
+      scheduled: { label: 'تم الجدولة', cls: 'pr' },
+      in_progress: { label: 'جارٍ التنفيذ', cls: 'pr' },
+      completed: { label: 'مكتمل', cls: 'ok' },
+      cancelled: { label: 'ملغى', cls: 'er' }
+    };
+    views['owner/services'] = (d) => {
+      const list = (d && d.requests) || [];
+      const counts = (d && d.counts) || {};
+      return `
+        <div class="card">
+          <div class="row-wrap" style="margin-bottom:16px;gap:10px;justify-content:space-between">
+            <div>
+              <h3 style="margin:0 0 4px">إدارة طلبات خدمات الخبراء</h3>
+              <p class="mu" style="font-size:13px;margin:0">متابعة طلبات إطلاق المتاجر وإدارة الإعلانات والتصوير مع ملاحظات فريق التنفيذ.</p>
+            </div>
+            <div class="seg-rail" role="group" aria-label="تصفية طلبات الخدمات">
+              ${[
+                ['all', `الكل (${fmtNum(counts.allCount || 0)})`],
+                ['pending', `قيد المراجعة (${fmtNum(counts.pending || 0)})`],
+                ['scheduled', `مجدول (${fmtNum(counts.scheduled || 0)})`],
+                ['in_progress', `جارٍ التنفيذ (${fmtNum(counts.inProgress || 0)})`],
+                ['completed', `مكتمل (${fmtNum(counts.completed || 0)})`],
+                ['cancelled', `ملغى (${fmtNum(counts.cancelled || 0)})`]
+              ].map(([k, lbl]) => `
+                <button type="button" class="pill ${rbacState.ownerServiceStatus === k ? 'on' : ''}" data-a="owner-service-flt" data-v="${k}">${lbl}</button>
+              `).join('')}
+            </div>
+          </div>
+          ${list.length ? renderTable(
+            ['المرجع', 'التاجر / المتجر', 'الخدمة المطلوبة', 'ملاحظات العميل', 'ملاحظات الإدارة', 'الحالة', 'إجراء'],
+            list.map((s) => {
+              const st = SERVICE_STATUS_META[s.status] || { label: s.status, cls: '' };
+              return [
+                `<code dir="ltr"><b>${esc(s.refCode || '#' + s.id)}</b></code>`,
+                `<div><b>${esc(s.storeName || s.name || 'تاجر')}</b><br><small class="mu" dir="ltr">${esc(s.phone || '')}</small></div>`,
+                `<div><b>${esc(s.serviceTitle)}</b><br><small class="mu">${esc(s.platforms || '')}</small></div>`,
+                `<small class="mu">${esc(s.notes || '—')}</small>`,
+                `<small>${esc(s.adminNotes || '—')}</small>`,
+                `<span class="rbac-status ${st.cls}">${st.label}</span>`,
+                `<button type="button" class="btn btn-ac btn-sm" data-a="owner-service-status-modal" data-id="${s.id}" data-title="${esc(s.serviceTitle)}" data-status="${esc(s.status || 'pending')}" data-notes="${esc(s.adminNotes || '')}">تحديث الحالة</button>`
+              ];
+            })
+          ) : emptyState('briefcase', 'لا توجد طلبات خدمات خبراء مطابقة', 'ستظهر هنا طلبات خدمات الإطلاق والإعلانات الواردة من التجار.')}
+        </div>
+      `;
+    };
 
     // --- Owner Platform Settings (#/owner/settings) ---
     views['owner/settings'] = (d) => {
@@ -1051,6 +1162,76 @@
     inputs['owner-audit-role'] = (el) => { rbacState.ownerAuditRole = el.value; renderApp(true); };
     inputs['owner-audit-actor'] = (el) => { rbacState.ownerAuditActorId = el.value; renderApp(true); };
     inputs['owner-audit-action'] = (el) => { rbacState.ownerAuditAction = el.value; renderApp(true); };
+
+    // --- Owner Support Tickets & Expert Services Actions ---
+    actions['owner-ticket-flt'] = (el) => {
+      rbacState.ownerTicketStatus = el.dataset.v || 'all';
+      renderApp(true);
+    };
+    actions['owner-ticket-reply-modal'] = (el) => {
+      const curStatus = ['open', 'in_progress', 'resolved', 'closed'].includes(el.dataset.status) ? el.dataset.status : 'resolved';
+      const defaultStatus = curStatus === 'open' ? 'resolved' : curStatus;
+      openDialog(`الرد على تذكرة #${el.dataset.id}: ${el.dataset.subject || ''}`, `
+        <form data-submit="owner-ticket-reply-submit" novalidate>
+          <input type="hidden" id="otr-id" value="${esc(el.dataset.id)}">
+          <label for="otr-status">حالة التذكرة بعد الرد</label>
+          <select id="otr-status">
+            <option value="resolved" ${defaultStatus === 'resolved' ? 'selected' : ''}>تم الحل (resolved)</option>
+            <option value="in_progress" ${defaultStatus === 'in_progress' ? 'selected' : ''}>قيد المتابعة (in_progress)</option>
+            <option value="closed" ${defaultStatus === 'closed' ? 'selected' : ''}>مغلقة (closed)</option>
+            <option value="open" ${defaultStatus === 'open' ? 'selected' : ''}>مفتوحة (open)</option>
+          </select>
+          <label for="otr-reply">نص الرد للتاجر</label>
+          <textarea id="otr-reply" rows="4" maxlength="2000" placeholder="اكتب الرد الواضح للتاجر...">${esc(el.dataset.reply || '')}</textarea>
+          <p id="otr-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
+          <button type="submit" class="btn btn-ac" style="width:100%">إرسال الرد وإشعار التاجر</button>
+        </form>
+      `);
+    };
+    act('owner-ticket-reply-submit', async () => {
+      const id = document.querySelector('#otr-id').value;
+      const reply = document.querySelector('#otr-reply')?.value.trim() || '';
+      const status = document.querySelector('#otr-status')?.value || 'resolved';
+      const err = document.querySelector('#otr-err');
+      if (!reply) { if (err) err.textContent = 'اكتب نص الرد أولًا'; return; }
+      await api('POST', `/api/owner/tickets/${encodeURIComponent(id)}/reply`, { reply, status });
+      closeDlg();
+      showToast('تم إرسال الرد وإشعار التاجر بنجاح ✓');
+      renderApp(true);
+    });
+
+    actions['owner-service-flt'] = (el) => {
+      rbacState.ownerServiceStatus = el.dataset.v || 'all';
+      renderApp(true);
+    };
+    actions['owner-service-status-modal'] = (el) => {
+      const st = el.dataset.status || 'pending';
+      openDialog(`تحديث طلب خدمة #${el.dataset.id}: ${el.dataset.title || ''}`, `
+        <form data-submit="owner-service-status-submit" novalidate>
+          <input type="hidden" id="oss-id" value="${esc(el.dataset.id)}">
+          <label for="oss-status">حالة الطلب</label>
+          <select id="oss-status">
+            <option value="pending" ${st === 'pending' ? 'selected' : ''}>قيد المراجعة</option>
+            <option value="scheduled" ${st === 'scheduled' ? 'selected' : ''}>تم جدولة الموعد</option>
+            <option value="in_progress" ${st === 'in_progress' ? 'selected' : ''}>جارٍ التنفيذ</option>
+            <option value="completed" ${st === 'completed' ? 'selected' : ''}>مكتمل</option>
+            <option value="cancelled" ${st === 'cancelled' ? 'selected' : ''}>ملغى</option>
+          </select>
+          <label for="oss-notes">ملاحظات الإدارة (اختياري)</label>
+          <textarea id="oss-notes" rows="3" maxlength="1000" placeholder="مثال: تم تعيين مدير حساب وسيتواصل معك خلال ساعتين">${esc(el.dataset.notes || '')}</textarea>
+          <button type="submit" class="btn btn-ac" style="width:100%">حفظ الحالة وإشعار التاجر</button>
+        </form>
+      `);
+    };
+    act('owner-service-status-submit', async () => {
+      const id = document.querySelector('#oss-id').value;
+      const status = document.querySelector('#oss-status')?.value || 'in_progress';
+      const adminNotes = document.querySelector('#oss-notes')?.value.trim() || '';
+      await api('POST', `/api/owner/services/${encodeURIComponent(id)}/status`, { status, adminNotes });
+      closeDlg();
+      showToast('تم تحديث حالة طلب الخدمة وإشعار التاجر ✓');
+      renderApp(true);
+    });
 
     // --- Moderator Actions ---
     let modClientTimer;

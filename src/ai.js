@@ -10,6 +10,32 @@ try {
 const str = (v, max) => String(v ?? '').slice(0, max);
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } };
 
+const OFFICIAL_FALLBACK_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+
+function supportsThinking(model) {
+  return /^(gemini-4-(hydrogen|neon|argon|carbon)|gemini-3)/.test(String(model || '').trim());
+}
+
+/** يبني قائمة النماذج بالترتيب: النموذج المحدد في cfg.geminiModel أولًا ثم النماذج الرسمية الاحتياطية بدون تكرار */
+function resolveModelCandidates(configuredModel, { search = false } = {}) {
+  const ordered = [];
+  const pushUnique = (m) => {
+    const clean = String(m || '').trim();
+    if (clean && !ordered.includes(clean)) ordered.push(clean);
+  };
+  pushUnique(configuredModel);
+  for (const fallback of OFFICIAL_FALLBACK_MODELS) pushUnique(fallback);
+
+  const attempts = [];
+  if (search && ordered.length) {
+    attempts.push({ model: ordered[0], useSearch: true });
+  }
+  for (const model of ordered) {
+    attempts.push({ model, useSearch: false });
+  }
+  return attempts;
+}
+
 async function gemini(cfg, { prompt, system, schema, search, thinking }) {
   if (!cfg.geminiKey) throw new HttpError(503, 'ميزات الذكاء الاصطناعي غير مُفعّلة بعد: أضف GEMINI_API_KEY في إعدادات الخادم.', { code: 'AI_OFF' });
 
@@ -52,18 +78,9 @@ async function gemini(cfg, { prompt, system, schema, search, thinking }) {
     throw new HttpError(502, 'تعذر الاتصال بخدمة الذكاء الاصطناعي حاليًا، حاول بعد قليل.', { code: 'AI_FAIL' });
   }
 
-  // في البيئة الحقيقية: استخدام حزمة @google/genai الرسمية مع مهلة زمنية تتجاوز الحد الأدنى (10s)
+  // في البيئة الحقيقية: احترام cfg.geminiModel أولًا مع fallback آمن للنماذج الرسمية
   const timeoutMs = thinking ? 60_000 : 30_000;
-  const attempts = search
-    ? [
-        { model: 'gemini-4-hydrogen', useSearch: true },
-        { model: 'gemini-4-hydrogen', useSearch: false },
-        { model: 'gemini-3.1-flash-lite', useSearch: false }
-      ]
-    : [
-        { model: 'gemini-4-hydrogen', useSearch: false },
-        { model: 'gemini-3.1-flash-lite', useSearch: false }
-      ];
+  const attempts = resolveModelCandidates(cfg.geminiModel, { search: Boolean(search) });
 
   let lastErr;
   for (const { model, useSearch } of attempts) {
@@ -85,7 +102,7 @@ async function gemini(cfg, { prompt, system, schema, search, thinking }) {
           config.responseMimeType = 'application/json';
           config.responseSchema = schema;
         }
-        if (thinking && genAiSdk.ThinkingLevel && model === 'gemini-4-hydrogen') {
+        if (thinking && genAiSdk.ThinkingLevel && supportsThinking(model)) {
           config.thinkingConfig = {
             thinkingLevel: genAiSdk.ThinkingLevel.HIGH
           };
@@ -107,7 +124,7 @@ async function gemini(cfg, { prompt, system, schema, search, thinking }) {
           genConfig.responseMimeType = 'application/json';
           genConfig.responseSchema = schema;
         }
-        if (thinking && model === 'gemini-4-hydrogen') {
+        if (thinking && supportsThinking(model)) {
           genConfig.thinkingConfig = { thinkingLevel: 'HIGH' };
         }
         if (Object.keys(genConfig).length) reqBody.generationConfig = genConfig;
@@ -382,7 +399,8 @@ function priceRadarBenchmark(name, catalogProducts = []) {
 }
 
 module.exports = {
-  gemini, listingPrompt, templateListing, normalizeListing,
+  gemini, resolveModelCandidates, supportsThinking,
+  listingPrompt, templateListing, normalizeListing,
   advisorPrompt, normalizeAdvisor, rulesAdvisor,
   orderMessagePrompt, templateOrderMessage,
   sellerChatPrompt, rulesSellerAssistant, priceRadarBenchmark,

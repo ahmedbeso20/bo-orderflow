@@ -29,6 +29,7 @@ module.exports = (r, app) => {
       const cleanTax = latin(text(body.taxId, 'الرقم الضريبي', { max: 20, optional: true }));
       if (!/^[0-9\- ]*$/.test(cleanTax)) throw bad('الرقم الضريبي: أرقام وشرطات فقط');
       f.tax_id = cleanTax ? cipher.encrypt(cleanTax) : '';
+      f.tax_id_hash = cleanTax ? cipher.blindIndex(cleanTax) : '';
     }
     if (body.instaPayHandle !== undefined) {
       const cleanIpa = text(body.instaPayHandle, 'عنوان InstaPay', { max: 60, optional: true });

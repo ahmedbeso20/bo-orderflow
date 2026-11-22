@@ -297,25 +297,20 @@ const setImpersonationToken = (t) => {
   } catch (_) {}
 };
 
-const getStoredToken = () => {
-  try { return localStorage.getItem('omni_token') || ''; } catch (_) { return ''; }
-};
+// Cleanup any legacy token left in localStorage — sessions rely exclusively on HttpOnly cookies
+try { localStorage.removeItem('omni_token'); } catch (_) {}
 
 const authedUrl = (url) => {
   const imp = getImpersonateToken();
-  const t = imp || getStoredToken();
-  if (!t) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t);
+  if (!imp) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(imp);
 };
 
 async function api(method, url, body) {
   const impToken = getImpersonateToken();
-  const token = getStoredToken();
   const headers = { 'X-Requested-With': 'omniarab' };
   if (impToken && !url.startsWith('/api/admin') && !url.startsWith('/api/owner') && !url.startsWith('/api/moderator')) {
     headers['X-Impersonate-Token'] = impToken;
-  } else if (token) {
-    headers['Authorization'] = 'Bearer ' + token;
   }
   const opts = { method, credentials: 'include', headers };
   if (body !== undefined) {
@@ -329,9 +324,6 @@ async function api(method, url, body) {
     throw new ApiError(0, 'تعذّر الاتصال بالخادم، تأكد من الإنترنت وحاول مجددًا');
   }
   const data = await res.json().catch(() => ({}));
-  if (data && data.token && !data.readOnly && !url.includes('/impersonate')) {
-    try { localStorage.setItem('omni_token', data.token); } catch (_) {}
-  }
   if (!res.ok) {
     if (res.status === 401 && me) {
       sessionExpired(data && data.code === 'SESSION_REVOKED' ? (data.error || 'تم إيقاف أو حذف حسابك — تم إنهاء الجلسة فورًا') : '');
@@ -344,10 +336,8 @@ async function api(method, url, body) {
 async function downloadFile(url, filename, label) {
   try {
     const impToken = getImpersonateToken();
-    const token = getStoredToken();
     const headers = { 'X-Requested-With': 'omniarab' };
     if (impToken) headers['X-Impersonate-Token'] = impToken;
-    else if (token) headers['Authorization'] = 'Bearer ' + token;
     const res = await fetch(url, { credentials: 'include', headers });
     if (!res.ok) throw new Error('تعذر تحميل الملف');
     const blob = await res.blob();
@@ -1464,6 +1454,7 @@ views.prod = () => `
       <span class="pill ${state.prodStockFilter === 'pending' ? 'on' : ''}" data-a="prod-flt" data-v="pending">قيد المراجعة</span>
       <span class="pill ${state.prodStockFilter === 'rejected' ? 'on' : ''}" data-a="prod-flt" data-v="rejected">مرفوض</span>
       <span class="sp"></span>
+      <button class="btn btn-gh btn-sm" data-a="import-prod-csv">📤 استيراد CSV</button>
       <button class="btn btn-gh btn-sm" data-a="export-prod-csv">📥 تصدير الكتالوج CSV</button>
       <button class="btn btn-ac btn-sm" data-a="add-prod">+ إضافة منتج جديد</button>
     </div>
@@ -3564,7 +3555,8 @@ async function renderApp(keepScroll = false) {
 }
 
 const boot = async () => {
-  if (getStoredToken() || getImpersonateToken()) await loadSession();
+  const sess = await api('GET', '/api/auth/session').catch(() => ({ authenticated: false }));
+  if ((sess && sess.authenticated) || getImpersonateToken()) await loadSession();
   // توجيه المسار المباشر /owner أو /moderator للمخوّلين فقط
   if (!location.hash) {
     if ((location.pathname === '/owner' || location.pathname.startsWith('/owner/')) && me && me.role === 'owner') {
@@ -4183,10 +4175,7 @@ act('contact-submit', async () => {
 
 act('demo', async () => {
   try {
-    const r = await api('POST', '/api/auth/demo');
-    if (r && r.token) {
-      try { localStorage.setItem('omni_token', r.token); } catch (_) {}
-    }
+    await api('POST', '/api/auth/demo');
     await loadSession();
     showToast('أنت الآن في حساب تجريبي ببيانات جاهزة — تصفّح بحرية', 3600);
     closeDlg();
@@ -4399,6 +4388,66 @@ actions['delete-prod'] = (el) => {
     }
   );
 };
+
+actions['import-prod-csv'] = () => {
+  const sample = 'SKU,الاسم,الفئة,السعر,التكلفة,المخزون,الأسواق\nCSV-101,سماعة بلوتوث لاسلكية برو,إلكترونيات,950,580,25,"أمازون,نون"\nCSV-102,ماكينة قهوة إسبريسو مدمجة,أجهزة منزلية,3400,2200,12,"أمازون,جوميا"';
+  openDialog('📤 استيراد المنتجات مجمّعًا (CSV)', `
+    <form data-submit="import-prod-csv-submit" novalidate>
+      <p class="mu" style="font-size:13px;margin-bottom:12px">
+        ارفع ملف CSV أو الصق الصفوف مباشرة. يدعم الأعمدة العربية أو الإنجليزية:
+        <code dir="ltr">SKU, name, cat, price, cost, stock, markets</code>.
+        المنتجات الموجودة بنفس كود SKU سيتم تحديثها، والجديدة تُضاف ضمن حد باقتك.
+      </p>
+      <div class="row-wrap" style="gap:8px;margin-bottom:10px">
+        <label class="btn btn-gh btn-sm" style="margin:0;cursor:pointer">
+          📂 اختيار ملف CSV
+          <input type="file" id="csv-file-input" accept=".csv,text/csv,text/plain" style="display:none">
+        </label>
+        <button type="button" class="btn btn-gh btn-sm" id="csv-fill-sample">✨ إدراج مثال جاهز</button>
+      </div>
+      <label for="csv-text-input">محتوى CSV</label>
+      <textarea id="csv-text-input" rows="7" dir="ltr" placeholder="SKU,name,cat,price,cost,stock,markets&#10;SKU-101,سماعة بلوتوث,إلكترونيات,950,580,25,an"></textarea>
+      <p id="csv-imp-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
+      <button type="submit" class="btn btn-ac" style="width:100%">استيراد وتحديث المنتجات</button>
+    </form>
+  `);
+  const fileEl = $('#csv-file-input');
+  const txtEl = $('#csv-text-input');
+  const sampleBtn = $('#csv-fill-sample');
+  if (fileEl && txtEl) {
+    fileEl.addEventListener('change', () => {
+      const f = fileEl.files && fileEl.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => { txtEl.value = String(reader.result || ''); };
+      reader.readAsText(f, 'utf-8');
+    });
+  }
+  if (sampleBtn && txtEl) {
+    sampleBtn.addEventListener('click', () => { txtEl.value = sample; });
+  }
+};
+
+act('import-prod-csv-submit', async () => {
+  const csv = ($('#csv-text-input')?.value || '').trim();
+  const errEl = $('#csv-imp-err');
+  if (errEl) errEl.textContent = '';
+  if (!csv) {
+    if (errEl) errEl.textContent = 'يرجى رفع ملف CSV أو لصق البيانات أولًا';
+    return;
+  }
+  try {
+    const r = await api('POST', '/api/products/import', { csv });
+    if (Array.isArray(r.products)) products = r.products;
+    applyMeta(r);
+    closeDlg();
+    const errNote = r.errors && r.errors.length ? ` · تم تخطي ${fmtNum(r.errors.length)} صف` : '';
+    showToast(`✓ تم استيراد ${fmtNum(r.imported || 0)} منتج جديد وتحديث ${fmtNum(r.updated || 0)} منتج${errNote}`, 4800);
+    renderApp(true);
+  } catch (e) {
+    if (errEl) errEl.textContent = e.message || 'تعذر استيراد ملف CSV';
+  }
+});
 
 actions['export-prod-csv'] = () => downloadFile('/api/products/export.csv', 'orderflow-products.csv', 'كتالوج المنتجات CSV');
 actions['export-ord-csv'] = () => downloadFile('/api/orders/export.csv', 'orderflow-orders.csv', 'سجل الطلبات CSV');

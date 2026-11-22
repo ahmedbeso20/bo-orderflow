@@ -14,12 +14,20 @@ const MIME = {
 const CSP_BASE = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'";
 
 function securityHeaders(res, cfg) {
-  const frameDirective = cfg.allowIframe ? 'frame-ancestors *' : "frame-ancestors 'none'";
+  let frameDirective;
+  if (cfg.production && !cfg.allowIframe) {
+    frameDirective = "frame-ancestors 'none'";
+    res.setHeader('X-Frame-Options', 'DENY');
+  } else if (cfg.allowIframe) {
+    frameDirective = "frame-ancestors 'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com";
+  } else {
+    frameDirective = "frame-ancestors 'self'";
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  }
   const csp = cfg.production
     ? `${CSP_BASE}; ${frameDirective}; upgrade-insecure-requests`
     : `${CSP_BASE}; ${frameDirective}`;
   res.setHeader('Content-Security-Policy', csp);
-  if (!cfg.allowIframe) res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-DNS-Prefetch-Control', 'off');
   res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');

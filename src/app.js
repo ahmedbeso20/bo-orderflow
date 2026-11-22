@@ -122,7 +122,24 @@ function createApp(overrides = {}) {
 
   ensureSingleOwner(cfg, store.q);
 
-  const handlePlanExpired = (u, prevPlan) => {
+  // تعبئة الفهرس الأعمى tax_id_hash تلقائيًا لأي عملاء سابقين لديهم رقم ضريبي مشفّر قبل الترحيل 9
+  try {
+    const missingTaxHash = store.q("SELECT id, tax_id FROM users WHERE tax_id <> '' AND (tax_id_hash IS NULL OR tax_id_hash = '')").all();
+    for (const row of missingTaxHash) {
+      const plainTax = cipher.decrypt(row.tax_id);
+      const h = plainTax ? cipher.blindIndex(plainTax) : '';
+      if (h) store.q('UPDATE users SET tax_id_hash = ? WHERE id = ?').run(h, row.id);
+    }
+  } catch (_) {}
+
+  const handlePlanExpired = (u, prevPlanArg) => {
+    const prevPlan = prevPlanArg || u.prevPlan || 'paid';
+    logAudit(null, 'plan.expired_downgrade', 'user', u.id, {
+      from: prevPlan,
+      to: 'free',
+      expiredAt: u.expiredAt || null,
+      storeName: u.store_name || ''
+    });
     notify(
       u.id,
       'warning',
@@ -241,6 +258,11 @@ function createApp(overrides = {}) {
     backupTimer.unref();
   }
 
+  const allowedOriginsSet = new Set(
+    cfg.allowedOrigins
+      .map((u) => { try { return new URL(u).origin; } catch { return ''; } })
+      .filter(Boolean)
+  );
   const allowedHosts = new Set([cfg.appUrl, ...cfg.allowedOrigins].filter(Boolean).map((u) => { try { return new URL(u).host; } catch { return ''; } }).filter(Boolean));
   const sameOrigin = (req) => {
     const origin = req.headers.origin;
@@ -249,13 +271,38 @@ function createApp(overrides = {}) {
     const host = (cfg.trustProxy && fHost) || req.headers.host;
     try {
       const u = new URL(origin);
-      if (u.host === host || allowedHosts.has(u.host)) return true;
+      if (u.host === host || allowedHosts.has(u.host) || allowedOriginsSet.has(u.origin)) return true;
       if (!cfg.production && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
       return false;
     } catch { return false; }
   };
 
+  const applyCors = (req, res) => {
+    const origin = req.headers.origin;
+    if (!origin) return false;
+    let normalized = '';
+    try { normalized = new URL(origin).origin; } catch { return false; }
+    if (!allowedOriginsSet.has(normalized)) return false;
+    res.setHeader('Access-Control-Allow-Origin', normalized);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Impersonate-Token, Idempotency-Key');
+    res.setHeader('Access-Control-Max-Age', '600');
+    return true;
+  };
+
   async function handleApi(req, res, url) {
+    const corsMatched = applyCors(req, res);
+    if (req.method === 'OPTIONS') {
+      if (req.headers.origin && !corsMatched && !sameOrigin(req)) {
+        throw new HttpError(403, 'النطاق غير مصرّح به (CORS)');
+      }
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const ip = clientIp(req, cfg.trustProxy);
     if (!limiter.hit(`api:${ip}`, 600, 60_000)) throw new HttpError(429, 'طلبات كثيرة، انتظر قليلًا ثم حاول مجددًا');
 

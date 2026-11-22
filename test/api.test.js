@@ -315,7 +315,7 @@ test('الذكاء الاصطناعي مع Gemini (محاكاة): المفتاح
   assert.equal(l.data.data.keywords, 'س، ص');
   assert.equal(calls[0].init.headers['x-goog-api-key'], 'TEST-KEY');
   assert.ok(!calls[0].url.includes('TEST-KEY'), 'المفتاح لا يظهر في الرابط');
-  assert.match(calls[0].url, /gemini-3-flash-preview:generateContent$/);
+  assert.match(calls[0].url, /gemini-4-hydrogen:generateContent$/);
   assert.equal(calls[0].body.generationConfig.responseMimeType, 'application/json');
 
   const m = (await a.post('/api/ai/market', { name: 'سماعة' })).data.market;

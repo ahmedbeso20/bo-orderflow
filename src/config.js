@@ -16,7 +16,8 @@ function load(o = {}) {
   const e = process.env;
   const nodeEnv = o.nodeEnv || (o.production === true ? 'production' : (e.NODE_ENV || 'development'));
   const production = o.production !== undefined ? Boolean(o.production) : nodeEnv === 'production';
-  const allowIframe = flag(o.allowIframe ?? e.ALLOW_IFRAME, !production);
+  const isAiStudioPreview = !production && /^https:\/\/ais-(dev|pre)-/i.test(String(e.APP_URL || ''));
+  const allowIframe = flag(o.allowIframe ?? e.ALLOW_IFRAME, isAiStudioPreview);
   const hasExplicitDataDir = Boolean(o.dataDir || e.DATA_DIR);
   const dataDir = path.resolve(o.dataDir || e.DATA_DIR || path.join(ROOT, 'data'));
   const dbFile = o.dbFile || e.DB_FILE || path.join(dataDir, 'omniarab.db');
@@ -74,7 +75,7 @@ function load(o = {}) {
     // لا نثق بترويسة X-Forwarded-For إلا خلف وسيط معروف (وإلا يستطيع أي عميل انتحال IP وتجاوز حدود الطلبات)
     trustProxy: flag(o.trustProxy ?? e.TRUST_PROXY, isCloud),
     geminiKey: o.geminiKey ?? e.GEMINI_API_KEY ?? '',
-    geminiModel: o.geminiModel || e.GEMINI_MODEL || 'gemini-3-flash-preview',
+    geminiModel: o.geminiModel || e.GEMINI_MODEL || 'gemini-4-hydrogen',
     // بيانات حساب المالك الوحيد للنظام (تُقرأ من البيئة أو الإعدادات)
     ownerName: String(o.ownerName ?? e.OWNER_NAME ?? 'مالك منصة OrderFlow').trim(),
     ownerEmail: String(o.ownerEmail ?? e.OWNER_EMAIL ?? e.ADMIN_EMAIL ?? (!production ? 'owner@orderflow.eg' : '')).trim().toLowerCase(),
@@ -83,9 +84,17 @@ function load(o = {}) {
     adminPhone: String(o.adminPhone ?? o.ownerPhone ?? e.ADMIN_PHONE ?? e.OWNER_PHONE ?? '').trim(),
     adminPassword: String(o.adminPassword ?? o.ownerPassword ?? e.ADMIN_PASSWORD ?? e.OWNER_PASSWORD ?? ''),
     mailTransport: o.mailTransport || null,
-    mailApiKey: String(o.mailApiKey ?? e.MAIL_API_KEY ?? '').trim(),
+    mailApiKey: String(o.mailApiKey ?? o.resendApiKey ?? e.RESEND_API_KEY ?? e.MAIL_API_KEY ?? '').trim(),
     mailApiUrl: String(o.mailApiUrl ?? e.MAIL_API_URL ?? 'https://api.resend.com/emails').trim(),
     mailFrom: String(o.mailFrom ?? e.MAIL_FROM ?? '').trim(),
+    smtpHost: String(o.smtpHost ?? e.SMTP_HOST ?? '').trim(),
+    smtpPort: Number(o.smtpPort ?? e.SMTP_PORT ?? 587) || 587,
+    smtpUser: String(o.smtpUser ?? e.SMTP_USER ?? '').trim(),
+    smtpPass: String(o.smtpPass ?? e.SMTP_PASS ?? '').trim(),
+    smtpSecure: flag(o.smtpSecure ?? e.SMTP_SECURE, Number(o.smtpPort ?? e.SMTP_PORT ?? 587) === 465),
+    smtpStartTls: flag(o.smtpStartTls ?? e.SMTP_STARTTLS, true),
+    mailWebhookUrl: String(o.mailWebhookUrl ?? e.MAIL_WEBHOOK_URL ?? '').trim(),
+    mailWebhookSecret: String(o.mailWebhookSecret ?? e.MAIL_WEBHOOK_SECRET ?? '').trim(),
     platformTaxId: String(o.platformTaxId ?? e.PLATFORM_TAX_ID ?? '').trim(),
     platformLegalName: String(o.platformLegalName ?? e.PLATFORM_LEGAL_NAME ?? '').trim(),
     // تغيير الباقة دون دفع مسموح في بيئة التطوير فقط
