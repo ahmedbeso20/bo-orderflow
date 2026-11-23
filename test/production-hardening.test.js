@@ -57,6 +57,22 @@ async function loginAs(req, id, password, extra = {}) {
   return r;
 }
 
+async function loginStaffCookie(req, id, password) {
+  const r = await req('POST', '/api/auth/login', { id, password });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  let cookie = (r.headers.get('set-cookie') || '').split(';')[0];
+  let me = r.json.me;
+  if (r.json && r.json.setup2faRequired) {
+    const setup = await req('POST', '/api/account/2fa/setup', {}, { Cookie: cookie });
+    assert.equal(setup.status, 200, JSON.stringify(setup.json));
+    const en = await req('POST', '/api/account/2fa/enable', { code: generateTotpCode(setup.json.secret) }, { Cookie: cookie });
+    assert.equal(en.status, 200, JSON.stringify(en.json));
+    cookie = (en.headers.get('set-cookie') || '').split(';')[0] || cookie;
+    me = en.json.me;
+  }
+  return { cookie, me };
+}
+
 describe('١. إلزام مفاتيح التشفير والجلسات في الإنتاج ومسار البيانات الافتراضي', () => {
   it('يرفض تشغيل الخادم (Throws Error) في production إذا كان SESSION_SECRET أو DATA_ENCRYPTION_KEY مفقودًا أو أقل من ٣٢ حرفًا', () => {
     const origEnv = {
@@ -166,8 +182,8 @@ describe('٣. حماية SSRF ضد DNS Rebinding ومنع إعادة التوج�
       }
     });
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
       const saveConn = await s.req('PUT', '/api/integrations/connections/k', {
         credentials: { apiKey: 'test-kenzz-key-123456', storeId: 'KNZ-EG-8821' },
         environment: 'production'
@@ -185,12 +201,15 @@ describe('٣. حماية SSRF ضد DNS Rebinding ومنع إعادة التوج�
 });
 
 describe('٤. المصادقة الثنائية (2FA - TOTP) للمالك والمشرفين', () => {
-  it('تفعّل TOTP للمالك وتفرض إدخال رمز 6 أرقام صالح عند تسجيل الدخول ثم تسمح بالتعطيل', async () => {
+  it('تفعّل TOTP الإلزامي للمالك وتفرض إدخال رمز 6 أرقام صالح أو كود استرداد وتمنع التعطيل للمالك', async () => {
     const s = await startApp();
     try {
       const login1 = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
       assert.equal(login1.status, 200);
-      const auth = { Authorization: `Bearer ${login1.json.token}` };
+      assert.equal(login1.json.setup2faRequired, true);
+      assert.equal(login1.json.token, undefined);
+      const setupCookie = (login1.headers.get('set-cookie') || '').split(';')[0];
+      const auth = { Cookie: setupCookie };
 
       const setup = await s.req('POST', '/api/account/2fa/setup', {}, auth);
       assert.equal(setup.status, 200);
@@ -202,11 +221,12 @@ describe('٤. المصادقة الثنائية (2FA - TOTP) للمالك وال
       const badEnable = await s.req('POST', '/api/account/2fa/enable', { code: '000000' }, auth);
       assert.equal(badEnable.status, 400);
 
-      // رمز TOTP صحيح يُفعّل 2FA
+      // رمز TOTP صحيح يُفعّل 2FA ويُصدر أكواد استرداد
       const validCode = generateTotpCode(setup.json.secret);
       const enable = await s.req('POST', '/api/account/2fa/enable', { code: validCode }, auth);
       assert.equal(enable.status, 200);
       assert.equal(enable.json.totpEnabled, true);
+      assert.equal(enable.json.recoveryCodes.length, 10);
 
       // محاولة الدخول بدون رمز تُرجع requires2fa + challengeToken دون إصدار جلسة
       const chal = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
@@ -222,23 +242,24 @@ describe('٤. المصادقة الثنائية (2FA - TOTP) للمالك وال
       });
       assert.equal(bad2fa.status, 401);
 
-      // رمز صحيح يُكمل الدخول ويصدر جلسة المالك
+      // كود استرداد صالح يُكمل الدخول ويصدر كوكي جلسة المالك (بدون token في JSON)
       const good2fa = await s.req('POST', '/api/auth/login/2fa', {
         challengeToken: chal.json.challengeToken,
-        code: generateTotpCode(setup.json.secret)
+        code: enable.json.recoveryCodes[0]
       });
       assert.equal(good2fa.status, 200);
       assert.equal(good2fa.json.ok, true);
-      assert.ok(good2fa.json.token);
+      assert.equal(good2fa.json.token, undefined);
       assert.equal(good2fa.json.me.totpEnabled, true);
+      const fullCookie = (good2fa.headers.get('set-cookie') || '').split(';')[0];
 
-      // تعطيل 2FA يتطلب كلمة المرور والرمز الصحيح
+      // تعطيل 2FA ممنوع لحسابات المالك والمشرفين (403 2FA_MANDATORY_FOR_STAFF)
       const dis = await s.req('POST', '/api/account/2fa/disable', {
         password: 'OwnerHard@2026!',
-        code: generateTotpCode(setup.json.secret)
-      }, { Authorization: `Bearer ${good2fa.json.token}` });
-      assert.equal(dis.status, 200);
-      assert.equal(dis.json.totpEnabled, false);
+        code: enable.json.recoveryCodes[1]
+      }, { Cookie: fullCookie });
+      assert.equal(dis.status, 403);
+      assert.equal(dis.json.code, '2FA_MANDATORY_FOR_STAFF');
     } finally {
       await s.cleanup();
     }
@@ -249,8 +270,8 @@ describe('٥. جدول العملاء الحقيقي (Migration 8) وربط ال
   it('يربط الطلبات بـ customer_id ولا يدمج عميلين لهما نفس الاسم وأرقام هواتف مختلفة، ويدعم CRUD والملاحظات', async () => {
     const s = await startApp();
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
 
       const pRes = await s.req('POST', '/api/products', {
         name: 'سماعة اختبار CRM',
@@ -347,8 +368,8 @@ describe('٦. النسخ الاحتياطي التلقائي واليدوي لـ
       backupDir: path.join(tmpDir, 'backups')
     });
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
 
       for (let i = 0; i < 9; i++) {
         const b = await s.req('POST', '/api/owner/backup', {}, auth);
@@ -369,8 +390,8 @@ describe('٦. النسخ الاحتياطي التلقائي واليدوي لـ
   it('يرفض ملفًا مزوّرًا لا يطابق Magic Bytes ويحفظ PNG صالحًا على القرص ويقدّمه بأمان', async () => {
     const s = await startApp();
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
 
       // ملف نصي مموّه بامتداد PNG
       const fakePng = 'data:image/png;base64,' + Buffer.from('<script>alert(1)</script>not-a-png-file').toString('base64');
@@ -444,14 +465,15 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
     });
     try {
       // نسجّل تاجرين ونفعّلهما
-      const ownerLogin = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const oAuth = { Authorization: `Bearer ${ownerLogin.json.token}` };
+      const { cookie: oCookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const oAuth = { Cookie: oCookie };
 
       const reg1 = await s.req('POST', '/api/auth/register', {
         store: 'متجر منتهي الباقة',
         phone: '01055551111',
         email: 'expired@store.eg',
-        password: 'Merchant@2026!'
+        password: 'Merchant@2026!',
+        termsAccepted: true
       });
       const uid1 = reg1.json.account.id;
       await s.req('POST', `/api/owner/clients/${uid1}/approve`, {}, oAuth);
@@ -460,7 +482,8 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
         store: 'متجر قريب الانتهاء',
         phone: '01055552222',
         email: 'soon@store.eg',
-        password: 'Merchant@2026!'
+        password: 'Merchant@2026!',
+        termsAccepted: true
       });
       const uid2 = reg2.json.account.id;
       await s.req('POST', `/api/owner/clients/${uid2}/approve`, {}, oAuth);
@@ -500,8 +523,8 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
   it('يستخدم الاسم القانوني والرقم الضريبي الديناميكيين في إيصال الاشتراك بدل القيمة الثابتة', async () => {
     const s = await startApp({ allowPlanSelfService: true });
     try {
-      const ownerLogin = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const oAuth = { Authorization: `Bearer ${ownerLogin.json.token}` };
+      const { cookie: oCookie, me: ownerMe } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const oAuth = { Cookie: oCookie };
 
       const upd = await s.req('PUT', '/api/owner/settings', {
         platform_legal_name: 'شركة أوردر فلو الحديثة ش.م.م',
@@ -512,7 +535,7 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
       // إنشاء إيصال مدفوع للتجربة
       const now = new Date().toISOString();
       const payId = Number(s.app.q(`INSERT INTO plan_payments (user_id, tx_ref, plan, cycle, method, amount, vat, discount, coupon, payer_info, status, period_start, period_end, created_at)
-        VALUES (?, 'OF-REC-777', 'pro', 'monthly', 'card', 1000, 122.81, 0, '', 'card', 'paid', ?, ?, ?)`).run(ownerLogin.json.me.id, now, now, now).lastInsertRowid);
+        VALUES (?, 'OF-REC-777', 'pro', 'monthly', 'card', 1000, 122.81, 0, '', 'card', 'paid', ?, ?, ?)`).run(ownerMe.id, now, now, now).lastInsertRowid);
 
       const rec = await s.req('GET', `/api/billing/payments/${payId}/receipt`, undefined, oAuth);
       assert.equal(rec.status, 200);
@@ -541,8 +564,8 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
       }
     });
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
 
       // فحص إشعار COD المحاسبي اليدوي
       const cod = await s.req('GET', '/api/cod', undefined, auth);
@@ -599,8 +622,8 @@ describe('٧. البريد الإلكتروني الحقيقي (HTTP API) وان
       }
     });
     try {
-      const login = await loginAs(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
-      const auth = { Authorization: `Bearer ${login.json.token}` };
+      const { cookie } = await loginStaffCookie(s.req, 'owner@hardened.eg', 'OwnerHard@2026!');
+      const auth = { Cookie: cookie };
       await s.req('PUT', '/api/integrations/connections/k', {
         credentials: { apiKey: 'knz_auto_secret_123456', storeId: 'KNZ-EG-8821' },
         environment: 'production',

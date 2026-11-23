@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const rbac = require('../src/rbac');
 const { createApp } = require('../src/app');
+const { generateTotpCode } = require('../src/auth');
 
 class Client {
   constructor(base, ip) { this.base = base; this.ip = ip; this.jar = ''; }
@@ -40,6 +41,19 @@ async function start(opts = {}) {
   const base = `http://127.0.0.1:${app.server.address().port}`;
   let n = 10;
   return { app, base, client: () => new Client(base, `10.9.0.${++n}`) };
+}
+
+async function loginStaff(c, id, password) {
+  const r = await c.post('/api/auth/login', { id, password });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  if (r.data.setup2faRequired) {
+    const setup = await c.post('/api/account/2fa/setup');
+    assert.equal(setup.status, 200, JSON.stringify(setup.data));
+    const en = await c.post('/api/account/2fa/enable', { code: generateTotpCode(setup.data.secret) });
+    assert.equal(en.status, 200, JSON.stringify(en.data));
+    return { ...en, recoveryCodes: en.data.recoveryCodes, secret: setup.data.secret };
+  }
+  return r;
 }
 
 /* ============================================================================
@@ -118,7 +132,7 @@ test('المالك الوحيد: قيد قاعدة البيانات الفريد
   });
 
   const owner = s.client();
-  const login = await owner.post('/api/auth/login', { id: 'owner@orderflow.eg', password: 'OwnerPassword@2026' });
+  const login = await loginStaff(owner, 'owner@orderflow.eg', 'OwnerPassword@2026');
   assert.equal(login.status, 200);
   assert.equal(login.data.me.role, 'owner');
   assert.equal(login.data.redirectTo, '#/owner');
@@ -137,7 +151,7 @@ test('دورة حياة العميل: تسجيل تلقائي بحالة قيد 
   t.after(() => s.app.close());
 
   const owner = s.client();
-  await owner.post('/api/auth/login', { id: 'owner@orderflow.eg', password: 'OwnerPassword@2026' });
+  await loginStaff(owner, 'owner@orderflow.eg', 'OwnerPassword@2026');
 
   // إنشاء مشرف معتمد
   const createMod = await owner.post('/api/owner/moderators', {
@@ -149,7 +163,7 @@ test('دورة حياة العميل: تسجيل تلقائي بحالة قيد 
   assert.equal(createMod.status, 200);
 
   const mod = s.client();
-  const modLogin = await mod.post('/api/auth/login', { id: 'mod1@orderflow.eg', password: 'ModPassword@1' });
+  const modLogin = await loginStaff(mod, 'mod1@orderflow.eg', 'ModPassword@1');
   assert.equal(modLogin.status, 200);
   assert.equal(modLogin.data.me.role, 'moderator');
   assert.equal(modLogin.data.redirectTo, '#/moderator');
@@ -161,7 +175,8 @@ test('دورة حياة العميل: تسجيل تلقائي بحالة قيد 
     fullName: 'أحمد السلام',
     email: 'salam@client.eg',
     phone: '01022223333',
-    password: 'ClientPass@1'
+    password: 'ClientPass@1',
+    termsAccepted: true
   });
   assert.equal(reg1.status, 200);
   assert.equal(reg1.data.pending, true);
@@ -181,7 +196,8 @@ test('دورة حياة العميل: تسجيل تلقائي بحالة قيد 
     fullName: 'سعيد مرفوض',
     email: 'rejected@client.eg',
     phone: '01033334444',
-    password: 'ClientPass@2'
+    password: 'ClientPass@2',
+    termsAccepted: true
   });
   assert.equal(reg2.status, 200);
   assert.equal(reg2.data.pending, true);
@@ -227,7 +243,7 @@ test('إدارة المشرفين: الحد الأقصى 3، تخصيص الصل
   t.after(() => s.app.close());
 
   const owner = s.client();
-  await owner.post('/api/auth/login', { id: 'owner@orderflow.eg', password: 'OwnerPassword@2026' });
+  await loginStaff(owner, 'owner@orderflow.eg', 'OwnerPassword@2026');
 
   // إنشاء 3 مشرفين
   const m1 = (await owner.post('/api/owner/moderators', { fullName: 'مشرف ١', email: 'm1@of.eg', phone: '01010000001', password: 'Password@1' })).data.moderator;
@@ -240,13 +256,14 @@ test('إدارة المشرفين: الحد الأقصى 3، تخصيص الصل
   assert.equal(m4.status, 409);
   assert.equal(m4.data.code, 'MODERATOR_LIMIT_REACHED');
 
-  // تسجيل دخول مشرف ١
+  // تسجيل دخول مشرف ١ وإعداد 2FA الإلزامي
   const mod1 = s.client();
-  assert.equal((await mod1.post('/api/auth/login', { id: 'm1@of.eg', password: 'Password@1' })).status, 200);
+  const mod1Info = await loginStaff(mod1, 'm1@of.eg', 'Password@1');
+  assert.equal(mod1Info.status, 200);
 
   // عميل جديد بانتظار التفعيل
   const pendingClient = s.client();
-  await pendingClient.post('/api/auth/register', { store: 'متجر المهام', email: 'task@client.eg', phone: '01055556666', password: 'Password@9' });
+  await pendingClient.post('/api/auth/register', { store: 'متجر المهام', email: 'task@client.eg', phone: '01055556666', password: 'Password@9', termsAccepted: true });
   const cid = (await owner.get('/api/owner/clients?status=pending')).data.clients[0].id;
 
   // المالك يسحب صلاحية القبول (approve_clients) من مشرف ١ فقط
@@ -269,8 +286,11 @@ test('إدارة المشرفين: الحد الأقصى 3، تخصيص الصل
   assert.equal(checkAfterPass.status, 401);
   assert.equal(checkAfterPass.data.code, 'SESSION_REVOKED');
 
-  // يدخل بكلمة المرور الجديدة ثم يقوم المالك بإيقافه مؤقتًا -> طرد فوري
-  assert.equal((await mod1.post('/api/auth/login', { id: 'm1@of.eg', password: 'NewModPass@99' })).status, 200);
+  // يدخل بكلمة المرور الجديدة + كود الاسترداد ثم يقوم المالك بإيقافه مؤقتًا -> طرد فوري
+  const reloginChal = await mod1.post('/api/auth/login', { id: 'm1@of.eg', password: 'NewModPass@99' });
+  assert.equal(reloginChal.status, 200);
+  assert.equal(reloginChal.data.requires2fa, true);
+  assert.equal((await mod1.post('/api/auth/login/2fa', { challengeToken: reloginChal.data.challengeToken, code: mod1Info.recoveryCodes[0] })).status, 200);
   assert.equal((await owner.post(`/api/owner/moderators/${m1.id}/status`, { status: 'suspended' })).status, 200);
   const checkAfterSusp = await mod1.get('/api/moderator/dashboard');
   assert.equal(checkAfterSusp.status, 401);
@@ -299,18 +319,18 @@ test('الأمان وإخفاء اللوحات (404 Not Found): الروابط �
   t.after(() => s.app.close());
 
   const owner = s.client();
-  await owner.post('/api/auth/login', { id: 'owner@orderflow.eg', password: 'OwnerPassword@2026' });
+  await loginStaff(owner, 'owner@orderflow.eg', 'OwnerPassword@2026');
   const ownerId = s.app.db.prepare("SELECT id FROM users WHERE role = 'owner'").get().id;
 
   const modRes = await owner.post('/api/owner/moderators', {
     fullName: 'مشرف اختبار', email: 'modsec@of.eg', phone: '01077778888', password: 'ModSecPassword@1'
   });
   const mod = s.client();
-  await mod.post('/api/auth/login', { id: 'modsec@of.eg', password: 'ModSecPassword@1' });
+  await loginStaff(mod, 'modsec@of.eg', 'ModSecPassword@1');
 
   // عميل نشط
   const client = s.client();
-  await client.post('/api/auth/register', { store: 'متجر عميل', email: 'csec@of.eg', phone: '01066667777', password: 'ClientSec@1' });
+  await client.post('/api/auth/register', { store: 'متجر عميل', email: 'csec@of.eg', phone: '01066667777', password: 'ClientSec@1', termsAccepted: true });
   const cId = (await owner.get('/api/owner/clients?status=pending')).data.clients[0].id;
   await owner.post(`/api/owner/clients/${cId}/approve`);
   await client.post('/api/auth/login', { id: 'csec@of.eg', password: 'ClientSec@1' });

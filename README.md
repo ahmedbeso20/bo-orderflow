@@ -58,7 +58,17 @@ npm run lint
 | `ADMIN_PHONE` | رقم موبايل المشرف الأول الذي يُنشأ أو يُرقّى تلقائيًا عند بدء التشغيل | — |
 | `ADMIN_PASSWORD` | كلمة مرور المشرف الأول (٨ أحرف على الأقل) | — |
 | `GEMINI_API_KEY` | مفتاح Google Gemini لتشغيل أدوات الذكاء الاصطناعي الحقيقية | — (يعمل الوضع الاحتياطي بدونه) |
-| `PAYMENT_PROVIDER` | مزود بوابة الدفع (`sandbox` للتجربة أو `hosted` للربط الحقيقي) | `sandbox` |
+| `PAYMENT_PROVIDER` | مزود بوابة الدفع (`sandbox` للتجربة، `hosted` للربط الخارجي، أو `kashier`) | `hosted` |
+| `TRUST_PROXY` | تفعيل قراءة عنوان IP الحقيقي للعميل من ترويسة `X-Forwarded-For` خلف Reverse Proxy (`1` أو `true`) | `0` |
+| `TRUST_PROXY_HOPS` | عدد الـ Proxies الموثوقة أمام الخادم عند تفعيل `TRUST_PROXY=1` | `1` |
+
+### إعداد `TRUST_PROXY` و `TRUST_PROXY_HOPS` في الإنتاج
+لحماية آلية تحديد معدل الطلبات (Rate Limiting) وسجلات الأمان من تزوير ترويسة `X-Forwarded-For`:
+- **اتصال مباشر بالإنترنت (بدون Reverse Proxy):** اترك `TRUST_PROXY=0` (الافتراضي). سيعتمد الخادم فقط على `socket.remoteAddress` ويتجاهل أي ترويسة `X-Forwarded-For` مرسلة من العميل.
+- **خلف Reverse Proxy واحد (مثل Nginx أو Caddy أو Google Cloud Run):** اضبط `TRUST_PROXY=1` و `TRUST_PROXY_HOPS=1`. سيقرأ الخادم العنوان الأول من اليمين الذي أضافه الـ Proxy الموثوق.
+- **خلف سلسلتين من الـ Proxy (مثل Cloudflare → Nginx → OrderFlow):** اضبط `TRUST_PROXY=1` و `TRUST_PROXY_HOPS=2` لقراءة عنوان العميل الحقيقي بدقة ومنع التلاعب بتجاوز الـ Rate Limit.
+
+راجع أيضًا ملف [`SECURITY.md`](./SECURITY.md) لخطة الاستجابة للحوادث الأمنية وتدوير مفاتيح التشفير (`scripts/rotate-encryption-key.js`) واستعادة النسخ الاحتياطية المشفّرة (`scripts/restore-backup.js`).
 
 ---
 

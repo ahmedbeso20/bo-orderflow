@@ -1,26 +1,131 @@
 'use strict';
-const { verifyPassword, hashPassword, generateTotpSecret, verifyTotpCode, buildTotpUri } = require('../auth');
+const zlib = require('node:zlib');
+const {
+  verifyPassword, hashPassword, generateTotpSecret, verifyTotpCode,
+  buildTotpUri, generateRecoveryCodes, normalizeRecoveryCode
+} = require('../auth');
+const { getLoginRedirect } = require('../rbac');
 const { HttpError, bad, text, phone, email, password, oneOf, latin, nowIso, parseJson } = require('../util');
 const { PLANS, INTEGRATION_KEYS, sanitizeIntegrations, NOTIFICATION_KEYS } = require('../domain');
-const { generateQrSvg } = require('../pages');
+const { generateQrSvg } = require('../qr');
 const { seedDemo } = require('../seed');
 
 const MARKET_KEYS = ['a', 'n', 'j', 't', 'k'];
 const DAY_MS = 86400_000;
 
+/** CRC32 table and zero-dependency ZIP archive writer (deflate via node:zlib) */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xFFFF;
+  const dosDate = ((((Math.max(1980, now.getFullYear()) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate())) & 0xFFFF;
+
+  for (const { name, content } of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const raw = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+    const compressed = zlib.deflateRawSync(raw);
+    const crc = crc32(raw);
+
+    const local = Buffer.alloc(30 + nameBuf.length);
+    local.writeUInt32LE(0x04034B50, 0);
+    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt16LE(0x0800, 6); // UTF-8
+    local.writeUInt16LE(8, 8); // deflate
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(compressed.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBuf.copy(local, 30);
+
+    const central = Buffer.alloc(46 + nameBuf.length);
+    central.writeUInt32LE(0x02014B50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(8, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(compressed.length, 20);
+    central.writeUInt32LE(raw.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    nameBuf.copy(central, 46);
+
+    localParts.push(local, compressed);
+    centralParts.push(central);
+    offset += local.length + compressed.length;
+  }
+
+  const centralBuf = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054B50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralBuf, eocd]);
+}
+
 module.exports = (r, app) => {
-  const { q, cfg, limiter, cipher, session, mailer, notify, logAudit, model, connectors, getPlatformSettings } = app;
+  const { q, tx, cfg, limiter, cipher, session, mailer, notify, logAudit, logPiiAccess, model, connectors, getPlatformSettings, sms } = app;
   const reload = (id) => q('SELECT * FROM users WHERE id = ?').get(id);
   const noDemo = (u) => { if (u.is_demo) throw new HttpError(403, 'هذا الإجراء غير متاح في الحساب التجريبي'); };
 
   /** كل ما تحتاجه الواجهة عند الفتح في طلب واحد */
-  r.get('/api/bootstrap', ({ user }) => ({
-    me: model.meOf(user), settings: model.settingsOf(user), ...model.meta(user),
-    products: model.productsOf(user.id), ai: parseJson(user.ai_cache, {}),
-    payments: model.paymentsOf(user.id),
-    marketplaceSchemas: connectors.PLATFORM_SCHEMAS,
-    marketplaceConnections: connectors.listForUser(user.id)
-  }));
+  r.get('/api/bootstrap', ({ user }) => {
+    const plat = getPlatformSettings();
+    const conns = connectors.listForUser(user.id);
+    const hasSeedData = Boolean(
+      q("SELECT 1 FROM orders WHERE user_id = ? AND source = 'seed' LIMIT 1").get(user.id)
+      || q("SELECT 1 FROM products WHERE user_id = ? AND source = 'seed' LIMIT 1").get(user.id)
+    );
+    return {
+      me: model.meOf(user),
+      settings: model.settingsOf(user),
+      ...model.meta(user),
+      products: model.productsOf(user.id),
+      ai: parseJson(user.ai_cache, {}),
+      payments: model.paymentsOf(user.id),
+      marketplaceSchemas: connectors.PLATFORM_SCHEMAS,
+      marketplaceConnections: conns,
+      hasActiveConnection: conns.some((c) => c.configured && c.enabled),
+      hasSeedData,
+      piiRetentionDays: Math.max(1, Number(plat.pii_retention_days || cfg.piiRetentionDays || 30)),
+      requireEmailVerification: plat.require_email_verification === '1',
+      smsEnabled: Boolean(sms && sms.configured)
+    };
+  });
 
   r.put('/api/settings', ({ user, body }) => {
     const f = {};
@@ -36,7 +141,10 @@ module.exports = (r, app) => {
       f.instapay = cleanIpa ? cipher.encrypt(cleanIpa) : '';
     }
     if (!user.is_demo) { // الموبايل والبريد هما بيانات الدخول، فلا تُعدَّل في الحساب التجريبي
-      if (body.storePhone !== undefined) f.phone = phone(body.storePhone);
+      if (body.storePhone !== undefined) {
+        f.phone = phone(body.storePhone);
+        if (f.phone !== user.phone) f.phone_verified_at = null;
+      }
       if (body.storeEmail !== undefined) {
         f.email = email(body.storeEmail);
         if (f.email !== user.email) f.email_verified_at = null;
@@ -65,7 +173,7 @@ module.exports = (r, app) => {
       }
     }
     if (!targetEmail) throw bad('أضف بريدك الإلكتروني أولًا في إعدادات المتجر');
-    const { token } = app.issueOneTimeToken(user.id, 'verify_email', 24 * 3600_000);
+    const { token } = app.issueOneTimeToken(user.id, 'verify_email', 24 * 3600_000, targetEmail);
     await mailer.send({
       to: targetEmail,
       subject: 'تأكيد البريد الإلكتروني — OrderFlow',
@@ -74,7 +182,7 @@ module.exports = (r, app) => {
       url: `${cfg.appUrl || 'http://localhost:3000'}/#/verify-email?token=${token}`,
       text: `رمز تأكيد بريدك الإلكتروني في OrderFlow هو: ${token}`
     });
-    return { ok: true, email: targetEmail, ...(!cfg.production ? { devToken: token } : {}) };
+    return { ok: true, email: targetEmail, ...(!cfg.enforcedProd ? { devToken: token } : {}) };
   });
 
   // تأكيد البريد الإلكتروني لحساب مسجّل الدخول
@@ -88,16 +196,39 @@ module.exports = (r, app) => {
     return { ok: true, me: model.meOf(fresh), settings: model.settingsOf(fresh) };
   });
 
+  // توثيق رقم الموبايل عبر SMS OTP
+  r.post('/api/account/verify-phone/send', async ({ user }) => {
+    noDemo(user);
+    if (!user.phone) throw bad('أضف رقم موبايلك أولًا في إعدادات المتجر');
+    const out = await app.issuePhoneOtp(user.id, user.phone, 'رمز تأكيد رقم موبايلك في OrderFlow');
+    return { ok: true, phone: user.phone, expiresAt: out.expiresAt, ...(!cfg.enforcedProd ? { devOtp: out.code } : {}) };
+  });
+
+  r.post('/api/account/verify-phone/confirm', ({ user, body }) => {
+    noDemo(user);
+    app.verifyPhoneOtp(user.phone, body.code || body.otp, user.id);
+    const now = nowIso();
+    q('UPDATE users SET phone_verified_at = ? WHERE id = ?').run(now, user.id);
+    notify(user.id, 'ok', 'تم توثيق رقم موبايلك بنجاح ✓', 'يمكنك الآن استخدام رقم الموبايل لاستعادة كلمة المرور والتنبيهات الهامة.', '#/set');
+    const fresh = reload(user.id);
+    return { ok: true, me: model.meOf(fresh), settings: model.settingsOf(fresh) };
+  });
+
   // المصادقة الثنائية (2FA - TOTP) لحسابات المالك والمشرفين والتجار
-  r.get('/api/account/2fa/status', ({ user }) => ({
-    enabled: Boolean(user.totp_enabled),
-    recommended: user.role === 'owner' || user.role === 'moderator'
-  }));
+  r.get('/api/account/2fa/status', ({ user }) => {
+    const remainingRecovery = q('SELECT COUNT(*) n FROM totp_recovery_codes WHERE user_id = ? AND used_at IS NULL').get(user.id).n;
+    return {
+      enabled: Boolean(user.totp_enabled),
+      mandatory: user.role === 'owner' || user.role === 'moderator',
+      recommended: user.role === 'owner' || user.role === 'moderator',
+      remainingRecoveryCodes: remainingRecovery
+    };
+  });
 
   r.post('/api/account/2fa/setup', ({ user }) => {
     noDemo(user);
     const secret = generateTotpSecret();
-    q('UPDATE users SET totp_secret_enc = ?, totp_enabled = 0 WHERE id = ?').run(cipher.encrypt(secret), user.id);
+    q('UPDATE users SET totp_secret_enc = ?, totp_enabled = 0, totp_last_step = 0 WHERE id = ?').run(cipher.encrypt(secret), user.id);
     const otpauthUri = buildTotpUri({
       secret,
       accountName: user.email || user.phone || `user-${user.id}`,
@@ -111,23 +242,53 @@ module.exports = (r, app) => {
     };
   });
 
-  r.post('/api/account/2fa/enable', ({ user, body, ip }) => {
+  r.post('/api/account/2fa/enable', async ({ user, body, res, ip }) => {
     noDemo(user);
     const cur = reload(user.id);
     if (!cur.totp_secret_enc) throw bad('ابدأ إعداد المصادقة الثنائية أولًا للحصول على المفتاح');
     const secret = cipher.decrypt(cur.totp_secret_enc);
     const code = String(body.code || body.totpCode || body.otp || '').trim();
-    if (!verifyTotpCode(secret, code)) {
+    const step = verifyTotpCode(secret, code);
+    if (!step) {
       throw bad('رمز التحقق غير صحيح. تأكد من إدخال الرمز المكوّن من ٦ أرقام من تطبيق المصادقة.');
     }
-    q('UPDATE users SET totp_enabled = 1 WHERE id = ?').run(user.id);
+    if (step <= Number(cur.totp_last_step || 0)) {
+      throw bad('تم استخدام هذا الرمز بالفعل، انتظر الرمز التالي.');
+    }
+
+    // توليد ١٠ أكواد استرداد ذات استخدام واحد وتخزين هاش scrypt فقط
+    const recoveryCodes = generateRecoveryCodes(10);
+    const hashes = await Promise.all(recoveryCodes.map((c) => hashPassword(normalizeRecoveryCode(c))));
+    const now = nowIso();
+    tx(() => {
+      q('UPDATE users SET totp_enabled = 1, totp_last_step = ? WHERE id = ?').run(step, user.id);
+      q('DELETE FROM totp_recovery_codes WHERE user_id = ?').run(user.id);
+      const ins = q('INSERT INTO totp_recovery_codes (user_id, code_hash, created_at) VALUES (?, ?, ?)');
+      for (const h of hashes) ins.run(user.id, h, now);
+    });
+
     logAudit(user.id, 'security.2fa_enabled', 'user', user.id, { role: user.role }, ip);
     const fresh = reload(user.id);
-    return { ok: true, totpEnabled: true, me: model.meOf(fresh), settings: model.settingsOf(fresh) };
+    // ترقية الجلسة المقيدة إلى جلسة كاملة بعد تفعيل 2FA
+    session.issue(res, fresh);
+    if (fresh.role === 'owner' && app.trackOwnerLoginIp) {
+      await app.trackOwnerLoginIp(fresh, ip);
+    }
+    return {
+      ok: true,
+      totpEnabled: true,
+      recoveryCodes,
+      me: model.meOf(fresh),
+      settings: model.settingsOf(fresh),
+      redirectTo: getLoginRedirect(fresh)
+    };
   });
 
   r.post('/api/account/2fa/disable', async ({ user, body, ip }) => {
     noDemo(user);
+    if (user.role === 'owner' || user.role === 'moderator') {
+      throw new HttpError(403, 'المصادقة الثنائية إلزامية لحسابات المالك والمشرفين ولا يمكن تعطيلها.', { code: '2FA_MANDATORY_FOR_STAFF' });
+    }
     if (!limiter.hit(`2fa-dis:${user.id}`, 6, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
     if (!(await verifyPassword(String(body.password ?? ''), user.pass_hash))) {
       throw new HttpError(403, 'كلمة المرور الحالية غير صحيحة');
@@ -139,10 +300,113 @@ module.exports = (r, app) => {
         throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتعطيل الحماية');
       }
     }
-    q("UPDATE users SET totp_enabled = 0, totp_secret_enc = '' WHERE id = ?").run(user.id);
+    tx(() => {
+      q("UPDATE users SET totp_enabled = 0, totp_secret_enc = '', totp_last_step = 0 WHERE id = ?").run(user.id);
+      q('DELETE FROM totp_recovery_codes WHERE user_id = ?').run(user.id);
+    });
     logAudit(user.id, 'security.2fa_disabled', 'user', user.id, { role: user.role }, ip);
     const fresh = reload(user.id);
     return { ok: true, totpEnabled: false, me: model.meOf(fresh), settings: model.settingsOf(fresh) };
+  });
+
+  // حذف البيانات التجريبية فقط (source = 'seed') دون المساس بالبيانات اليدوية أو المتصلة بالأسواق
+  r.delete('/api/account/seed-data', ({ user, ip }) => {
+    const out = tx(() => {
+      const delOrders = q("DELETE FROM orders WHERE user_id = ? AND source = 'seed'").run(user.id).changes;
+      const delProducts = q("DELETE FROM products WHERE user_id = ? AND source = 'seed'").run(user.id).changes;
+      const delCustomers = q(`DELETE FROM customers WHERE user_id = ? AND id NOT IN (
+        SELECT DISTINCT customer_id FROM orders WHERE user_id = ? AND customer_id IS NOT NULL
+      )`).run(user.id, user.id).changes;
+      return { deletedOrders: delOrders, deletedProducts: delProducts, deletedCustomers: delCustomers };
+    });
+    logAudit(user.id, 'account.seed_data_deleted', 'user', user.id, out, ip);
+    return { ok: true, ...out, ...model.meta(reload(user.id)) };
+  });
+
+  // تصدير جميع بيانات التاجر في ملف ZIP (قانون حماية البيانات الشخصية ١٥١ لسنة ٢٠٢٠)
+  r.get('/api/account/export', ({ user, res, ip }) => {
+    noDemo(user);
+    if (!limiter.hit(`export-data:${user.id}`, 2, 86400_000)) {
+      throw new HttpError(429, 'يمكنك تصدير نسخة كاملة من بياناتك مرتين كحد أقصى يوميًا.', { code: 'RATE_LIMITED' });
+    }
+    const profile = {
+      ...model.meOf(user),
+      settings: model.settingsOf(user),
+      exportedAt: nowIso()
+    };
+    const products = model.productsOf(user.id);
+    const orders = q('SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC').all(user.id).map(model.orderOf);
+    const customers = q('SELECT * FROM customers WHERE user_id = ? ORDER BY id DESC').all(user.id).map(model.customerOf);
+    const payments = model.paymentsOf(user.id);
+    const notifications = q('SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC').all(user.id).map(model.notificationOf);
+
+    const zipBuf = buildZip([
+      { name: 'profile.json', content: JSON.stringify(profile, null, 2) },
+      { name: 'products.json', content: JSON.stringify(products, null, 2) },
+      { name: 'orders.json', content: JSON.stringify(orders, null, 2) },
+      { name: 'customers.json', content: JSON.stringify(customers, null, 2) },
+      { name: 'payments.json', content: JSON.stringify(payments, null, 2) },
+      { name: 'notifications.json', content: JSON.stringify(notifications, null, 2) }
+    ]);
+
+    logAudit(user.id, 'account.data_export', 'user', user.id, { orders: orders.length, customers: customers.length, products: products.length }, ip);
+    if (logPiiAccess) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: 'account_export_zip',
+        targetType: 'account',
+        targetId: user.id,
+        count: orders.length + customers.length,
+        ip
+      });
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="orderflow-export-${user.id}.zip"`,
+      'Content-Length': zipBuf.length,
+      'Cache-Control': 'no-store'
+    });
+    res.end(zipBuf);
+  });
+
+  // طلب حذف الحساب مع مهلة سماح ١٤ يومًا قبل الحذف النهائي وأرشفة الفواتير الضريبية مجهولة الهوية
+  r.post('/api/account/delete', async ({ user, body, ip }) => {
+    noDemo(user);
+    if (user.role === 'owner') {
+      throw new HttpError(403, 'لا يمكن حذف حساب مالك المنصة لحماية استمرارية النظام.', { code: 'OWNER_PROTECTED' });
+    }
+    if (!limiter.hit(`delreq:${user.id}`, 5, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
+    if (!(await verifyPassword(String(body.password ?? ''), user.pass_hash))) {
+      throw new HttpError(403, 'كلمة المرور غير صحيحة');
+    }
+    if (user.totp_enabled && user.totp_secret_enc) {
+      const code = String(body.code || body.totpCode || body.otp || '').trim();
+      if (!code || !verifyTotpCode(cipher.decrypt(user.totp_secret_enc), code)) {
+        throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد طلب حذف الحساب');
+      }
+    }
+    const now = nowIso();
+    const scheduled = new Date(Date.now() + 14 * DAY_MS).toISOString();
+    q('UPDATE users SET deletion_requested_at = ? WHERE id = ?').run(now, user.id);
+    logAudit(user.id, 'account.deletion_requested', 'user', user.id, { scheduledDeletionAt: scheduled }, ip);
+    notify(user.id, 'warning', 'تم جدولة حذف الحساب بعد ١٤ يومًا', 'يمكنك إلغاء طلب حذف الحساب في أي وقت خلال ١٤ يومًا من صفحة الإعدادات.', '#/set');
+    const fresh = reload(user.id);
+    return {
+      ok: true,
+      deletionRequestedAt: now,
+      scheduledDeletionAt: scheduled,
+      me: model.meOf(fresh)
+    };
+  });
+
+  r.post('/api/account/delete/cancel', ({ user, ip }) => {
+    noDemo(user);
+    q('UPDATE users SET deletion_requested_at = NULL WHERE id = ?').run(user.id);
+    logAudit(user.id, 'account.deletion_cancelled', 'user', user.id, {}, ip);
+    const fresh = reload(user.id);
+    return { ok: true, me: model.meOf(fresh) };
   });
 
   r.put('/api/settings/integrations', ({ user, body }) => {
@@ -258,7 +522,7 @@ module.exports = (r, app) => {
     await mailer.send({
       to: getPlatformSettings().support_email || 'support@orderflow.eg',
       subject: `[تذكرة دعم #${info.lastInsertRowid}] ${subject} — ${user.store_name}`,
-      type: 'support_ticket',
+      type: 'contact',
       text: `المتجر: ${user.store_name} (${user.email || user.phone})\nالموضوع: ${subject}\n\n${message}`
     });
     return { ok: true, ticket: q('SELECT * FROM support_tickets WHERE id = ?').get(info.lastInsertRowid) };
@@ -287,7 +551,6 @@ module.exports = (r, app) => {
     return { plan: model.planOf(reload(user.id)) };
   });
 
-  // مسارات الفوترة والدفع انتقلت إلى routes/billing.js
   app.checkPlanDowngradeLimits = checkPlanDowngradeLimits;
 
   r.post('/api/demo/reset', ({ user }) => {
@@ -321,4 +584,3 @@ module.exports = (r, app) => {
     return { ok: true };
   });
 };
-

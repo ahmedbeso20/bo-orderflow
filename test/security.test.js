@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createApp } = require('../src/app');
+const { generateTotpCode } = require('../src/auth');
 const { createLimiter } = require('../src/http');
 const {
   ENC_PREFIX,
@@ -125,7 +126,8 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
         store: 'متجر الأمان',
         phone: '01055551111',
         email: 'sec@client.eg',
-        password: 'ClientSec@2026'
+        password: 'ClientSec@2026',
+        termsAccepted: true
       });
       assert.equal(reg.status, 200);
       const clientId = reg.json.account.id;
@@ -134,20 +136,28 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
         id: 'owner@sec.eg',
         password: 'OwnerSec@2026!'
       });
-      const ownerToken = ownerLogin.json.token;
+      let ownerCookie = (ownerLogin.headers.get('set-cookie') || '').split(';')[0];
+      if (ownerLogin.json.setup2faRequired) {
+        const setup = await app.req('POST', '/api/account/2fa/setup', {}, { Cookie: ownerCookie });
+        const en = await app.req('POST', '/api/account/2fa/enable', { code: generateTotpCode(setup.json.secret) }, { Cookie: ownerCookie });
+        ownerCookie = (en.headers.get('set-cookie') || '').split(';')[0] || ownerCookie;
+      }
 
-      await app.req('POST', `/api/owner/clients/${clientId}/approve`, {}, { Authorization: `Bearer ${ownerToken}` });
+      await app.req('POST', `/api/owner/clients/${clientId}/approve`, {}, { Cookie: ownerCookie });
 
       const clientLogin = await app.req('POST', '/api/auth/login', {
         id: 'sec@client.eg',
         password: 'ClientSec@2026'
       });
-      const clientToken = clientLogin.json.token;
+      assert.equal(clientLogin.json.token, undefined, 'لا يجوز إرجاع التوكن في JSON');
+      const clientCookie = (clientLogin.headers.get('set-cookie') || '').split(';')[0];
+      const clientTokenVal = clientCookie.split('=').slice(1).join('=');
+      const ownerTokenVal = ownerCookie.split('=').slice(1).join('=');
 
       const putRes = await app.req('PUT', '/api/settings', {
         taxId: '555-777-999',
         instaPayHandle: 'secure.merchant@instapay'
-      }, { Authorization: `Bearer ${clientToken}` });
+      }, { Cookie: clientCookie });
       assert.equal(putRes.status, 200);
       assert.equal(putRes.json.settings.taxId, '555-777-999');
       assert.equal(putRes.json.settings.instaPayHandle, 'secure.merchant@instapay');
@@ -167,7 +177,7 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
         stock: 5,
         markets: 'a',
         image: 'data:image/svg+xml,<svg onload=alert(1)>'
-      }, { Authorization: `Bearer ${clientToken}` });
+      }, { Cookie: clientCookie });
       assert.equal(svgRes.status, 400);
 
       const protoRelRes = await app.req('POST', '/api/products', {
@@ -177,15 +187,17 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
         stock: 5,
         markets: 'a',
         image: '//evil.example/payload.png'
-      }, { Authorization: `Bearer ${clientToken}` });
+      }, { Cookie: clientCookie });
       assert.equal(protoRelRes.status, 400);
 
-      // حصر ?token= على مسارات التصدير فقط ورفضه على /api/auth/me و /api/owner/dashboard
-      const qMe = await app.req('GET', `/api/auth/me?token=${encodeURIComponent(clientToken)}`);
+      // رفض ?token= على كافة المسارات (بما فيها التصدير) والاعتماد على HttpOnly Cookie فقط
+      const qMe = await app.req('GET', `/api/auth/me?token=${encodeURIComponent(clientTokenVal)}`);
       assert.equal(qMe.status, 401);
-      const qOwner = await app.req('GET', `/api/owner/dashboard?token=${encodeURIComponent(ownerToken)}`);
+      const qOwner = await app.req('GET', `/api/owner/dashboard?token=${encodeURIComponent(ownerTokenVal)}`);
       assert.equal(qOwner.status, 404);
-      const qCsv = await app.req('GET', `/api/products/export.csv?token=${encodeURIComponent(clientToken)}`);
+      const qCsvRejected = await app.req('GET', `/api/products/export.csv?token=${encodeURIComponent(clientTokenVal)}`);
+      assert.equal(qCsvRejected.status, 401);
+      const qCsv = await app.req('GET', '/api/products/export.csv', undefined, { Cookie: clientCookie });
       assert.equal(qCsv.status, 200);
 
       // التحقق من ترويسات الأمان ومهل Slowloris
@@ -201,9 +213,9 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
       assert.equal(ownerFp.json.devToken, undefined);
 
       // إبطال الجلسة على الخادم فور تسجيل الخروج
-      const logoutRes = await app.req('POST', '/api/auth/logout', {}, { Authorization: `Bearer ${clientToken}` });
+      const logoutRes = await app.req('POST', '/api/auth/logout', {}, { Cookie: clientCookie });
       assert.equal(logoutRes.status, 200);
-      const reusedRes = await app.req('GET', '/api/auth/me', undefined, { Authorization: `Bearer ${clientToken}` });
+      const reusedRes = await app.req('GET', '/api/auth/me', undefined, { Cookie: clientCookie });
       assert.equal(reusedRes.status, 401);
       assert.equal(reusedRes.json.code, 'SESSION_REVOKED');
 
@@ -212,7 +224,8 @@ describe('تكامل تقوية أمان الخادم وقاعدة البيان�
         store: 'متجر ضعيف',
         phone: '01055552222',
         email: 'weak@client.eg',
-        password: 'password123'
+        password: 'password123',
+        termsAccepted: true
       });
       assert.equal(weakReg.status, 400);
     } finally {

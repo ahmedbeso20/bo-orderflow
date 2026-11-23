@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../src/app');
+const { generateTotpCode } = require('../src/auth');
 
 class Client {
   constructor(base, ip) { this.base = base; this.ip = ip; this.jar = ''; }
@@ -35,9 +36,21 @@ async function start(opts = {}) {
 const phoneOf = (() => { let n = 0; return () => `0100000${String(++n).padStart(4, '0')}`; })();
 async function signup(c, over = {}) {
   const phone = over.phone || phoneOf();
-  const r = await c.post('/api/auth/register', { store: 'متجر الاختبار', phone, password: 'secret123', ...over });
+  const r = await c.post('/api/auth/register', { store: 'متجر الاختبار', phone, password: 'secret123', termsAccepted: true, ...over });
   assert.equal(r.status, 200, JSON.stringify(r.data));
   return phone;
+}
+async function loginStaff(c, id, password) {
+  const r = await c.post('/api/auth/login', { id, password });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  if (r.data.setup2faRequired) {
+    const setup = await c.post('/api/account/2fa/setup');
+    assert.equal(setup.status, 200, JSON.stringify(setup.data));
+    const en = await c.post('/api/account/2fa/enable', { code: generateTotpCode(setup.data.secret) });
+    assert.equal(en.status, 200, JSON.stringify(en.data));
+    return en;
+  }
+  return r;
 }
 const prod = (o = {}) => ({ name: 'منتج تجريبي', sku: `SKU-${Math.random().toString(36).slice(2, 8)}`, price: 100, cost: 60, stock: 10, markets: 'anj', ...o });
 const orderBody = (productId, o = {}) => ({ market: 'a', customer: 'عميل اختبار', gov: 'القاهرة', pay: 'عند الاستلام', courier: 'بوسطة', items: [{ productId, qty: 1 }], ...o });
@@ -69,7 +82,7 @@ test('التسجيل والدخول وتغيير كلمة المرور وحذف 
   assert.equal(boot.data.me.email, 'owner@example.com');
   assert.equal(boot.data.plan.id, 'free');
   assert.equal(boot.data.products.length, 0);
-  assert.equal((await s.client().post('/api/auth/register', { store: 'آخر', phone: '+201000000001', password: 'secret123' })).status, 409);
+  assert.equal((await s.client().post('/api/auth/register', { store: 'آخر', phone: '+201000000001', password: 'secret123', termsAccepted: true })).status, 409);
 
   const c2 = s.client();
   assert.equal((await c2.post('/api/auth/login', { id: phone, password: 'wrong-pass' })).status, 401);
@@ -430,7 +443,7 @@ test('الدفع التجريبي: Luhn والانتهاء والرفض ومنع
 
 test('الإنتاج بلا بوابة مضبوطة: لا ترقية مجانية بأي طريقة', async (t) => {
   const s = await start({ nodeEnv: 'production' }); t.after(() => s.app.close());
-  const a = s.client(); await signup(a);
+  const a = s.client(); await signup(a, { email: 'prod-billing@test.eg' });
   const co = await a.post('/api/billing/checkout', card());
   assert.equal(co.status, 503);
   const direct = await a.post('/api/plan', { plan: 'business', cycle: 'yearly' });
@@ -487,8 +500,8 @@ test('بوابة مستضافة (مزوّد خارجي): تحويل، خطاف �
   const signed = JSON.stringify({ event_id: 'e1', reference: ref, status: 'paid', amount: 1, currency: 'EGP' });
   assert.equal((await hook(null, sign(SECRET, signed), signed.replace('"amount":1', '"amount":1000'))).status, 401, 'تعديل الجسم يبطل التوقيع');
 
-  // مبلغ غير مطابق (موقَّع صحيحًا) ⇒ لا تفعيل
-  assert.equal((await hook({ event_id: 'e2', reference: ref, status: 'paid', amount: 1, currency: 'EGP' })).status, 200);
+  // مبلغ غير مطابق (موقَّع صحيحًا) ⇒ لا تفعيل ويرفض بـ 400 مع تسجيل review
+  assert.equal((await hook({ event_id: 'e2', reference: ref, status: 'paid', amount: 1, currency: 'EGP' })).status, 400);
   assert.equal((await a.get('/api/bootstrap')).data.plan.id, 'free');
   assert.equal((await a.get(`/api/billing/status/${ref}`)).data.status, 'review');
 
@@ -541,7 +554,7 @@ test('دور الإدارة (Admin Role): إنشاء أول مشرف من متغ
 
   // 2) المالك الوحيد المنشأ من متغيرات البيئة يستطيع الدخول والوصول لـ /api/admin و /api/owner
   const admin = s.client();
-  const adminLogin = await admin.post('/api/auth/login', { id: '01099998888', password: 'adminPassword123' });
+  const adminLogin = await loginStaff(admin, '01099998888', 'adminPassword123');
   assert.equal(adminLogin.status, 200);
   assert.equal(adminLogin.data.me.role, 'owner');
 
@@ -574,7 +587,7 @@ test('سير عمل الاعتمادات (Approval Workflow) وسجل التدق
   t.after(() => s.app.close());
 
   const admin = s.client();
-  await admin.post('/api/auth/login', { id: '01099997777', password: 'adminPassword123' });
+  await loginStaff(admin, '01099997777', 'adminPassword123');
 
   const c = s.client();
   await signup(c, { store: 'متجر الاعتمادات' });
@@ -657,7 +670,7 @@ test('إدارة التجار، التصفح بوضع القراءة فقط (Imp
   t.after(() => s.app.close());
 
   const admin = s.client();
-  await admin.post('/api/auth/login', { id: '01099996666', password: 'adminPassword123' });
+  await loginStaff(admin, '01099996666', 'adminPassword123');
 
   const merchant = s.client();
   await signup(merchant, { store: 'متجر النيل للتجارة' });

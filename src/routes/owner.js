@@ -10,14 +10,36 @@ const {
   assertActiveModeratorLimit,
   assertNotOwnerTarget
 } = require('../rbac');
-const { HttpError, bad, text, phone, email, password, money, integer, oneOf, latin, round2, nowIso } = require('../util');
+const { HttpError, bad, text, phone, email, password, money, integer, oneOf, latin, round2, toCsv, nowIso } = require('../util');
 const { PLANS } = require('../domain');
 
 const DAY_MS = 86400_000;
 
 module.exports = (r, app) => {
-  const { q, tx, cipher, session, notify, logAudit, model, getPlatformSettings, setPlatformSetting } = app;
+  const { q, tx, cfg, cipher, session, mailer, notify, logAudit, model, getPlatformSettings, setPlatformSetting } = app;
   const dec = (v) => (cipher ? cipher.decrypt(v) : String(v || ''));
+
+  const systemStatusOf = () => {
+    const backups = app.listBackups ? app.listBackups() : [];
+    const lastBackup = backups[0] || null;
+    const plat = getPlatformSettings();
+    const unackSecurityEvents = q('SELECT COUNT(*) n FROM security_events WHERE acknowledged_at IS NULL').get().n;
+    return {
+      production: Boolean(cfg.enforcedProd),
+      mailConfigured: Boolean(mailer && mailer.configured),
+      mailProvider: mailer ? mailer.activeProvider : 'memory',
+      smsConfigured: Boolean(app.sms && app.sms.configured),
+      paymentProvider: cfg.payments.provider || null,
+      paymentMode: cfg.payments.provider === 'kashier' ? (cfg.payments.kashierMode || 'test') : (cfg.payments.provider || 'none'),
+      piiRetentionDays: Math.max(1, Number(plat.pii_retention_days || cfg.piiRetentionDays || 30)),
+      requireEmailVerification: plat.require_email_verification === '1',
+      lastBackupAt: lastBackup ? lastBackup.createdAt : null,
+      lastBackupFile: lastBackup ? lastBackup.file : null,
+      lastBackupEncrypted: lastBackup ? Boolean(lastBackup.encrypted) : false,
+      lastBackupUploadStatus: app.lastBackupUpload ? app.lastBackupUpload.status : (cfg.backupS3Bucket ? 'pending' : 'local_only'),
+      unackSecurityEvents
+    };
+  };
 
   const clientRowOf = (u) => ({
     id: u.id,
@@ -54,6 +76,7 @@ module.exports = (r, app) => {
     phone: u.phone,
     role: ROLES.MODERATOR,
     status: u.status,
+    totpEnabled: Boolean(u.totp_enabled),
     permissions: normalizePermissions(u.permissions),
     approvedCount: u.approved_count ?? q("SELECT COUNT(*) n FROM audit_log WHERE admin_id = ? AND action = 'client.approve'").get(u.id).n,
     rejectedCount: u.rejected_count ?? q("SELECT COUNT(*) n FROM audit_log WHERE admin_id = ? AND action = 'client.reject'").get(u.id).n,
@@ -155,7 +178,8 @@ module.exports = (r, app) => {
       },
       pendingQueue,
       recentAudit,
-      platformSettings: getPlatformSettings()
+      platformSettings: getPlatformSettings(),
+      systemStatus: systemStatusOf()
     };
   }, { owner: true });
 
@@ -344,23 +368,43 @@ module.exports = (r, app) => {
     };
   }, { owner: true });
 
-  r.post('/api/owner/clients/:id/approve', ({ user, params, ip }) => {
+  r.post('/api/owner/clients/:id/approve', async ({ user, params, ip }) => {
     const u = findClientStrict(params.id);
     const now = nowIso();
     q("UPDATE users SET status = 'active', reject_reason = '', reviewed_by = ?, reviewed_at = ? WHERE id = ?")
       .run(user.id, now, u.id);
     logAudit(user.id, 'client.approve', 'user', u.id, { storeName: u.store_name, email: u.email || '', phone: u.phone }, ip);
     notify(u.id, 'ok', 'تمت الموافقة على حسابك وتفعيله ✓', 'أهلًا بك في OrderFlow! يمكنك الآن تسجيل الدخول واستخدام جميع خدمات المنصة.', '#/dash');
+    if (u.email && mailer) {
+      await mailer.send({
+        to: u.email,
+        subject: 'تمت الموافقة على حسابك في OrderFlow ✓',
+        type: 'account_approved',
+        storeName: u.store_name,
+        url: `${cfg.appUrl || 'http://localhost:3000'}/#/login`,
+        text: `مرحبًا ${u.store_name}، تمت الموافقة على حسابك في OrderFlow ويمكنك الآن تسجيل الدخول.`
+      });
+    }
     return { ok: true, client: clientRowOf(findClientStrict(u.id)) };
   }, { owner: true });
 
-  r.post('/api/owner/clients/:id/reject', ({ user, params, body, ip }) => {
+  r.post('/api/owner/clients/:id/reject', async ({ user, params, body, ip }) => {
     const u = findClientStrict(params.id);
     const reason = text(body.reason || '', 'سبب الرفض', { max: 300, optional: true });
     const now = nowIso();
     q("UPDATE users SET status = 'rejected', reject_reason = ?, reviewed_by = ?, reviewed_at = ?, token_ver = token_ver + 1 WHERE id = ?")
       .run(reason, user.id, now, u.id);
     logAudit(user.id, 'client.reject', 'user', u.id, { storeName: u.store_name, email: u.email || '', phone: u.phone, reason }, ip);
+    if (u.email && mailer) {
+      await mailer.send({
+        to: u.email,
+        subject: 'تحديث بخصوص طلب تسجيل متجرك — OrderFlow',
+        type: 'account_rejected',
+        storeName: u.store_name,
+        reason,
+        text: `مرحبًا ${u.store_name}، نعتذر لعدم قبول طلب تسجيلك حاليًا.${reason ? ` السبب: ${reason}` : ''}`
+      });
+    }
     return { ok: true, client: clientRowOf(findClientStrict(u.id)) };
   }, { owner: true });
 
@@ -411,7 +455,8 @@ module.exports = (r, app) => {
   // 4. إعدادات المنصة العامة والنسخ الاحتياطي (حصريًا للمالك)
   r.get('/api/owner/settings', () => ({
     settings: getPlatformSettings(),
-    backups: app.listBackups ? app.listBackups() : []
+    backups: app.listBackups ? app.listBackups() : [],
+    systemStatus: systemStatusOf()
   }), { owner: true });
 
   r.put('/api/owner/settings', ({ user, body, ip }) => {
@@ -427,6 +472,8 @@ module.exports = (r, app) => {
       support_phone: (v) => text(v, 'هاتف الدعم', { max: 40, optional: true }),
       registration_open: (v) => (v === true || v === '1' || v === 1 ? '1' : '0'),
       require_client_approval: (v) => (v === true || v === '1' || v === 1 ? '1' : '0'),
+      require_email_verification: (v) => (v === true || v === '1' || v === 1 ? '1' : '0'),
+      pii_retention_days: (v) => String(integer(v, 'مدة الاحتفاظ ببيانات العملاء (بالأيام)', { min: 7, max: 3650 })),
       maintenance_notice: (v) => text(v, 'إشعار الصيانة', { max: 240, optional: true })
     };
     const updated = {};
@@ -438,20 +485,160 @@ module.exports = (r, app) => {
       }
     }
     logAudit(user.id, 'platform.settings_update', 'platform', null, updated, ip);
-    return { ok: true, settings: getPlatformSettings() };
+    return { ok: true, settings: getPlatformSettings(), systemStatus: systemStatusOf() };
   }, { owner: true });
 
-  // النسخ الاحتياطي لقاعدة البيانات (VACUUM INTO مع الاحتفاظ بآخر 7 نسخ)
+  // إرسال إيميل تجريبي للمالك للتحقق من إعدادات البريد الإلكتروني
+  r.post('/api/owner/mail/test', async ({ user, body, ip }) => {
+    const to = email(body?.to) || user.email || getPlatformSettings().support_email;
+    if (!to) throw bad('أضف بريدًا إلكترونيًا لحساب المالك أو في إعدادات المنصة أولًا');
+    const result = await mailer.send({
+      to,
+      subject: 'رسالة اختبار البريد الإلكتروني — OrderFlow',
+      type: 'contact',
+      text: `هذه رسالة اختبار للتأكد من عمل مزوّد البريد الإلكتروني (${mailer.activeProvider}) بنجاح في منصة OrderFlow.`
+    });
+    logAudit(user.id, 'platform.mail_test', 'mail', null, { to, provider: result.provider, delivered: result.delivered }, ip);
+    return {
+      ok: Boolean(result.delivered || result.provider === 'memory'),
+      provider: result.provider,
+      configured: mailer.configured,
+      delivered: Boolean(result.delivered),
+      error: result.error || null
+    };
+  }, { owner: true });
+
+  // النسخ الاحتياطي لقاعدة البيانات (VACUUM INTO مشفّر بـ AES-256-GCM عند توفر المفتاح + رفع اختياري إلى S3)
   r.get('/api/owner/backups', () => ({
     backups: app.listBackups ? app.listBackups() : [],
-    keepCount: app.cfg.backupKeepCount || 7
+    keepCount: app.cfg.backupKeepCount || 7,
+    lastBackupUpload: app.lastBackupUpload || null
   }), { owner: true });
 
   r.post('/api/owner/backup', ({ user, ip }) => {
     const backup = app.createBackup();
     const backups = app.listBackups();
-    logAudit(user.id, 'platform.backup_create', 'database', null, { file: backup.file, size: backup.size }, ip);
-    return { ok: true, backup, backups };
+    logAudit(user.id, 'platform.backup_create', 'database', null, { file: backup.file, size: backup.size, encrypted: Boolean(backup.encrypted) }, ip);
+    return { ok: true, backup, backups, systemStatus: systemStatusOf() };
+  }, { owner: true });
+
+  // 4b. سجل الوصول للبيانات الشخصية (PII Access Log — الامتثال لسياسة أمازون SP-API DPP والقانون ١٥١/٢٠٢٠)
+  const buildPiiLogQuery = (query) => {
+    const where = ['1 = 1'];
+    const args = [];
+    if (query.merchantId || query.ownerUserId) {
+      where.push('p.owner_user_id = ?');
+      args.push(Number(query.merchantId || query.ownerUserId) || 0);
+    }
+    if (query.actorId) {
+      where.push('p.actor_id = ?');
+      args.push(Number(query.actorId) || 0);
+    }
+    if (query.action) {
+      where.push('p.action = ?');
+      args.push(String(query.action));
+    }
+    if (query.from) {
+      where.push('p.created_at >= ?');
+      args.push(String(query.from));
+    }
+    if (query.to) {
+      where.push('p.created_at <= ?');
+      args.push(String(query.to));
+    }
+    return { sql: where.join(' AND '), args };
+  };
+
+  r.get('/api/owner/pii-log', ({ query }) => {
+    const { sql, args } = buildPiiLogQuery(query);
+    const limit = Math.min(500, Math.max(10, Number(query.limit) || 150));
+    const rows = q(`SELECT p.*,
+        act.store_name AS actor_name, act.role AS actor_role, act.email AS actor_email,
+        own.store_name AS merchant_name
+      FROM pii_access_log p
+      LEFT JOIN users act ON act.id = p.actor_id
+      LEFT JOIN users own ON own.id = p.owner_user_id
+      WHERE ${sql}
+      ORDER BY p.id DESC LIMIT ?`).all(...args, limit);
+    const logs = rows.map((x) => ({
+      id: x.id,
+      actorId: x.actor_id,
+      actorName: x.actor_name || '',
+      actorRole: x.actor_role || '',
+      actorEmail: x.actor_email || '',
+      ownerUserId: x.owner_user_id,
+      merchantName: x.merchant_name || '',
+      action: x.action,
+      targetType: x.target_type,
+      targetId: x.target_id,
+      count: x.count,
+      ip: x.ip || '',
+      createdAt: x.created_at
+    }));
+    return { logs, items: logs, total: logs.length };
+  }, { owner: true });
+
+  r.get('/api/owner/pii-log/export.csv', ({ query, res }) => {
+    const { sql, args } = buildPiiLogQuery(query);
+    const rows = q(`SELECT p.*,
+        act.store_name AS actor_name, act.role AS actor_role,
+        own.store_name AS merchant_name
+      FROM pii_access_log p
+      LEFT JOIN users act ON act.id = p.actor_id
+      LEFT JOIN users own ON own.id = p.owner_user_id
+      WHERE ${sql}
+      ORDER BY p.id DESC LIMIT 5000`).all(...args);
+    const csv = [['ID', 'التاريخ', 'المُنفّذ', 'دور المُنفّذ', 'التاجر المالك للبيانات', 'الإجراء', 'النوع', 'المعرّف', 'العدد', 'IP']];
+    for (const x of rows) {
+      csv.push([x.id, x.created_at, x.actor_name || x.actor_id, x.actor_role || '', x.merchant_name || x.owner_user_id, x.action, x.target_type, x.target_id ?? '', x.count, x.ip || '']);
+    }
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="orderflow-pii-access-log.csv"', 'Cache-Control': 'no-store' });
+    res.end(toCsv(csv));
+  }, { owner: true });
+
+  // 4c. التنبيهات الأمنية (Security Events)
+  r.get('/api/owner/security', ({ query }) => {
+    const where = ['1 = 1'];
+    const args = [];
+    if (query.severity && ['low', 'medium', 'high', 'critical'].includes(query.severity)) {
+      where.push('e.severity = ?');
+      args.push(query.severity);
+    }
+    if (query.unacked === '1') {
+      where.push('e.acknowledged_at IS NULL');
+    }
+    const rows = q(`SELECT e.*, u.full_name AS ack_by_name
+      FROM security_events e
+      LEFT JOIN users u ON u.id = e.acknowledged_by
+      WHERE ${where.join(' AND ')}
+      ORDER BY CASE WHEN e.acknowledged_at IS NULL THEN 0 ELSE 1 END, e.id DESC
+      LIMIT 150`).all(...args);
+    const events = rows.map((e) => {
+      let details = {};
+      try { details = JSON.parse(e.details || '{}'); } catch {}
+      return {
+        id: e.id,
+        severity: e.severity,
+        title: e.title,
+        details,
+        acknowledgedAt: e.acknowledged_at || null,
+        acknowledgedBy: e.acknowledged_by || null,
+        acknowledgedByName: e.ack_by_name || '',
+        createdAt: e.created_at
+      };
+    });
+    const unackCount = q('SELECT COUNT(*) n FROM security_events WHERE acknowledged_at IS NULL').get().n;
+    return { events, unackCount };
+  }, { owner: true });
+
+  r.post('/api/owner/security/:id/ack', ({ user, params, ip }) => {
+    const id = integer(params.id, 'معرّف التنبيه', { min: 1 });
+    const row = q('SELECT * FROM security_events WHERE id = ?').get(id);
+    if (!row) throw new HttpError(404, 'التنبيه الأمني غير موجود');
+    const now = nowIso();
+    q('UPDATE security_events SET acknowledged_at = ?, acknowledged_by = ? WHERE id = ?').run(now, user.id, id);
+    logAudit(user.id, 'security.event_ack', 'security_event', id, { title: row.title, severity: row.severity }, ip);
+    return { ok: true, id, acknowledgedAt: now };
   }, { owner: true });
 
   // 5. سجل المراقبة الشامل (Audit Log) مع تصفية حسب المشرف أو الدور أو الإجراء

@@ -73,6 +73,9 @@ module.exports = (r, app) => {
     const provider = payments.active();
     if (!provider) throw new HttpError(503, 'الدفع الإلكتروني غير مُفعّل حاليًا. تواصل مع الدعم لتفعيل باقتك.', { code: 'PAYMENT_UNAVAILABLE' });
     if (user.is_demo && provider.mode === 'live') throw new HttpError(403, 'أنشئ حسابًا حقيقيًا لإتمام الدفع', { code: 'DEMO_NO_PAY' });
+    if (!user.is_demo && app.getPlatformSettings().require_email_verification === '1' && !user.email_verified_at) {
+      throw new HttpError(403, 'يرجى تأكيد بريدك الإلكتروني أولًا قبل إتمام الاشتراك.', { code: 'EMAIL_VERIFICATION_REQUIRED' });
+    }
     if (!limiter.hit(`pay:${user.id}`, 8, 600_000)) throw new HttpError(429, 'محاولات دفع كثيرة، حاول بعد عدة دقائق');
 
     const method = oneOf(body.method || 'card', Object.keys(GATEWAY_METHODS), 'طريقة الدفع');

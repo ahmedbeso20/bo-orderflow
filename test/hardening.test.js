@@ -8,6 +8,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { createApp } = require('../src/app');
+const { generateTotpCode } = require('../src/auth');
 const { createMailer } = require('../src/mailer');
 const { isPrivateIp, assertSafeResolvedUrl } = require('../src/connectors');
 const { resolveModelCandidates } = require('../src/ai');
@@ -51,8 +52,22 @@ async function startApp(overrides = {}) {
   return { ...inst, base, req, tmpDir, cleanup };
 }
 
+async function loginStaffWith2fa(app, id, password) {
+  const login = await app.req('POST', '/api/auth/login', { id, password });
+  assert.equal(login.status, 200);
+  let cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+  if (login.json && login.json.setup2faRequired) {
+    const setup = await app.req('POST', '/api/account/2fa/setup', {}, { Cookie: cookie });
+    assert.equal(setup.status, 200);
+    const en = await app.req('POST', '/api/account/2fa/enable', { code: generateTotpCode(setup.json.secret) }, { Cookie: cookie });
+    assert.equal(en.status, 200);
+    cookie = (en.headers.get('set-cookie') || '').split(';')[0] || cookie;
+  }
+  return cookie;
+}
+
 async function createActiveMerchant(app, ownerCookie, { store, email, phone, password }) {
-  const reg = await app.req('POST', '/api/auth/register', { store, fullName: store, email, phone, password });
+  const reg = await app.req('POST', '/api/auth/register', { store, fullName: store, email, phone, password, termsAccepted: true });
   assert.equal(reg.status, 200);
   const userId = app.db.prepare('SELECT id FROM users WHERE email = ?').get(email).id;
   const appr = await app.req('POST', `/api/owner/clients/${userId}/approve`, {}, { Cookie: ownerCookie });
@@ -140,11 +155,7 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
   it('indexes encrypted Tax ID with blind index and finds clients by Tax ID in Owner and Admin routes', async () => {
     const app = await startApp();
     try {
-      const ownerLogin = await app.req('POST', '/api/auth/login', {
-        id: 'owner@orderflow.test',
-        password: 'OwnerPass@2026!'
-      });
-      const ownerCookie = (ownerLogin.headers.get('set-cookie') || '').split(';')[0];
+      const ownerCookie = await loginStaffWith2fa(app, 'owner@orderflow.test', 'OwnerPass@2026!');
 
       const merch = await createActiveMerchant(app, ownerCookie, {
         store: 'متجر الضرائب',
@@ -259,8 +270,7 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
   it('auto-downgrades expired plan with merchant notification and audit_log entry', async () => {
     const app = await startApp();
     try {
-      const ownerLogin = await app.req('POST', '/api/auth/login', { id: 'owner@orderflow.test', password: 'OwnerPass@2026!' });
-      const ownerCookie = (ownerLogin.headers.get('set-cookie') || '').split(';')[0];
+      const ownerCookie = await loginStaffWith2fa(app, 'owner@orderflow.test', 'OwnerPass@2026!');
       const merch = await createActiveMerchant(app, ownerCookie, {
         store: 'متجر الاشتراكات',
         email: 'exp@merchant.eg',
@@ -288,8 +298,7 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
   it('restores stock and notifies merchant when moderator rejects an order', async () => {
     const app = await startApp();
     try {
-      const ownerLogin = await app.req('POST', '/api/auth/login', { id: 'owner@orderflow.test', password: 'OwnerPass@2026!' });
-      const ownerCookie = (ownerLogin.headers.get('set-cookie') || '').split(';')[0];
+      const ownerCookie = await loginStaffWith2fa(app, 'owner@orderflow.test', 'OwnerPass@2026!');
 
       // Create moderator with review_products_orders permission
       const modRes = await app.req('POST', '/api/owner/moderators', {
@@ -301,8 +310,7 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
       }, { Cookie: ownerCookie });
       assert.equal(modRes.status, 200);
 
-      const modLogin = await app.req('POST', '/api/auth/login', { id: 'mod@orderflow.test', password: 'ModPassword@123!' });
-      const modCookie = (modLogin.headers.get('set-cookie') || '').split(';')[0];
+      const modCookie = await loginStaffWith2fa(app, 'mod@orderflow.test', 'ModPassword@123!');
 
       const merch = await createActiveMerchant(app, ownerCookie, {
         store: 'متجر المخزون',
@@ -354,8 +362,7 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
   it('supports Owner support ticket replies and expert service status updates with notifications and audit log', async () => {
     const app = await startApp();
     try {
-      const ownerLogin = await app.req('POST', '/api/auth/login', { id: 'owner@orderflow.test', password: 'OwnerPass@2026!' });
-      const ownerCookie = (ownerLogin.headers.get('set-cookie') || '').split(';')[0];
+      const ownerCookie = await loginStaffWith2fa(app, 'owner@orderflow.test', 'OwnerPass@2026!');
 
       const merch = await createActiveMerchant(app, ownerCookie, {
         store: 'متجر الدعم والخبراء',

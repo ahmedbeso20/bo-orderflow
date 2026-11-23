@@ -162,6 +162,7 @@ const renderTable = (headers, rows) => `
 const DEFAULT_UI = {
   range: 30,
   marketFilter: 'all',
+  sourceFilter: 'all',
   heroMarket: 'all',
   mobileNavOpen: false,
   dashMenuOpen: false,
@@ -173,6 +174,7 @@ const DEFAULT_UI = {
   orderPage: 1,
   authMode: 0,
   customerQuery: '',
+  authConfig: { smsEnabled: false, requireEmailVerification: false, piiRetentionDays: 30 },
   helpQuery: '',
   adminClientQuery: '',
   adminClientStatus: 'all',
@@ -300,11 +302,38 @@ const setImpersonationToken = (t) => {
 // Cleanup any legacy token left in localStorage — sessions rely exclusively on HttpOnly cookies
 try { localStorage.removeItem('omni_token'); } catch (_) {}
 
-const authedUrl = (url) => {
-  const imp = getImpersonateToken();
-  if (!imp) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(imp);
-};
+async function openAuthedHtml(url, title, downloadName) {
+  try {
+    const impToken = getImpersonateToken();
+    const headers = { 'X-Requested-With': 'omniarab' };
+    if (impToken) headers['X-Impersonate-Token'] = impToken;
+    const res = await fetch(url, { credentials: 'include', headers });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'تعذر فتح المستند');
+    }
+    const html = await res.text();
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const objUrl = URL.createObjectURL(blob);
+    openDialog(title, `
+      <div class="row-wrap" style="justify-content:flex-end;gap:8px;margin-bottom:10px">
+        <button type="button" class="btn btn-ac btn-sm" id="btn-print-doc-frame">🖨️ طباعة المستند</button>
+        <a class="btn btn-gh btn-sm" href="${objUrl}" download="${esc(downloadName || 'document.html')}">📥 تنزيل نسخة HTML</a>
+      </div>
+      <iframe id="doc-preview-frame" title="${esc(title)}" src="${objUrl}" style="width:100%;height:70vh;border:1px solid var(--bd);border-radius:10px;background:#fff"></iframe>
+    `, true);
+    const btn = $('#btn-print-doc-frame');
+    const frame = $('#doc-preview-frame');
+    if (btn && frame) {
+      btn.addEventListener('click', () => {
+        try { frame.contentWindow.focus(); frame.contentWindow.print(); } catch (_) { showToast('اضغط Ctrl+P للطباعة'); }
+      });
+    }
+    setTimeout(() => URL.revokeObjectURL(objUrl), 120000);
+  } catch (e) {
+    showToast('⚠️ ' + (e.message || 'تعذر فتح المستند'));
+  }
+}
 
 async function api(method, url, body) {
   const impToken = getImpersonateToken();
@@ -327,6 +356,10 @@ async function api(method, url, body) {
   if (!res.ok) {
     if (res.status === 401 && me) {
       sessionExpired(data && data.code === 'SESSION_REVOKED' ? (data.error || 'تم إيقاف أو حذف حسابك — تم إنهاء الجلسة فورًا') : '');
+    }
+    if (res.status === 403 && data && data.code === '2FA_SETUP_REQUIRED') {
+      if (me) me.setup2faRequired = true;
+      if (location.hash !== '#/setup-2fa') go('#/setup-2fa');
     }
     throw new ApiError(res.status, data.error || 'حدث خطأ غير متوقع', data);
   }
@@ -411,6 +444,11 @@ function applySession(d) {
   Object.assign(state, d.settings);
   state.marketplaceConnections = d.marketplaceConnections || [];
   state.marketplaceSchemas = d.marketplaceSchemas || {};
+  state.hasActiveConnection = Boolean(d.hasActiveConnection);
+  state.hasSeedData = Boolean(d.hasSeedData);
+  state.piiRetentionDays = Number(d.piiRetentionDays || state.authConfig?.piiRetentionDays || 30);
+  state.requireEmailVerification = Boolean(d.requireEmailVerification);
+  state.smsEnabled = Boolean(d.smsEnabled);
   if (state.instaPayHandle) pgState.instaPayAddress = state.instaPayHandle;
   if (state.storePhone) {
     pgState.walletPhone = state.storePhone;
@@ -1282,6 +1320,22 @@ const renderGuidedOnboarding = () => {
   `;
 };
 
+const SOURCE_BADGES = {
+  seed: ['تجريبي', 'wn'],
+  manual: ['يدوي', ''],
+  csv: ['CSV', ''],
+  amazon: ['أمازون', 'pr'],
+  noon: ['نون', 'pr'],
+  jumia: ['جوميا', 'pr'],
+  trendyol: ['ترينديول', 'pr'],
+  kenzz: ['كنز', 'pr']
+};
+const renderSourceBadge = (src) => {
+  const m = SOURCE_BADGES[String(src || 'manual').toLowerCase()];
+  if (!m) return '';
+  return `<span class="badge ${m[1]}" style="font-size:10.5px;padding:1px 6px;margin-inline-start:4px">${m[0]}</span>`;
+};
+
 views.dash = (d) => {
   const k = d.kpis;
   const lowStockItems = products.filter((p) => p.approvalStatus === 'approved' && p.stock <= 15);
@@ -1293,13 +1347,30 @@ views.dash = (d) => {
     { icon: 'ord', title: 'إجمالي الطلبات', value: fmtNum(k.orders) + ' طلب', meta: `${fmtNum(k.deliveryRate)}٪ نسبة تسليم`, cls: 'pr' },
     { icon: 'cod', title: 'تحصيلات COD جاهزة', value: fmtEGP(k.codReady), meta: 'بوسطة · أرامكس · مايلرز', cls: 'ok' }
   ];
+  const hasConn = Boolean(d.hasActiveConnection || state.hasActiveConnection);
 
   return `
-    <div class="row-wrap" style="margin-bottom:20px">
+    ${!hasConn ? `
+      <div class="card" style="margin-bottom:16px;padding:14px 18px;border-inline-start:4px solid var(--wn)">
+        <div class="row-wrap" style="gap:12px;align-items:center">
+          <div class="sp">
+            <b style="font-size:14px">لا توجد متاجر متصلة حاليًا عبر API</b>
+            <p class="mu" style="font-size:13px;margin:2px 0 0">الأرقام المعروضة تعكس الطلبات اليدوية أو التجريبية فقط. اربط متجرك على أمازون مصر أو نون أو جوميا لبدء المزامنة الحية.</p>
+          </div>
+          <a href="#/int" class="btn btn-ac btn-sm">${ico('sync', 14)} ربط المتاجر الآن</a>
+        </div>
+      </div>
+    ` : ''}
+
+    <div class="row-wrap" style="margin-bottom:20px;gap:10px">
       <div class="seg-rail" role="group" aria-label="تصفية حسب السوق">
         ${[['all', 'كل الأسواق'], ['a', 'أمازون مصر'], ['n', 'نون مصر'], ['j', 'جوميا']].map((m) => `
           <button type="button" class="pill ${state.marketFilter === m[0] ? 'on' : ''}" data-a="mkt-filter" data-v="${m[0]}">${m[1]}</button>
         `).join('')}
+      </div>
+      <div class="seg-rail" role="group" aria-label="مصدر البيانات">
+        <button type="button" class="pill ${(state.sourceFilter || 'all') === 'all' ? 'on' : ''}" data-a="src-filter" data-v="all">كل البيانات</button>
+        <button type="button" class="pill ${state.sourceFilter === 'connected' ? 'on' : ''}" data-a="src-filter" data-v="connected">المتصلة بالأسواق فقط</button>
       </div>
       <span class="sp"></span>
       <label class="row" style="cursor:pointer;font-size:13px;font-weight:700;gap:7px;background:var(--bg-elev);padding:7px 14px;border-radius:11px;border:1px solid var(--bd);white-space:nowrap;align-items:center" title="تفعيل نموذج gemini-4-argon عالي التفكير لتحليل متجرك واستخراج خطة استراتيجية دقيقة">
@@ -1423,7 +1494,7 @@ const renderProductsTable = () => {
       const margin = p.price ? ((p.price - p.cost) / p.price) * 100 : 0;
       const sb = getStockBadge(p.stock);
       return [
-        `<div class="row" style="gap:10px">${renderProdThumb(p)}<div><b>${esc(p.name)}</b><br><small class="mu">${esc(p.cat || 'عام')}</small></div></div>`,
+        `<div class="row" style="gap:10px">${renderProdThumb(p)}<div><b>${esc(p.name)}</b>${renderSourceBadge(p.source)}<br><small class="mu">${esc(p.cat || 'عام')}</small></div></div>`,
         `<code dir="ltr" style="background:var(--bg-sub);padding:2px 7px;border-radius:6px">${esc(p.sku)}</code>`,
         `<div class="row" style="gap:5px;justify-content:flex-end">${['a', 'n', 'j'].map(k => `
           <span style="cursor:pointer;opacity:${p.markets.includes(k) ? '1' : '0.25'}" data-a="toggle-prod-mkt" data-id="${p.id}" data-m="${k}" title="اضغط لتفعيل/إيقاف السوق">
@@ -1483,7 +1554,7 @@ const renderOrdersTable = (d) => {
     d.items.map((o) => {
       const stObj = ORDER_STATUS[o.status] || ORDER_STATUS[0];
       return [
-        `<b>#${arDigits(o.no)}</b><br><small class="mu">${fmtDate(o.createdAt)}</small>`,
+        `<b>#${arDigits(o.no)}</b>${renderSourceBadge(o.source)}<br><small class="mu">${fmtDate(o.createdAt)}</small>`,
         renderMarketChip(o.market),
         `<div><b>${esc(o.customer)}</b>${o.phone ? `<br><small dir="ltr" class="mu">${esc(o.phone)}</small>` : ''}<br><small class="mu">${esc(o.items || 'منتجات متنوعة')}</small></div>`,
         esc(o.gov),
@@ -2056,8 +2127,10 @@ function renderApiStatusLine(conn, isOn) {
     <small class="mu">اضغط «اختبار الاتصال» أو «سحب البيانات» لبدء التشغيل الفوري</small>`;
 }
 
-views.int = () => {
+views.int = (d) => {
   const conns = state.marketplaceConnections || [];
+  const schemas = state.marketplaceSchemas || {};
+  const syncRuns = (d && d.runs) || [];
   const connectedApiCount = conns.filter((c) => c.configured).length;
   return `
     <div class="card mp-api-banner">
@@ -2081,13 +2154,15 @@ views.int = () => {
           const isOn = !!state.integrations[item.key];
           if (API_PLATFORM_KEYS.includes(item.key)) {
             const conn = getPlatformConnection(item.key);
+            const schema = schemas[item.key] || {};
             const idLabel = formatApiIdentity(item.key, conn);
+            const sandboxUnverified = Boolean(schema.sandboxUnverified && conn?.environment === 'sandbox');
             return `
               <div class="card mp-api-card" data-platform="${item.key}">
                 <div class="mp-api-head">
                   ${renderMarketChip(item.key, 42)}
                   <div class="sp" style="min-width:0">
-                    <b style="display:block;font-size:15px">${item.name}</b>
+                    <b style="display:block;font-size:15px">${item.name}${sandboxUnverified ? ' <span class="badge wn" style="font-size:10.5px">تجريبي — لم يتم التحقق</span>' : ''}</b>
                     <p class="mu" style="font-size:12.5px;margin:2px 0 0">${item.sub}</p>
                     ${idLabel ? `<div class="mp-api-id" dir="ltr">${esc(idLabel)}${conn?.environment === 'sandbox' ? ' · Sandbox' : ''}</div>` : ''}
                   </div>
@@ -2129,6 +2204,22 @@ views.int = () => {
         }).join('')}
       </div>
     `).join('')}
+
+    <div class="card" style="margin-top:22px">
+      <h3 style="margin-bottom:12px">آخر ١٠ عمليات مزامنة مع الأسواق</h3>
+      ${syncRuns.length ? renderTable(
+        ['المنصة', 'البدء', 'طلبات جديدة', 'تحديثات', 'الحالة / الخطأ'],
+        syncRuns.slice(0, 10).map((r) => [
+          renderMarketChip(r.platform),
+          `<small class="mu">${fmtDate(r.startedAt)} · ${timeAgo(r.startedAt)}</small>`,
+          `<b>${fmtNum(r.ordersNew || 0)}</b>`,
+          `<span>${fmtNum(r.ordersUpdated || 0)}</span>`,
+          r.error
+            ? `<span class="er-tx" style="font-size:12.5px">${esc(r.error)}</span>`
+            : renderBadge('ناجحة ✓', 'ok')
+        ])
+      ) : '<p class="mu" style="font-size:13px;margin:0">لا توجد عمليات مزامنة مسجّلة حتى الآن.</p>'}
+    </div>
   `;
 };
 
@@ -2260,10 +2351,11 @@ const demoBanner = () => `
 `;
 
 const loaders = {
-  dash: () => api('GET', `/api/dashboard?range=${state.range}&market=${state.marketFilter}`),
+  dash: () => api('GET', `/api/dashboard?range=${state.range}&market=${state.marketFilter}&source=${encodeURIComponent(state.sourceFilter || 'all')}`),
   ord: () => api('GET', `/api/orders?${new URLSearchParams({ status: state.orderStatusFilter, q: state.orderQuery, page: state.orderPage })}`),
   returns: () => api('GET', '/api/returns'),
   customers: () => api('GET', `/api/customers?${new URLSearchParams({ q: state.customerQuery })}`),
+  int: () => api('GET', '/api/integrations/sync-runs').catch(() => ({ runs: [] })),
   cod: () => api('GET', '/api/cod'),
   pay: () => api('GET', '/api/billing'),
   services: () => api('GET', '/api/services/requests'),
@@ -2500,6 +2592,7 @@ views.customers = (d) => {
           <small class="mu">يُنشأ العميل تلقائيًا عند كل طلب (بالمطابقة برقم الموبايل أولًا) مع إمكانية تعديل بياناته وإضافة ملاحظات ووسوم.</small>
         </div>
         <span class="sp"></span>
+        <button type="button" class="btn btn-gh btn-sm" data-a="export-cust-csv">📥 تصدير CSV</button>
         <button type="button" class="btn btn-ac btn-sm" data-a="add-customer">+ إضافة عميل</button>
         <input style="width:260px;margin:0" placeholder="🔍 ابحث بالاسم أو الموبايل أو المحافظة أو الملاحظات..." value="${esc(state.customerQuery)}" data-i="cust-search">
       </div>
@@ -2643,7 +2736,14 @@ views.set = () => `
       </div>
       <input id="set-email" type="email" dir="ltr" value="${esc(state.storeEmail)}" ${me.isDemo ? 'disabled title="غير متاح في الحساب التجريبي"' : ''}>
 
-      <label for="set-phone">رقم الموبايل (واتساب) — يُستخدم لتسجيل الدخول</label>
+      <div class="row-wrap" style="justify-content:space-between;align-items:center;margin-top:8px">
+        <label for="set-phone" style="margin:0">رقم الموبايل (واتساب) — يُستخدم لتسجيل الدخول</label>
+        ${!me.isDemo ? (me && me.phoneVerified
+          ? renderBadge('الموبايل موثّق ✓', 'ok')
+          : (state.smsEnabled
+            ? `<button type="button" class="btn btn-gh btn-sm" data-a="open-verify-phone">📱 توثيق الموبايل عبر SMS</button>`
+            : renderBadge('غير موثّق', 'wn'))) : ''}
+      </div>
       <input id="set-phone" dir="ltr" inputmode="tel" value="${esc(state.storePhone)}" ${me.isDemo ? 'disabled title="غير متاح في الحساب التجريبي"' : ''}>
 
       <div class="grid-equal" style="gap:12px">
@@ -2674,25 +2774,34 @@ views.set = () => `
         </div>
       `).join('')}
 
-      <h3 style="margin-top:22px">المظهر والبيانات</h3>
-      <p class="mu" style="font-size:13px;margin-bottom:12px">${me.isDemo
+      <h3 style="margin-top:22px">المظهر والبيانات والخصوصية</h3>
+      <p class="mu" style="font-size:13px;margin-bottom:8px">${me.isDemo
         ? 'هذا حساب تجريبي: بياناته مؤقتة وتُحذف تلقائيًا بعد ٢٤ ساعة.'
-        : 'بياناتك محفوظة بأمان على حسابك، ويمكنك تصديرها في أي وقت.'}</p>
-      <div class="row-wrap">
+        : `بياناتك مشفّرة ومعزولة بالكامل. تُحذف بيانات العملاء الشخصية تلقائيًا بعد <b>${fmtNum(state.piiRetentionDays || 30)} يومًا</b> من التسليم.`}</p>
+      <div class="row-wrap" style="gap:8px">
         <button class="btn btn-gh" data-a="theme">🌓 تبديل الوضع الليلي / النهاري</button>
         ${me.isDemo
           ? '<button class="btn btn-er" data-a="reset-demo">↺ إعادة ضبط البيانات التجريبية</button>'
           : `<button class="btn btn-gh" data-a="export-prod-csv">📥 المنتجات CSV</button>
-             <button class="btn btn-gh" data-a="export-ord-csv">📥 الطلبات CSV</button>`}
+             <button class="btn btn-gh" data-a="export-ord-csv">📥 الطلبات CSV</button>
+             <button class="btn btn-ac" data-a="export-account-zip">📦 تصدير نسخة كاملة من بياناتي (ZIP)</button>`}
+        ${!me.isDemo && state.hasSeedData ? '<button class="btn btn-gh" data-a="delete-seed-data">🧹 حذف البيانات التجريبية</button>' : ''}
         <button class="btn btn-gh" data-a="logout">تسجيل الخروج</button>
       </div>
 
       ${me.isDemo ? '' : `
         <h3 style="margin-top:22px">الأمان والحساب</h3>
+        ${me.deletionRequestedAt ? `
+          <div class="card" style="background:var(--bg);border:1px solid var(--er);padding:12px;margin-bottom:12px">
+            <b class="er-tx" style="display:block;margin-bottom:4px">⚠️ حسابك مجدول للحذف النهائي</b>
+            <p class="mu" style="font-size:12.5px;margin:0 0 8px">تم طلب الحذف بتاريخ ${fmtDate(me.deletionRequestedAt)} وسيُحذف الحساب نهائيًا بعد انتهاء مهلة الـ ١٤ يومًا ما لم تقم بإلغاء الطلب.</p>
+            <button class="btn btn-ok btn-sm" data-a="cancel-delete-account">إلغاء طلب حذف الحساب</button>
+          </div>
+        ` : ''}
         <div class="row-wrap" style="gap:8px;align-items:center">
           <button class="btn btn-ac" data-a="open-2fa-modal">🛡️ المصادقة الثنائية (2FA) ${me.totpEnabled ? '— مفعّلة ✓' : ''}</button>
           <button class="btn btn-gh" data-a="change-password">🔑 تغيير كلمة المرور</button>
-          <button class="btn btn-er" data-a="delete-account">🗑 حذف الحساب نهائيًا</button>
+          ${!me.deletionRequestedAt ? '<button class="btn btn-er" data-a="delete-account">🗑 جدولة حذف الحساب (مهلة ١٤ يومًا)</button>' : ''}
         </div>`}
     </div>
   </div>
@@ -3158,19 +3267,46 @@ const PUBLIC_PAGES = {
       <p>أنت مسؤول عن الحفاظ على سرية كلمة المرور الخاصة بك. يحق لإدارة المنصة إيقاف أي حساب يخالف السياسات أو يسيء استخدام الموارد التقنية.</p>
     </div>
   `,
-  privacy: () => `
+  privacy: () => {
+    const retentionDays = fmtNum(state.piiRetentionDays || state.authConfig?.piiRetentionDays || 30);
+    return `
     <div class="card public-prose">
-      <span class="sec-kicker">حماية البيانات</span>
-      <h1>سياسة الخصوصية</h1>
-      <p>نلتزم في <b>OrderFlow</b> بحماية خصوصية بيانات متجرك وعملائك وفقًا لأعلى معايير الأمان التقني وقانون حماية البيانات الشخصية المصري.</p>
-      <h3>١. البيانات التي نجمعها</h3>
-      <p>نحتفظ ببيانات المتجر (الاسم، الهاتف، البريد الإلكتروني، الرقم الضريبي) وبيانات الكتالوج والطلبات اللازمة لتشغيل لوحة التحكم وإصدار الفواتير وبوالص الشحن.</p>
-      <h3>٢. أمان المدفوعات</h3>
-      <p>لا نخزّن أرقام البطاقات البنكية الكاملة أو رموز CVV على خوادمنا إطلاقًا؛ تتم معالجة المدفوعات عبر قنوات مشفرة وتُحفظ فقط المراجع الضريبية وآخر ٤ أرقام للإيصال.</p>
-      <h3>٣. عزل الحسابات وحق الحذف</h3>
-      <p>بيانات كل تاجر معزولة تمامًا، ويمكنك في أي وقت تصدير بياناتك بصيغة CSV أو حذف حسابك نهائيًا من صفحة الإعدادات.</p>
+      <span class="sec-kicker">حماية البيانات — قانون حماية البيانات الشخصية المصري رقم ١٥١ لسنة ٢٠٢٠</span>
+      <h1>سياسة الخصوصية وحماية البيانات</h1>
+      <p>تلتزم منصة <b>OrderFlow</b> (المتحكّم في البيانات لأغراض إدارة حسابات التجار، والمعالج بالنيابة عن التاجر فيما يخص بيانات عملاء المتجر) بحماية خصوصية بياناتك وبيانات عملائك وفقًا لأحكام <b>قانون حماية البيانات الشخصية المصري رقم ١٥١ لسنة ٢٠٢٠</b> وأعلى معايير الأمان التقني.</p>
+
+      <h3>١. البيانات التي نجمعها ونعالجها</h3>
+      <ul>
+        <li><b>بيانات حساب التاجر والمتجر:</b> الاسم الكامل، اسم المتجر، البريد الإلكتروني، رقم الموبايل، الرقم الضريبي، عنوان InstaPay، وإعدادات الربط المشفّرة مع الأسواق وشركات الشحن.</li>
+        <li><b>بيانات عملاء المتجر (PII):</b> اسم المشتري، رقم هاتفه، عنوان الشحن، والمحافظة — وتُستخدم حصريًا لتنفيذ الطلبات وإصدار بوالص الشحن والفواتير الضريبية المبسطة.</li>
+        <li><b>السجلات التشغيلية والأمنية:</b> سجلات الدخول والمصادقة الثنائية، سجل المراقبة (Audit Log)، وسجل الوصول للبيانات الشخصية (PII Access Log).</li>
+      </ul>
+
+      <h3>٢. أغراض المعالجة</h3>
+      <p>نعالج البيانات فقط لتشغيل لوحة التحكم الموحّدة، مزامنة المخزون والطلبات مع الأسواق المتصلة، إصدار بوالص الشحن والفواتير الضريبية، مطابقة تحصيلات الدفع عند الاستلام (COD)، حماية الحسابات من الاختراق، والامتثال للالتزامات الضريبية والقانونية المصرية.</p>
+
+      <h3>٣. مزوّدو الخدمة الفرعيون (Sub-processors)</h3>
+      <p>قد نُرسل البيانات اللازمة فقط عند تفعيلك للربط مع الجهات التالية: <b>Amazon SP-API، نون (Noon)، جوميا (Jumia)، ترينديول (Trendyol)، كنز (Kenzz)، بوسطة (Bosta)، أرامكس (Aramex)، بوابة الدفع كاشير (Kashier)، خدمات Gemini للذكاء الاصطناعي (دون إرسال بيانات عملاء شخصية)، ومزوّد البريد الإلكتروني / الرسائل القصيرة SMS</b>.</p>
+
+      <h3>٤. مدة الاحتفاظ بالبيانات وحذفها التلقائي</h3>
+      <p>تُحذف وتُجهَّل بيانات العملاء الشخصية (الاسم، رقم الهاتف، العنوان) تلقائيًا من الطلبات المسلَّمة بعد مرور <b>${retentionDays} يومًا</b> من تاريخ التسليم، مع الإبقاء فقط على الأرقام المالية المجمّعة والتقارير الضريبية دون أي معرّفات شخصية. كما نحتفظ بسجلات الفوترة والمدفوعات المجهّلة وفق المدد القانونية الضريبية.</p>
+
+      <h3>٥. حقوقك وفق القانون المصري</h3>
+      <ul>
+        <li><b>حق الوصول والتصحيح:</b> يمكنك استعراض وتحديث بيانات متجرك في أي وقت من صفحة الإعدادات.</li>
+        <li><b>حق نقل وتصدير البيانات:</b> يمكنك تحميل نسخة كاملة من بيانات حسابك (منتجات، طلبات، عملاء، مدفوعات، إعدادات) بصيغة <b>ZIP</b> من صفحة الإعدادات.</li>
+        <li><b>حق الحذف وسحب الموافقة:</b> يمكنك جدولة حذف حسابك نهائيًا مع مهلة <b>١٤ يومًا</b> للتراجع، يُحذف بعدها الحساب وكل بياناته تلقائيًا.</li>
+      </ul>
+
+      <h3>٦. ممارسات الأمان التقني</h3>
+      <p>تُشفَّر بيانات العملاء الشخصية ومفاتيح API والرقم الضريبي في قاعدة البيانات بخوارزمية <b>AES-256-GCM</b>، وتُحمى حسابات الإدارة والمشرفين بالمصادقة الثنائية الإلزامية (2FA TOTP)، وتُدار الجلسات بملفات تعريف ارتباط مشفّرة <code>HttpOnly</code> مع تسجيل كامل لعمليات الوصول للبيانات الشخصية، ونسخ احتياطية مشفّرة يوميًا.</p>
+
+      <h3>٧. التواصل مع مسؤول حماية البيانات</h3>
+      <p>لأي استفسار أو طلب يتعلق بخصوصية البيانات أو ممارسة حقوقك القانونية، راسلنا على: <code dir="ltr">support@orderflow.eg</code>.</p>
+      <p class="mu" style="margin-top:16px;font-size:12.5px">آخر تحديث: نوفمبر ٢٠٢٦</p>
     </div>
-  `,
+  `;
+  },
   refund: () => `
     <div class="card public-prose">
       <span class="sec-kicker">ضمان رضا التاجر</span>
@@ -3377,6 +3513,7 @@ function parseRoute(rawHash) {
   if (PUBLIC_PAGES[path]) return { type: 'public', viewKey: path, params: {}, query };
   if (path === 'reset-password') return { type: 'reset-password', viewKey: path, params: {}, query };
   if (path === 'verify-email') return { type: 'verify-email', viewKey: path, params: {}, query };
+  if (path === 'setup-2fa') return { type: 'setup-2fa', viewKey: path, params: {}, query };
 
   const ownerClientDetail = /^owner\/clients\/(\d+)$/.exec(path);
   if (ownerClientDetail) {
@@ -3450,6 +3587,20 @@ async function renderApp(keepScroll = false) {
     root.innerHTML = renderVerifyEmailPage(parsed.query);
     enhanceA11y(root);
     if (!keepScroll) window.scrollTo(0, 0);
+    return;
+  }
+
+  if (parsed.type === 'setup-2fa') {
+    root.removeAttribute('aria-busy');
+    root.innerHTML = renderSetup2faPage();
+    enhanceA11y(root);
+    if (!keepScroll) window.scrollTo(0, 0);
+    initForced2faSetup();
+    return;
+  }
+
+  if (me && me.setup2faRequired && parsed.type !== 'landing' && parsed.type !== 'public') {
+    go('#/setup-2fa');
     return;
   }
 
@@ -3547,8 +3698,17 @@ async function renderApp(keepScroll = false) {
 }
 
 const boot = async () => {
-  const sess = await api('GET', '/api/auth/session').catch(() => ({ authenticated: false }));
-  if ((sess && sess.authenticated) || getImpersonateToken()) await loadSession();
+  const [sess, authCfg] = await Promise.all([
+    api('GET', '/api/auth/session').catch(() => ({ authenticated: false })),
+    api('GET', '/api/auth/config').catch(() => ({ smsEnabled: false, requireEmailVerification: false, piiRetentionDays: 30 }))
+  ]);
+  if (authCfg) state.authConfig = authCfg;
+  if (sess && sess.setup2faRequired) {
+    me = { setup2faRequired: true };
+    history.replaceState(null, '', '/#/setup-2fa');
+  } else if ((sess && sess.authenticated) || getImpersonateToken()) {
+    await loadSession();
+  }
   // توجيه المسار المباشر /owner أو /moderator للمخوّلين فقط
   if (!location.hash) {
     if ((location.pathname === '/owner' || location.pathname.startsWith('/owner/')) && me && me.role === 'owner') {
@@ -3627,6 +3787,12 @@ const renderShell = (viewKey, data) => {
           </div>
         ` : ''}
         ${me.isDemo ? demoBanner() : ''}
+        ${(state.requireEmailVerification && me && !me.isDemo && !me.emailVerified && me.email) ? `
+          <div class="demo-banner" role="status" style="background:rgba(245,158,11,0.12);border-color:rgba(245,158,11,0.35)">
+            <span>📧 يرجى توثيق بريدك الإلكتروني (<code dir="ltr">${esc(me.email)}</code>) لتفعيل بوابات الدفع وربط الأسواق.</span>
+            <button type="button" class="btn btn-ac btn-sm" data-a="resend-verify-email">إعادة إرسال رابط التفعيل</button>
+          </div>
+        ` : ''}
         <div class="topbar">
           <button class="mobile-menu-btn" data-a="toggle-dash-menu" aria-label="فتح قائمة الأقسام" title="جميع أقسام لوحة التحكم">${ico('menu', 20)}</button>
           <div class="topbar-title-wrap">
@@ -3774,6 +3940,11 @@ actions['pricing-toggle'] = (el) => {
 actions['mkt-filter'] = (el) => {
   state.marketFilter = el.dataset.v;
   saveAppState();
+  renderApp(true);
+};
+
+actions['src-filter'] = (el) => {
+  state.sourceFilter = el.dataset.v || 'all';
   renderApp(true);
 };
 
@@ -3978,6 +4149,12 @@ actions.auth = (el) => {
         ${!up ? `<a class="pr-tx" style="font-size:12px;font-weight:700;cursor:pointer" data-a="forgot-password">نسيت كلمة المرور؟</a>` : ''}
       </div>
       <input id="auth-pass" type="password" autocomplete="${up ? 'new-password' : 'current-password'}" placeholder="${up ? '٨ أحرف على الأقل' : '••••••••'}">
+      ${up ? `
+        <label class="row" style="gap:8px;align-items:flex-start;margin:10px 0 6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="auth-terms" style="width:auto;min-height:auto;margin-top:3px">
+          <span>أوافق على <a href="#/terms" class="pr-tx" data-a="close-dlg">الشروط والأحكام</a> و<a href="#/privacy" class="pr-tx" data-a="close-dlg">سياسة الخصوصية</a></span>
+        </label>
+      ` : ''}
       <p id="auth-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
       <button class="btn" style="width:100%" type="submit">${up ? 'إرسال طلب إنشاء الحساب' : 'تسجيل الدخول'}</button>
       <p class="mu ctr" style="margin-top:14px;font-size:13px">
@@ -3996,6 +4173,10 @@ act('auth-submit', async () => {
   err.textContent = '';
   const id = $('#auth-id').value.trim();
   const password = $('#auth-pass').value;
+  if (up && !$('#auth-terms')?.checked) {
+    err.textContent = 'يجب الموافقة على الشروط وسياسة الخصوصية للمتابعة';
+    return;
+  }
   let r;
   try {
     if (up) {
@@ -4004,7 +4185,8 @@ act('auth-submit', async () => {
         fullName: $('#auth-fullname')?.value.trim() || '',
         email: $('#auth-email')?.value.trim() || '',
         phone: id,
-        password
+        password,
+        termsAccepted: true
       });
     } else {
       r = await api('POST', '/api/auth/login', { id, password });
@@ -4032,14 +4214,23 @@ act('auth-submit', async () => {
     return;
   }
 
+  // إلزام إعداد المصادقة الثنائية لحسابات المالك والمشرفين
+  if (!up && r && r.setup2faRequired) {
+    closeDlg();
+    me = { setup2faRequired: true };
+    showToast(r.message || 'يرجى إعداد المصادقة الثنائية أولًا');
+    go('#/setup-2fa');
+    return;
+  }
+
   // طلب رمز المصادقة الثنائية (2FA - TOTP) عند تفعيله على الحساب
   if (!up && r && r.requires2fa && r.challengeToken) {
     openDialog('🛡️ التحقق بالمصادقة الثنائية (2FA)', `
       <form data-submit="login-2fa-submit" novalidate>
         <input type="hidden" id="l2fa-token" value="${esc(r.challengeToken)}">
-        <p class="mu" style="margin-bottom:14px;font-size:13.5px;line-height:1.7">${esc(r.message || 'أدخل الرمز المكوّن من ٦ أرقام من تطبيق المصادقة (Google Authenticator / Authy).')}</p>
-        <label for="l2fa-code">رمز التحقق (٦ أرقام)</label>
-        <input id="l2fa-code" dir="ltr" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="123456" style="font-size:20px;letter-spacing:4px;text-align:center">
+        <p class="mu" style="margin-bottom:14px;font-size:13.5px;line-height:1.7">${esc(r.message || 'أدخل الرمز المكوّن من ٦ أرقام من تطبيق المصادقة أو أحد أكواد الاسترداد الطارئة (XXXX-XXXX).')}</p>
+        <label for="l2fa-code">رمز التحقق (٦ أرقام) أو كود استرداد</label>
+        <input id="l2fa-code" dir="ltr" autocomplete="one-time-code" maxlength="12" placeholder="123456 أو XXXX-XXXX" style="font-size:18px;letter-spacing:3px;text-align:center">
         <p id="l2fa-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
         <button class="btn" style="width:100%" type="submit">تأكيد الدخول</button>
       </form>
@@ -4076,16 +4267,40 @@ act('login-2fa-submit', async () => {
 });
 
 actions['forgot-password'] = () => {
+  const smsOn = Boolean(state.authConfig && state.authConfig.smsEnabled);
   openDialog('🔑 استعادة كلمة المرور', `
     <form data-submit="forgot-password-submit" novalidate>
-      <p class="mu" style="margin-bottom:12px;font-size:13.5px">أدخل رقم الموبايل أو البريد الإلكتروني المسجل بحسابك لإصدار رمز مؤقت لاستعادة كلمة المرور (صالح لمدة ٣٠ دقيقة لمرة واحدة).</p>
-      <label for="fp-id">رقم الموبايل أو البريد الإلكتروني</label>
-      <input id="fp-id" dir="ltr" placeholder="010xxxxxxxx أو sales@store.com">
+      <p class="mu" style="margin-bottom:12px;font-size:13.5px">${smsOn
+        ? 'أدخل البريد الإلكتروني لإرسال رابط الاستعادة، أو أدخل رقم الموبايل المصري لاستلام رمز SMS مكوّن من ٦ أرقام.'
+        : 'أدخل البريد الإلكتروني المسجل بحسابك لإرسال رابط استعادة كلمة المرور (صالح لمدة ٣٠ دقيقة لمرة واحدة).'}</p>
+      <label for="fp-id">${smsOn ? 'البريد الإلكتروني أو رقم الموبايل' : 'البريد الإلكتروني'}</label>
+      <input id="fp-id" dir="ltr" placeholder="${smsOn ? '010xxxxxxxx أو sales@store.com' : 'sales@store.com'}">
       <p id="fp-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
       <button class="btn" style="width:100%" type="submit">إرسال رمز الاستعادة</button>
     </form>
   `);
 };
+
+let otpCooldownTimer = null;
+function startOtpCooldown(btnId, sec = 60) {
+  clearInterval(otpCooldownTimer);
+  let left = sec;
+  const tick = () => {
+    const b = document.querySelector(btnId);
+    if (!b) { clearInterval(otpCooldownTimer); return; }
+    if (left <= 0) {
+      b.disabled = false;
+      b.textContent = 'إعادة إرسال الرمز';
+      clearInterval(otpCooldownTimer);
+      return;
+    }
+    b.disabled = true;
+    b.textContent = `إعادة الإرسال بعد ${fmtNum(left)} ثانية`;
+    left -= 1;
+  };
+  tick();
+  otpCooldownTimer = setInterval(tick, 1000);
+}
 
 act('forgot-password-submit', async () => {
   const err = $('#fp-err');
@@ -4096,7 +4311,36 @@ act('forgot-password-submit', async () => {
     const r = await api('POST', '/api/auth/forgot-password', { id });
     closeDlg();
     showToast(r.message || 'تم إرسال رمز الاستعادة ✓');
-    go(r.devToken ? `#/reset-password?token=${encodeURIComponent(r.devToken)}` : '#/reset-password');
+    if (r.method === 'sms') {
+      go(`#/reset-password?method=sms&phone=${encodeURIComponent(id)}`);
+      setTimeout(() => startOtpCooldown('#btn-resend-otp', 60), 100);
+    } else {
+      go(r.devToken ? `#/reset-password?token=${encodeURIComponent(r.devToken)}` : '#/reset-password');
+    }
+  } catch (e) {
+    if (err) err.textContent = e.message;
+  }
+});
+
+act('resend-reset-otp', async () => {
+  const phone = $('#rp-phone')?.value.trim();
+  if (!phone) return showToast('أدخل رقم الموبايل أولًا');
+  await api('POST', '/api/auth/forgot-password', { id: phone });
+  showToast('تم إعادة إرسال رمز التحقق عبر SMS ✓');
+  startOtpCooldown('#btn-resend-otp', 60);
+});
+
+act('reset-password-otp-submit', async () => {
+  const err = $('#rp-otp-err');
+  if (err) err.textContent = '';
+  const phone = $('#rp-phone')?.value.trim() || '';
+  const code = $('#rp-otp')?.value.trim() || '';
+  const password = $('#rp-otp-pass')?.value || '';
+  try {
+    const r = await api('POST', '/api/auth/reset-password/otp', { phone, code, password });
+    showToast(r.message || 'تم تعيين كلمة المرور الجديدة بنجاح ✓');
+    go('#/');
+    actions.auth({ dataset: { m: 0 } });
   } catch (e) {
     if (err) err.textContent = e.message;
   }
@@ -4115,6 +4359,11 @@ act('reset-password-submit', async () => {
   } catch (e) {
     if (err) err.textContent = e.message;
   }
+});
+
+act('resend-verify-email', async () => {
+  const r = await api('POST', '/api/auth/resend-verification', {});
+  showToast(r.message || 'تم إرسال رابط التفعيل إلى بريدك الإلكتروني ✓', 4500);
 });
 
 act('send-verify-email', async () => {
@@ -4443,6 +4692,8 @@ act('import-prod-csv-submit', async () => {
 
 actions['export-prod-csv'] = () => downloadFile('/api/products/export.csv', 'orderflow-products.csv', 'كتالوج المنتجات CSV');
 actions['export-ord-csv'] = () => downloadFile('/api/orders/export.csv', 'orderflow-orders.csv', 'سجل الطلبات CSV');
+actions['export-cust-csv'] = () => downloadFile('/api/customers/export.csv', 'orderflow-customers.csv', 'بيانات العملاء CSV');
+actions['export-account-zip'] = () => downloadFile('/api/account/export', 'orderflow-account-export.zip', 'أرشيف بيانات الحساب ZIP');
 
 /* الطلبات والفواتير والإلغاء */
 actions['ord-flt'] = (el) => {
@@ -4656,7 +4907,6 @@ actions['view-invoice'] = (el) => {
   if (!o) return;
   const preTax = Math.round(o.total / 1.14);
   const vat = o.total - preTax;
-  const invUrl = authedUrl(`/api/orders/${o.id}/invoice`);
   openDialog(`🧾 فاتورة ضريبية مبسطة #${arDigits(o.no)}`, `
     <div class="card" style="background:var(--bg);box-shadow:none">
       <div class="row" style="margin-bottom:10px">
@@ -4669,20 +4919,17 @@ actions['view-invoice'] = (el) => {
       <div class="row" style="padding:4px 0"><span class="sp mu">ضريبة القيمة المضافة (١٤٪)</span><b>${fmtEGP(vat)}</b></div>
       <div class="row" style="padding:8px 0 0;border-top:1px solid var(--bd)"><b class="sp">الإجمالي شامل الضريبة</b><b class="pr-tx" style="font-size:20px">${fmtEGP(o.total)}</b></div>
     </div>
-    <a class="btn" style="width:100%;margin-top:12px;text-align:center;display:flex;text-decoration:none" href="${esc(invUrl)}" target="_blank" rel="noopener noreferrer">🖨️ فتح وطباعة الفاتورة الضريبية الرسمية (QR) ↗</a>
+    <button type="button" class="btn" style="width:100%;margin-top:12px" data-a="open-official-invoice" data-id="${o.id}" data-no="${esc(o.no)}">🖨️ فتح وطباعة الفاتورة الضريبية الرسمية (QR)</button>
   `);
 };
 
-actions['bulk-awb'] = () => {
-  const a = document.createElement('a');
-  a.href = authedUrl('/api/orders/awb');
-  a.target = '_blank';
-  a.rel = 'noopener noreferrer';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  showToast(counts.pendingOrders ? `🚚 جاري تجهيز ${fmtNum(counts.pendingOrders)} بوليصة شحن للطباعة` : 'لا توجد طلبات قيد التجهيز حاليًا');
-};
+act('open-official-invoice', async (el) => {
+  await openAuthedHtml(`/api/orders/${encodeURIComponent(el.dataset.id)}/invoice`, `فاتورة ضريبية #${el.dataset.no || el.dataset.id}`, `invoice-${el.dataset.no || el.dataset.id}.html`);
+});
+
+act('bulk-awb', async () => {
+  await openAuthedHtml('/api/orders/awb', 'بوالص الشحن المجمّعة (AWB)', 'orderflow-awb.html');
+});
 
 let ordSearchTimer;
 let ordSearchSeq = 0;
@@ -5528,10 +5775,84 @@ actions['reset-demo'] = () => {
 };
 
 /* المصادقة الثنائية (2FA - TOTP) لجميع الحسابات (المالك / المشرف / التاجر) */
+function renderRecoveryCodesBlock(codes, redirectTo) {
+  const text = (codes || []).join('\n');
+  return `
+    <div style="text-align:right">
+      <p class="ok-tx" style="font-weight:700;margin-bottom:8px">🛡️ تم تفعيل المصادقة الثنائية بنجاح ✓</p>
+      <p class="mu" style="font-size:13px;line-height:1.7;margin-bottom:10px">احفظ أكواد الاسترداد الطارئة التالية في مكان آمن الآن — <b>لن تُعرض مرة أخرى</b>، وكل كود صالح للاستخدام مرة واحدة فقط في حال فقدت هاتفك:</p>
+      <pre id="recovery-codes-pre" dir="ltr" style="padding:12px;border-radius:10px;background:var(--bg);border:1px solid var(--bd);font-family:var(--font-mono);font-size:14px;line-height:1.7;text-align:center;user-select:all">${esc(text)}</pre>
+      <div class="row-wrap" style="gap:8px;margin-top:12px">
+        <button type="button" class="btn btn-gh" style="flex:1" data-a="copy-recovery-codes">📋 نسخ الأكواد</button>
+        <button type="button" class="btn btn-ac" style="flex:1" data-a="finish-2fa-setup" data-to="${esc(redirectTo || '')}">حفظت الأكواد — متابعة للوحة التحكم</button>
+      </div>
+    </div>
+  `;
+}
+
+async function initForced2faSetup() {
+  const slot = $('#forced-2fa-slot');
+  if (!slot) return;
+  try {
+    const r = await api('POST', '/api/account/2fa/setup');
+    slot.innerHTML = `
+      <div style="text-align:center;margin-bottom:14px">
+        <div style="display:inline-block;padding:10px;background:#fff;border-radius:12px;border:1px solid var(--bd)">${r.qrSvg}</div>
+      </div>
+      <p class="mu" style="font-size:12.5px;margin-bottom:6px">امسح رمز QR بتطبيق المصادقة أو أدخل المفتاح السري يدويًا:</p>
+      <code dir="ltr" style="display:block;padding:10px;border-radius:8px;background:var(--bg);text-align:center;font-size:14px;letter-spacing:2px;margin-bottom:14px;word-break:break-all">${esc(r.secret)}</code>
+      <form data-submit="forced-2fa-enable" novalidate>
+        <label for="f2fa-code">أدخل الرمز الظاهر في التطبيق (٦ أرقام)</label>
+        <input id="f2fa-code" dir="ltr" inputmode="numeric" maxlength="8" placeholder="123456" style="text-align:center;font-size:18px;letter-spacing:4px">
+        <p id="f2fa-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
+        <button type="submit" class="btn btn-ac" style="width:100%">تأكيد وتفعيل المصادقة الثنائية ✓</button>
+      </form>
+    `;
+  } catch (e) {
+    slot.innerHTML = `<p class="er-tx">${esc(e.message || 'تعذر تهيئة المصادقة الثنائية')}</p>`;
+  }
+}
+
+act('forced-2fa-enable', async () => {
+  const err = $('#f2fa-err');
+  if (err) err.textContent = '';
+  let r;
+  try {
+    r = await api('POST', '/api/account/2fa/enable', { code: $('#f2fa-code')?.value.trim() || '' });
+  } catch (e) {
+    if (err) err.textContent = e.message;
+    return;
+  }
+  await loadSession();
+  const slot = $('#forced-2fa-slot');
+  if (slot && r.recoveryCodes && r.recoveryCodes.length) {
+    slot.innerHTML = renderRecoveryCodesBlock(r.recoveryCodes, r.redirectTo || roleHomeHash(me));
+  } else {
+    go(r.redirectTo || roleHomeHash(me));
+  }
+});
+
+actions['copy-recovery-codes'] = async () => {
+  const txt = $('#recovery-codes-pre')?.textContent || '';
+  try { await navigator.clipboard.writeText(txt); showToast('تم نسخ أكواد الاسترداد ✓'); } catch (_) { showToast('انسخ الأكواد يدويًا من المربع'); }
+};
+
+actions['finish-2fa-setup'] = (el) => {
+  closeDlg();
+  const to = el.dataset.to;
+  if (to) go(to);
+  else renderApp(true);
+};
+
 act('open-2fa-modal', async () => {
   const st = await api('GET', '/api/account/2fa/status');
+  const isStaff = me && (me.role === 'owner' || me.role === 'moderator');
   if (st.enabled) {
-    openDialog('🛡️ المصادقة الثنائية (2FA) — مفعّلة', `
+    openDialog('🛡️ المصادقة الثنائية (2FA) — مفعّلة', isStaff ? `
+      <p class="ok-tx" style="font-weight:700;margin-bottom:10px">✓ حسابك محمي حاليًا بالمصادقة الثنائية (TOTP).</p>
+      <p class="mu" style="font-size:13.5px;line-height:1.7">المصادقة الثنائية إلزامية لحسابات المالك والمشرفين ولا يمكن تعطيلها حفاظًا على أمان بيانات التجار.</p>
+      <button type="button" class="btn btn-ac" style="width:100%;margin-top:10px" data-a="close-dlg">إغلاق</button>
+    ` : `
       <p class="ok-tx" style="font-weight:700;margin-bottom:10px">✓ حسابك محمي حاليًا بالمصادقة الثنائية (TOTP).</p>
       <p class="mu" style="font-size:13px;margin-bottom:14px">لتعطيل المصادقة الثنائية، أدخل كلمة المرور الحالية والرمز الحالي من تطبيق المصادقة.</p>
       <form data-submit="disable-2fa-submit" novalidate>
@@ -5578,16 +5899,23 @@ act('start-2fa-setup', async () => {
 act('enable-2fa-submit', async () => {
   const err = $('#e2fa-err');
   if (err) err.textContent = '';
+  let r;
   try {
-    const r = await api('POST', '/api/account/2fa/enable', { code: $('#e2fa-code')?.value.trim() || '' });
+    r = await api('POST', '/api/account/2fa/enable', { code: $('#e2fa-code')?.value.trim() || '' });
     if (r.me) me = r.me;
   } catch (e) {
     if (err) err.textContent = e.message;
     return;
   }
-  closeDlg();
-  showToast('🛡️ تم تفعيل المصادقة الثنائية (2FA) لحسابك بنجاح ✓', 4500);
-  renderApp(true);
+  const slot = $('#setup-2fa-slot');
+  if (slot && r.recoveryCodes && r.recoveryCodes.length) {
+    slot.innerHTML = renderRecoveryCodesBlock(r.recoveryCodes, '');
+    showToast('🛡️ تم تفعيل المصادقة الثنائية — احفظ أكواد الاسترداد الآن ✓', 5000);
+  } else {
+    closeDlg();
+    showToast('🛡️ تم تفعيل المصادقة الثنائية (2FA) لحسابك بنجاح ✓', 4500);
+    renderApp(true);
+  }
 });
 
 act('disable-2fa-submit', async () => {
@@ -5607,6 +5935,55 @@ act('disable-2fa-submit', async () => {
   showToast('تم تعطيل المصادقة الثنائية');
   renderApp(true);
 });
+
+actions['open-verify-phone'] = async () => {
+  openDialog('📱 توثيق رقم الموبايل عبر SMS', `
+    <p class="mu" style="font-size:13.5px;margin-bottom:12px">سنرسل رمز تحقق مكوّنًا من ٦ أرقام إلى رقمك المسجل <code dir="ltr">${esc(state.storePhone)}</code>.</p>
+    <button type="button" class="btn btn-gh btn-sm" id="btn-send-phone-otp" data-a="verify-phone-send" style="width:100%;margin-bottom:14px">إرسال رمز التحقق الآن</button>
+    <form data-submit="verify-phone-confirm" novalidate>
+      <label for="vp-code">رمز التحقق SMS (٦ أرقام)</label>
+      <input id="vp-code" dir="ltr" inputmode="numeric" maxlength="6" placeholder="123456" style="text-align:center;font-size:18px;letter-spacing:4px">
+      <p id="vp-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
+      <button type="submit" class="btn btn-ac" style="width:100%">تأكيد وتوثيق الموبايل ✓</button>
+    </form>
+  `);
+};
+
+act('verify-phone-send', async () => {
+  const r = await api('POST', '/api/account/verify-phone/send', {});
+  showToast(r.message || 'تم إرسال رمز التحقق عبر SMS ✓');
+  startOtpCooldown('#btn-send-phone-otp', 60);
+});
+
+act('verify-phone-confirm', async () => {
+  const err = $('#vp-err');
+  if (err) err.textContent = '';
+  try {
+    const r = await api('POST', '/api/account/verify-phone/confirm', { code: $('#vp-code')?.value.trim() || '' });
+    if (r.me) me = r.me;
+    closeDlg();
+    showToast(r.message || 'تم توثيق رقم الموبايل بنجاح ✓');
+    renderApp(true);
+  } catch (e) {
+    if (err) err.textContent = e.message;
+  }
+});
+
+actions['delete-seed-data'] = () => {
+  openConfirmDialog(
+    '🧹 حذف البيانات التجريبية',
+    'سيتم حذف المنتجات والطلبات والعملاء التجريبية فقط، مع الاحتفاظ بجميع منتجاتك وطلباتك اليدوية والمتصلة بالأسواق دون أي تأثير.',
+    'حذف البيانات التجريبية',
+    true,
+    async () => {
+      const r = await api('DELETE', '/api/account/seed-data');
+      await loadSession();
+      closeDlg();
+      showToast(r.message || 'تم حذف البيانات التجريبية بنجاح ✓', 4000);
+      renderApp(true);
+    }
+  );
+};
 
 actions['change-password'] = () => openDialog('🔑 تغيير كلمة المرور', `
   <form data-submit="change-password-submit" novalidate>
@@ -5629,26 +6006,39 @@ act('change-password-submit', async () => {
   showToast('تم تغيير كلمة المرور ✓ وتم تسجيل خروجك من الأجهزة الأخرى', 4000);
 });
 
-actions['delete-account'] = () => openDialog('🗑 حذف الحساب نهائيًا', `
+actions['delete-account'] = () => openDialog('🗑 جدولة حذف الحساب (مهلة ١٤ يومًا)', `
   <form data-submit="delete-account-submit" novalidate>
-    <p class="mu" style="margin-bottom:12px;font-size:13.5px">سيتم حذف حسابك وكل منتجاتك وطلباتك نهائيًا ولا يمكن التراجع. صدّر بياناتك أولًا إن احتجتها.</p>
+    <p class="mu" style="margin-bottom:12px;font-size:13.5px;line-height:1.7">سيُجدوَل حذف حسابك نهائيًا بعد <b>١٤ يومًا</b>. يمكنك إلغاء الطلب في أي وقت خلال هذه المهلة من صفحة الإعدادات، كما ننصح بتحميل نسخة ZIP من بياناتك أولًا.</p>
     <label for="del-pass">أدخل كلمة المرور للتأكيد</label>
     <input id="del-pass" type="password" autocomplete="current-password">
+    ${me && me.totpEnabled ? `
+      <label for="del-2fa">رمز المصادقة الثنائية (2FA)</label>
+      <input id="del-2fa" dir="ltr" inputmode="numeric" maxlength="10" placeholder="123456">
+    ` : ''}
     <p id="del-err" class="er-tx" role="alert" style="min-height:22px;font-size:13px;font-weight:700"></p>
-    <button class="btn btn-er" style="width:100%" type="submit">حذف حسابي نهائيًا</button>
+    <button class="btn btn-er" style="width:100%" type="submit">تأكيد جدولة حذف الحساب</button>
   </form>
 `);
 act('delete-account-submit', async () => {
   try {
-    await api('DELETE', '/api/account', { password: $('#del-pass').value });
+    const r = await api('POST', '/api/account/delete', {
+      password: $('#del-pass').value,
+      code: $('#del-2fa')?.value.trim() || ''
+    });
+    closeDlg();
+    await loadSession();
+    showToast(r.message || 'تمت جدولة حذف الحساب بعد ١٤ يومًا', 5000);
+    renderApp(true);
   } catch (e) {
     $('#del-err').textContent = e.message;
-    return;
   }
-  closeDlg();
-  clearSession();
-  go('#/');
-  showToast('تم حذف حسابك وبياناتك نهائيًا');
+});
+
+act('cancel-delete-account', async () => {
+  const r = await api('POST', '/api/account/delete/cancel', {});
+  await loadSession();
+  showToast(r.message || 'تم إلغاء طلب حذف الحساب بنجاح ✓', 4000);
+  renderApp(true);
 });
 
 /* ----- إجراءات لوحة تحكم الإدارة (Admin Actions) ----- */
@@ -6034,6 +6424,7 @@ if (window.OrderFlowRBAC && typeof window.OrderFlowRBAC.registerRbacViews === 'f
     ico,
     setImpersonationToken,
     loadSession,
+    downloadFile,
     go
   });
 }

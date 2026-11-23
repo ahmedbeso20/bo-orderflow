@@ -9,16 +9,24 @@ module.exports = (r, app) => {
     if (u.is_demo) throw new HttpError(403, 'حفظ مفاتيح API الحقيقية متاح للحسابات المسجّلة فقط (أنشئ حسابًا مجانيًا أولًا).');
   };
 
-  /** قائمة المنصات الخمس مع مخطط الحقول وحالة الاتصال (دون كشف أي أسرار) */
+  /** قائمة المنصات الخمس مع مخطط الحقول وحالة الاتصال وسجل آخر ١٠ مزامنات (دون كشف أي أسرار) */
   r.get('/api/integrations/connections', ({ user }) => ({
     schemas: PLATFORM_SCHEMAS,
     connections: connectors.listForUser(user.id),
+    syncRuns: connectors.listSyncRuns ? connectors.listSyncRuns(user.id, 10) : [],
     integrations: sanitizeIntegrations(parseJson(user.integrations, {}))
+  }));
+
+  r.get('/api/integrations/sync-runs', ({ user, query }) => ({
+    runs: connectors.listSyncRuns ? connectors.listSyncRuns(user.id, Number(query.limit) || 10) : []
   }));
 
   /** حفظ أو تحديث مفاتيح API لمنصة محددة (تُشفّر بـ AES-256-GCM في قاعدة البيانات) */
   r.put('/api/integrations/connections/:platform', async ({ user, params, body, ip }) => {
     noDemo(user);
+    if (app.getPlatformSettings().require_email_verification === '1' && !user.email_verified_at) {
+      throw new HttpError(403, 'يرجى تأكيد بريدك الإلكتروني أولًا قبل ربط متاجر الأسواق.', { code: 'EMAIL_VERIFICATION_REQUIRED' });
+    }
     const platform = oneOf(params.platform, PLATFORM_KEYS, 'المنصة');
     if (!limiter.hit(`conn-save:${user.id}`, 30, 600_000)) {
       throw new HttpError(429, 'طلبات كثيرة لتحديث بيانات الربط، انتظر قليلًا');

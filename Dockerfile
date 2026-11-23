@@ -8,8 +8,8 @@ ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
 
 # Copy manifests first for layer caching
-COPY package*.json ./
-RUN npm ci --omit=dev
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
 # Copy application source
 COPY server.js index.html metadata.json ./

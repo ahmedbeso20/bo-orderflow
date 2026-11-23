@@ -8,5 +8,6 @@ coverage/
 !.env.example
 data/*.db*
 data/.session-secret
+data/.dev-secrets.json
 .playwright-cli/
 

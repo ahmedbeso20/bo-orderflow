@@ -69,8 +69,10 @@ module.exports = (r, app) => {
   });
 
   r.post('/api/ai/order-message', async ({ user, body }) => {
-    const o = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(integer(body.orderId, 'الطلب', { min: 1, max: 2 ** 31 }), user.id);
-    if (!o) throw new HttpError(404, 'الطلب غير موجود');
+    const rawOrder = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(integer(body.orderId, 'الطلب', { min: 1, max: 2 ** 31 }), user.id);
+    if (!rawOrder) throw new HttpError(404, 'الطلب غير موجود');
+    const dec = (v) => (app.cipher ? app.cipher.decrypt(v) : String(v || ''));
+    const o = { ...rawOrder, customer: dec(rawOrder.customer), phone: dec(rawOrder.phone), address: dec(rawOrder.address) };
     const res = await tryGemini(user, ai.orderMessagePrompt(o, user.store_name, MARKETS[o.market].name, STATUS_LABEL[o.status]));
     if (res && res.text) return { source: 'gemini', text: ai.str(res.text, 1200) };
     return { source: 'template', text: ai.templateOrderMessage(o, user.store_name) };

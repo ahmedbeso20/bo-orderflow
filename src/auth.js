@@ -67,6 +67,7 @@ const cookie = (name, value, { maxAge, secure, production = true, allowIframe = 
    المصادقة الثنائية القياسية TOTP (RFC 6238 / HMAC-SHA1 عبر node:crypto فقط)
    ========================================================================== */
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const RECOVERY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 function base32Encode(buf) {
   let bits = 0;
@@ -128,16 +129,42 @@ function normalizeTotpInput(raw) {
     .replace(/[\s-]+/g, '');
 }
 
+/**
+ * يتحقق من رمز TOTP ويعيد رقم الخطوة الزمنية (time step) المطابق (عدد صحيح موجب) لمنع إعادة الاستخدام (replay)،
+ * أو false عند عدم المطابقة.
+ */
 function verifyTotpCode(secretBase32, inputCode, { window = 1, timestampMs = Date.now(), stepSec = 30, digits = 6 } = {}) {
   const code = normalizeTotpInput(inputCode);
   if (!/^\d{6,8}$/.test(code) || code.length !== digits) return false;
   const givenBuf = Buffer.from(code, 'utf8');
+  const baseStep = Math.floor(timestampMs / 1000 / stepSec);
   for (let delta = -window; delta <= window; delta++) {
-    const expected = generateTotpCode(secretBase32, timestampMs + delta * stepSec * 1000, stepSec, digits);
+    const step = baseStep + delta;
+    const expected = generateTotpCode(secretBase32, step * stepSec * 1000, stepSec, digits);
     const expBuf = Buffer.from(expected, 'utf8');
-    if (givenBuf.length === expBuf.length && crypto.timingSafeEqual(givenBuf, expBuf)) return true;
+    if (givenBuf.length === expBuf.length && crypto.timingSafeEqual(givenBuf, expBuf)) return step;
   }
   return false;
+}
+
+function generateRecoveryCodes(count = 10) {
+  const codes = [];
+  for (let i = 0; i < count; i++) {
+    const bytes = crypto.randomBytes(8);
+    let raw = '';
+    for (let j = 0; j < 8; j++) raw += RECOVERY_ALPHABET[bytes[j] % RECOVERY_ALPHABET.length];
+    codes.push(`${raw.slice(0, 4)}-${raw.slice(4, 8)}`);
+  }
+  return codes;
+}
+
+function normalizeRecoveryCode(raw) {
+  return String(raw ?? '')
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0))
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '');
 }
 
 function buildTotpUri({ secret, accountName, issuer = 'OrderFlow' }) {
@@ -172,9 +199,7 @@ function requirePermission(user, permKey) {
 /** توافق مع الاسم القديم (حصريًا للمالك) */
 const requireAdmin = requireOwner;
 
-const { isDownloadTokenAllowedPath } = require('./security');
-
-/** إدارة جلسة المستخدم عبر كوكي موقَّع HttpOnly ودعم ترويسة Authorization مع كشف الإبطال الفوري للجلسة */
+/** إدارة جلسة المستخدم عبر كوكي موقَّع HttpOnly ودعم X-Impersonate-Token (بدون أي تمرير للتوكن في رابط URL) */
 function createSession(cfg, q) {
   const signingKey = cfg.sessionKey || cfg.secret;
 
@@ -196,6 +221,9 @@ function createSession(cfg, q) {
     if (u.status !== 'active') {
       return { user: null, revoked: true, reason: u.status };
     }
+    if (p.setup2fa === 1) {
+      return { user: { ...u, _setup2fa: true }, revoked: false, reason: 'setup2fa' };
+    }
     return { user: u, revoked: false, reason: 'ok' };
   };
 
@@ -207,16 +235,6 @@ function createSession(cfg, q) {
     if (req.headers['x-omni-token']) tokens.push(String(req.headers['x-omni-token']).trim());
     const ck = parseCookies(req.headers.cookie)[cfg.cookieName];
     if (ck) tokens.push(ck);
-    if (req.method === 'GET' && req.url && req.url.includes('token=')) {
-      try {
-        const uUrl = new URL(req.url, 'http://localhost');
-        // لا نسمح بتمرير التوكن في رابط URL إلا لمسارات التصدير والطباعة المباشرة فقط لمنع تسريبه في السجلات أو للوحات التحكم
-        if (isDownloadTokenAllowedPath(uUrl.pathname)) {
-          const qToken = uUrl.searchParams.get('token');
-          if (qToken) tokens.push(qToken);
-        }
-      } catch { /* تجاهل */ }
-    }
     return tokens;
   };
 
@@ -231,19 +249,21 @@ function createSession(cfg, q) {
   };
 
   return {
-    issue(res, user) {
+    issue(res, user, { setup2fa = false } = {}) {
       const isPrivileged = user.role === ROLES.OWNER || user.role === ROLES.MODERATOR;
-      // مدة جلسة أقصر للحسابات الإدارية (12 ساعة) مقابل 14 يومًا للعملاء و24 ساعة للتجريبي
-      const maxAge = user.is_demo ? cfg.demoTtlSec : (isPrivileged ? 12 * 3600 : 14 * 86400);
+      // مدة جلسة أقصر للحسابات الإدارية (12 ساعة) مقابل 14 يومًا للعملاء و24 ساعة للتجريبي و15 دقيقة لإعداد 2FA الإلزامي
+      const maxAge = setup2fa ? 900 : (user.is_demo ? cfg.demoTtlSec : (isPrivileged ? 12 * 3600 : 14 * 86400));
       const nowSec = Math.floor(Date.now() / 1000);
-      const token = signToken(signingKey, {
+      const claims = {
         u: user.id,
         v: user.token_ver,
         r: user.role,
         iat: nowSec,
         jti: crypto.randomBytes(8).toString('hex'),
         e: nowSec + maxAge
-      });
+      };
+      if (setup2fa) claims.setup2fa = 1;
+      const token = signToken(signingKey, claims);
       res.setHeader('Set-Cookie', cookie(cfg.cookieName, token, { maxAge, secure: cfg.secureCookie, production: cfg.production, allowIframe: cfg.allowIframe }));
       return token;
     },
@@ -300,7 +320,10 @@ module.exports = {
   base32Decode,
   generateTotpSecret,
   generateTotpCode,
+  normalizeTotpInput,
   verifyTotpCode,
+  generateRecoveryCodes,
+  normalizeRecoveryCode,
   buildTotpUri,
   requireOwner,
   requireModerator,

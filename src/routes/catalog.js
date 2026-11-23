@@ -78,7 +78,7 @@ const MIME_BY_EXT = {
   '.gif': 'image/gif'
 };
 
-module.exports = (r, { q, model, cfg, limiter }) => {
+module.exports = (r, { q, model, cfg, limiter, sendSecurityAlert }) => {
   const uploadsDir = path.resolve(cfg.uploadsDir);
 
   const find = (uid, id) => {
@@ -153,7 +153,7 @@ module.exports = (r, { q, model, cfg, limiter }) => {
     const p = read(body, false);
     const now = nowIso();
     const approvalStatus = user.role === 'owner' ? 'approved' : 'pending';
-    const id = dupSku(() => q('INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,reject_reason,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    const id = dupSku(() => q("INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,reject_reason,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual',?,?)")
       .run(user.id, p.name, p.sku, p.cat, p.markets, p.price, p.cost, p.stock, p.image, approvalStatus, '', now, now).lastInsertRowid);
     return { product: model.productOf(find(user.id, id)), ...model.meta(user) };
   });
@@ -185,10 +185,17 @@ module.exports = (r, { q, model, cfg, limiter }) => {
     return { ok: true, ...model.meta(user) };
   });
 
-  r.get('/api/products/export.csv', ({ user, res }) => {
-    const rows = [['المنتج', 'SKU', 'الفئة', 'الأسواق', 'التكلفة', 'السعر', 'المخزون', 'حالة الاعتماد']];
+  r.get('/api/products/export.csv', ({ user, res, ip }) => {
+    if (limiter && sendSecurityAlert && !limiter.hit(`bulk-exp:${user.id}`, 3, 600_000)) {
+      sendSecurityAlert({
+        severity: 'high',
+        title: 'تصدير بيانات متكرر بشكل غير معتاد',
+        details: { userId: user.id, storeName: user.store_name, target: 'products.csv', ip }
+      }).catch(() => {});
+    }
+    const rows = [['المنتج', 'SKU', 'الفئة', 'الأسواق', 'التكلفة', 'السعر', 'المخزون', 'حالة الاعتماد', 'المصدر']];
     for (const p of q('SELECT * FROM products WHERE user_id = ? ORDER BY id').all(user.id)) {
-      rows.push([p.name, p.sku, p.cat, p.markets.split('').map((k) => MARKETS[k].name).join(' + '), p.cost, p.price, p.stock, p.approval_status]);
+      rows.push([p.name, p.sku, p.cat, p.markets.split('').map((k) => MARKETS[k].name).join(' + '), p.cost, p.price, p.stock, p.approval_status, p.source || 'manual']);
     }
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="omniarab-products.csv"', 'Cache-Control': 'no-store' });
     res.end(toCsv(rows));
@@ -333,7 +340,7 @@ module.exports = (r, { q, model, cfg, limiter }) => {
             });
             continue;
           }
-          q('INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,reject_reason,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          q("INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,reject_reason,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'csv',?,?)")
             .run(user.id, p.name, p.sku, p.cat, p.markets, p.price, p.cost, p.stock, p.image, approvalStatus, '', now, now);
           currentCount++;
           imported++;

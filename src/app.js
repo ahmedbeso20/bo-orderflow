@@ -1,21 +1,34 @@
 'use strict';
 const http = require('node:http');
 const { load } = require('./config');
-const { openDb, backupDatabase, listBackups } = require('./db');
+const { openDb, backupDatabase, listBackups, uploadBackupToS3 } = require('./db');
 const { createSession, hashPasswordSync, requireOwner, requireModerator, requirePermission, requireAdmin } = require('./auth');
 const { ROLES, requiredRoleForPath, canAccessPanel } = require('./rbac');
-const { createModel } = require('./model');
-const { createRouter, createLimiter, createStatic, readBody, clientIp, sendJson, sendText, securityHeaders } = require('./http');
+const { createModel, normalizePhoneForIndex } = require('./model');
+const { createRouter, createLimiter, createSqliteLimiter, createStatic, readBody, clientIp, sendJson, sendText, securityHeaders } = require('./http');
 const { HttpError, phone, email, clean, esc, nowIso } = require('./util');
 const { createFieldCipher, sanitizePayload } = require('./security');
 const { createPayments } = require('./payments');
 const { createMailer } = require('./mailer');
+const { createSms } = require('./sms');
 const { createConnectors } = require('./connectors');
 const { createCouriers } = require('./couriers');
+const { createLogger } = require('./logger');
+const { sendSecurityAlert, trackOwnerLoginIp } = require('./alerts');
+const pkg = require('../package.json');
+
+const SECURITY_LIMIT_PREFIXES = ['login-', '2fa-', 'reg:', 'forgot-', 'reset-', 'contact:', 'otp-', 'export-', 'verify-resend:'];
+const isSecurityLimitKey = (key) => SECURITY_LIMIT_PREFIXES.some((p) => String(key || '').startsWith(p));
 
 /** يضمن وجود حساب المالك الوحيد فقط (1 Owner Max — محمي بفهرس فريد في قاعدة البيانات) */
 function ensureSingleOwner(cfg, q) {
-  if (!cfg.ownerPassword || (!cfg.ownerPhone && !cfg.ownerEmail)) return;
+  if (!cfg.ownerPassword || (!cfg.ownerPhone && !cfg.ownerEmail)) {
+    const existingOwner = q("SELECT id FROM users WHERE role = 'owner'").get();
+    if (!existingOwner) {
+      console.warn('[security] تنبيه: لم يُضبط متغير OWNER_PASSWORD — تم تخطي إنشاء حساب المالك. عيّن OWNER_PASSWORD (12 حرفًا على الأقل) أو ALLOW_DEV_DEFAULT_OWNER=1 في التطوير المحلي.');
+    }
+    return;
+  }
   let ph = '';
   try { ph = cfg.ownerPhone ? phone(cfg.ownerPhone) : '01099990000'; } catch { ph = clean(cfg.ownerPhone) || '01099990000'; }
   let mail = null;
@@ -66,13 +79,65 @@ function renderServer404Html(badPath) {
 </html>`;
 }
 
+/** المسارات المسموح بها مؤقتًا عند فرض تفعيل المصادقة الثنائية للمالك أو المشرف */
+function isAllowedDuring2faSetup(method, pathname) {
+  if (method === 'GET' && pathname === '/api/auth/me') return true;
+  if (method === 'POST' && pathname === '/api/auth/logout') return true;
+  if (pathname.startsWith('/api/account/2fa/')) return true;
+  return false;
+}
+
 function createApp(overrides = {}) {
+  const startedAtMs = Date.now();
   const cfg = load(overrides);
   const store = openDb(cfg.dbFile);
-  const limiter = createLimiter();
-  const cipher = createFieldCipher(cfg.encryptionKey || cfg.secret);
+  const logger = createLogger(cfg);
+  const memLimiter = createLimiter();
+  const sqliteLimiter = createSqliteLimiter(store.q);
+
+  // محدّد مركّب: المفاتيح الأمنية الحساسة دائمة في SQLite، وحد api:<ip> العام سريع في الذاكرة
+  const limiter = {
+    hit(key, max, windowMs) {
+      return isSecurityLimitKey(key) ? sqliteLimiter.hit(key, max, windowMs) : memLimiter.hit(key, max, windowMs);
+    },
+    reset(key) {
+      if (isSecurityLimitKey(key)) sqliteLimiter.reset(key);
+      else memLimiter.reset(key);
+    },
+    size() {
+      return memLimiter.size() + sqliteLimiter.size();
+    },
+    purge() {
+      return sqliteLimiter.purge();
+    },
+    stop() {
+      memLimiter.stop();
+      sqliteLimiter.stop();
+    }
+  };
+
+  let decryptAlertRaised = false;
+  let appRef = null;
+  const cipher = createFieldCipher(cfg.encryptionKey || cfg.secret, {
+    onDecryptFailure() {
+      if (!decryptAlertRaised && appRef) {
+        decryptAlertRaised = true;
+        sendSecurityAlert(appRef, {
+          severity: 'critical',
+          title: 'عدم تطابق مفتاح تشفير البيانات (DATA_ENCRYPTION_KEY mismatch)',
+          details: { hint: 'تحقق من DATA_ENCRYPTION_KEY فورًا' }
+        }).catch(() => {});
+      }
+    }
+  });
+
   const session = createSession(cfg, store.q);
   const mailer = createMailer(cfg);
+  const sms = createSms(cfg);
+
+  if (cfg.enforcedProd && !mailer.configured) {
+    console.warn('[mailer] تحذير إنتاج: لم يُضبط أي مزود بريد إلكتروني (Resend أو SMTP أو Mail Webhook) — لن تصل رسائل التأكيد والتنبيهات.');
+  }
 
   const notify = (userId, type, title, body = '', link = '') => {
     try {
@@ -93,6 +158,24 @@ function createApp(overrides = {}) {
     return Number(info.lastInsertRowid);
   };
 
+  /** TASK 9: تسجيل كل عملية وصول لبيانات المشترين الحساسة (Amazon DPP) */
+  const logPiiAccess = ({ actorId, ownerUserId, action, targetType = '', targetId = null, count = 1, ip = '' }) => {
+    try {
+      store.q(`INSERT INTO pii_access_log (actor_id, owner_user_id, action, target_type, target_id, count, ip, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          actorId == null ? null : Number(actorId),
+          ownerUserId == null ? null : Number(ownerUserId),
+          String(action || 'view'),
+          String(targetType || ''),
+          targetId == null ? null : Number(targetId),
+          Math.max(1, Number(count) || 1),
+          String(ip || ''),
+          nowIso()
+        );
+    } catch (_) {}
+  };
+
   const getPlatformSettings = () => {
     const rows = store.q('SELECT key, value FROM platform_settings').all();
     const out = {
@@ -103,7 +186,13 @@ function createApp(overrides = {}) {
       support_phone: '+20 100 000 0000',
       registration_open: '1',
       require_client_approval: '1',
-      maintenance_notice: ''
+      require_email_verification: cfg.enforcedProd ? '1' : '0',
+      pii_retention_days: String(cfg.piiRetentionDays || 30),
+      maintenance_notice: '',
+      last_backup_at: '',
+      last_backup_file: '',
+      last_backup_upload_status: '',
+      last_backup_encrypted: '0'
     };
     for (const row of rows) {
       if ((row.key === 'platform_tax_id' || row.key === 'platform_legal_name') && !row.value && out[row.key]) {
@@ -131,6 +220,61 @@ function createApp(overrides = {}) {
       if (h) store.q('UPDATE users SET tax_id_hash = ? WHERE id = ?').run(h, row.id);
     }
   } catch (_) {}
+
+  // TASK 7 #4: ترحيل idempotent مرة واحدة عند التشغيل لتشفير بيانات المشترين النصية القديمة وتعبئة phone_hash
+  try {
+    store.tx(() => {
+      const plainOrders = store.q(
+        `SELECT id, customer, phone, address, phone_hash FROM orders
+         WHERE (customer <> '' AND customer NOT LIKE 'enc:v1:%')
+            OR (phone <> '' AND phone NOT LIKE 'enc:v1:%')
+            OR (address <> '' AND address NOT LIKE 'enc:v1:%')
+            OR (phone <> '' AND (phone_hash IS NULL OR phone_hash = ''))`
+      ).all();
+      for (const o of plainOrders) {
+        const plainCust = cipher.isEncrypted(o.customer) ? cipher.decrypt(o.customer) : String(o.customer || '');
+        const plainPhone = cipher.isEncrypted(o.phone) ? cipher.decrypt(o.phone) : String(o.phone || '');
+        const plainAddr = cipher.isEncrypted(o.address) ? cipher.decrypt(o.address) : String(o.address || '');
+        const pHash = plainPhone ? cipher.blindIndex(normalizePhoneForIndex(plainPhone)) : '';
+        store.q('UPDATE orders SET customer = ?, phone = ?, address = ?, phone_hash = ? WHERE id = ?')
+          .run(
+            plainCust ? cipher.encrypt(plainCust) : '',
+            plainPhone ? cipher.encrypt(plainPhone) : '',
+            plainAddr ? cipher.encrypt(plainAddr) : '',
+            pHash,
+            o.id
+          );
+      }
+
+      const plainCustomers = store.q(
+        `SELECT id, user_id, name, phone, address, phone_hash FROM customers
+         WHERE (name <> '' AND name NOT LIKE 'enc:v1:%')
+            OR (phone <> '' AND phone NOT LIKE 'enc:v1:%')
+            OR (address <> '' AND address NOT LIKE 'enc:v1:%')
+            OR (phone <> '' AND (phone_hash IS NULL OR phone_hash = ''))`
+      ).all();
+      for (const c of plainCustomers) {
+        const plainName = cipher.isEncrypted(c.name) ? cipher.decrypt(c.name) : String(c.name || '');
+        const plainPhone = cipher.isEncrypted(c.phone) ? cipher.decrypt(c.phone) : String(c.phone || '');
+        const plainAddr = cipher.isEncrypted(c.address) ? cipher.decrypt(c.address) : String(c.address || '');
+        let pHash = plainPhone ? cipher.blindIndex(normalizePhoneForIndex(plainPhone)) : '';
+        if (pHash) {
+          const dup = store.q('SELECT id FROM customers WHERE user_id = ? AND phone_hash = ? AND id <> ?').get(c.user_id, pHash, c.id);
+          if (dup) pHash = '';
+        }
+        store.q('UPDATE customers SET name = ?, phone = ?, address = ?, phone_hash = ? WHERE id = ?')
+          .run(
+            plainName ? cipher.encrypt(plainName) : '',
+            plainPhone ? cipher.encrypt(plainPhone) : '',
+            plainAddr ? cipher.encrypt(plainAddr) : '',
+            pHash,
+            c.id
+          );
+      }
+    });
+  } catch (err) {
+    logger.error('pii_startup_migration_error', { error: err?.message || String(err) });
+  }
 
   const handlePlanExpired = (u, prevPlanArg) => {
     const prevPlan = prevPlanArg || u.prevPlan || 'paid';
@@ -161,12 +305,18 @@ function createApp(overrides = {}) {
   const app = {
     cfg,
     ...store,
+    logger,
     limiter,
+    sqliteLimiter,
     cipher,
     session,
     mailer,
+    sms,
     notify,
     logAudit,
+    logPiiAccess,
+    sendSecurityAlert: (opts) => sendSecurityAlert(app, opts),
+    trackOwnerLoginIp: (ownerUser, ip) => trackOwnerLoginIp(app, ownerUser, ip),
     getPlatformSettings,
     setPlatformSetting,
     requireOwner,
@@ -175,10 +325,38 @@ function createApp(overrides = {}) {
     requireAdmin,
     model: createModel(store.q, cipher, { onPlanExpired: handlePlanExpired })
   };
+  appRef = app;
   app.payments = createPayments(app);
   app.connectors = createConnectors(app);
   app.couriers = createCouriers(app);
-  app.createBackup = () => backupDatabase(store.db, cfg.backupDir, cfg.backupKeepCount);
+
+  app.createBackup = () => {
+    const res = backupDatabase(store.db, cfg.backupDir, cfg.backupKeepCount, {
+      encryptionKey: cfg.backupEncryptionKey || ''
+    });
+    setPlatformSetting('last_backup_at', res.createdAt);
+    setPlatformSetting('last_backup_file', res.filename);
+    setPlatformSetting('last_backup_encrypted', res.encrypted ? '1' : '0');
+    const s3Configured = Boolean(cfg.backupS3Endpoint && cfg.backupS3Bucket && cfg.backupS3AccessKey && cfg.backupS3Secret);
+    if (s3Configured) {
+      setPlatformSetting('last_backup_upload_status', 'uploading');
+      uploadBackupToS3(res.file, cfg)
+        .then((u) => {
+          setPlatformSetting('last_backup_upload_status', u.uploaded ? `uploaded:${u.key}` : 'skipped');
+        })
+        .catch((err) => {
+          setPlatformSetting('last_backup_upload_status', `failed:${String(err?.message || 'error').slice(0, 120)}`);
+          app.sendSecurityAlert({
+            severity: 'high',
+            title: 'فشل رفع النسخة الاحتياطية إلى التخزين الخارجي S3',
+            details: { file: res.filename, error: String(err?.message || '').slice(0, 180) }
+          }).catch(() => {});
+        });
+    } else {
+      setPlatformSetting('last_backup_upload_status', 'local_only');
+    }
+    return res;
+  };
   app.listBackups = () => listBackups(cfg.backupDir);
 
   const router = createRouter();
@@ -187,15 +365,31 @@ function createApp(overrides = {}) {
   for (const name of ['auth', 'catalog', 'orders', 'finance', 'account', 'integrations', 'billing', 'ai', 'services', 'owner', 'moderator', 'admin']) {
     require(`./routes/${name}`)(router, app);
   }
-  router.get('/api/health', () => ({ ok: true }), { auth: false });
+  router.get('/api/health', () => {
+    let dbOk = false;
+    try {
+      dbOk = store.q('SELECT 1 AS ok').get()?.ok === 1;
+    } catch {
+      dbOk = false;
+    }
+    return {
+      ok: dbOk,
+      db: dbOk,
+      uptimeSec: Math.floor((Date.now() - startedAtMs) / 1000),
+      version: pkg.version || '1.0.0'
+    };
+  }, { auth: false });
 
-  // حذف الحسابات التجريبية المنتهية، التحقق من انتهاء الباقات، وإرسال تذكيرات التجديد قبل 3 أيام
+  // مهمة الصيانة الدورية (كل ساعة): تنظيف التجريبي، حدود الطلبات، الباقات، إخفاء PII، سجل الوصول، حذف الحسابات، مطابقة كاشير، ومراقبة النسخ الاحتياطي
   const purge = () => {
     const now = nowIso();
     store.q('DELETE FROM users WHERE is_demo = 1 AND created_at < ?').run(new Date(Date.now() - cfg.demoTtlSec * 1000).toISOString());
     try {
       store.q('DELETE FROM auth_tokens WHERE expires_at < ? OR (used_at IS NOT NULL AND used_at < ?)').run(now, new Date(Date.now() - 86400_000).toISOString());
     } catch (_) {}
+
+    // TASK 6: تنظيف صفوف rate_limits المنتهية
+    try { sqliteLimiter.purge(); } catch (_) {}
 
     // 1) تخفيض الباقات المنتهية تلقائيًا إلى free وإشعار التاجر
     try {
@@ -234,6 +428,92 @@ function createApp(overrides = {}) {
         }
       }
     } catch (_) {}
+
+    // 3) TASK 8: إخفاء بيانات المشترين (PII) للطلبات المكتملة/المرتجعة/الملغاة الأقدم من PII_RETENTION_DAYS
+    try {
+      const pSettings = getPlatformSettings();
+      const retentionDays = Math.max(1, Number(pSettings.pii_retention_days || cfg.piiRetentionDays || 30) || 30);
+      const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+      const anonLabel = cipher.encrypt('عميل محذوف البيانات');
+      const ordersRes = store.q(`
+        UPDATE orders
+        SET customer = ?, phone = '', phone_hash = '', address = '', pii_purged_at = ?
+        WHERE status IN (2, 3, 4)
+          AND pii_purged_at IS NULL
+          AND COALESCE(delivered_at, cancelled_at, created_at) <= ?
+      `).run(anonLabel, now, cutoff);
+
+      const customersRes = store.q(`
+        UPDATE customers
+        SET name = ?, phone = '', phone_hash = '', address = '', email = '', pii_purged_at = ?
+        WHERE pii_purged_at IS NULL
+          AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = customers.id)
+          AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = customers.id AND o.pii_purged_at IS NULL)
+      `).run(anonLabel, now);
+
+      const ordersPurged = Number(ordersRes.changes || 0);
+      const customersPurged = Number(customersRes.changes || 0);
+      if (ordersPurged > 0 || customersPurged > 0) {
+        logAudit(null, 'privacy.pii_purged', 'platform', null, {
+          ordersPurged,
+          customersPurged,
+          retentionDays
+        });
+      }
+    } catch (_) {}
+
+    // 4) TASK 9: حذف سجلات pii_access_log الأقدم من سنة واحدة
+    try {
+      const oneYearAgo = new Date(Date.now() - 365 * 86400_000).toISOString();
+      store.q('DELETE FROM pii_access_log WHERE created_at < ?').run(oneYearAgo);
+    } catch (_) {}
+
+    // 5) TASK 17: تنفيذ حذف الحسابات التي مر على طلب حذفها 14 يومًا مع الاحتفاظ بسجل مدفوعات مجهول الهوية لأغراض ضريبية
+    try {
+      const delCutoff = new Date(Date.now() - 14 * 86400_000).toISOString();
+      const doomed = store.q("SELECT id FROM users WHERE role = 'client' AND deletion_requested_at IS NOT NULL AND deletion_requested_at <= ?").all(delCutoff);
+      for (const u of doomed) {
+        store.tx(() => {
+          const pays = store.q('SELECT * FROM plan_payments WHERE user_id = ?').all(u.id);
+          for (const p of pays) {
+            store.q(`INSERT INTO anonymized_payments (receipt_no, tx_ref, plan, cycle, amount, discount, currency, method, status, paid_at, created_at, anonymized_at)
+              VALUES (?, ?, ?, ?, ?, ?, 'EGP', ?, ?, ?, ?, ?)`)
+              .run(p.receipt_no || null, p.tx_ref, p.plan, p.cycle, p.amount, p.discount || 0, p.method, p.status, p.paid_at || null, p.created_at, now);
+          }
+          store.q('DELETE FROM users WHERE id = ?').run(u.id);
+          logAudit(null, 'account.scheduled_delete_executed', 'user', u.id, { anonymizedPayments: pays.length });
+        });
+      }
+    } catch (_) {}
+
+    // 6) TASK 16: مطابقة مدفوعات كاشير المعلّقة لأكثر من 30 دقيقة
+    try {
+      if (typeof app.payments.reconcilePendingPayments === 'function') {
+        Promise.resolve(app.payments.reconcilePendingPayments()).catch(() => {});
+      }
+    } catch (_) {}
+
+    // 7) TASK 18C: تنبيه أمني إذا مرت 36 ساعة دون نسخة احتياطية ناجحة (لقواعد البيانات على القرص)
+    try {
+      if (cfg.dbFile && cfg.dbFile !== ':memory:') {
+        const s = getPlatformSettings();
+        const lastAt = s.last_backup_at ? Date.parse(s.last_backup_at) : 0;
+        const staleMs = 36 * 3600_000;
+        const overdue = lastAt ? (Date.now() - lastAt > staleMs) : (Date.now() - startedAtMs > staleMs);
+        if (overdue) {
+          const recentAlert = store.q(
+            "SELECT id FROM security_events WHERE title LIKE '%النسخ الاحتياطي%' AND created_at > ?"
+          ).get(new Date(Date.now() - 12 * 3600_000).toISOString());
+          if (!recentAlert) {
+            app.sendSecurityAlert({
+              severity: 'high',
+              title: 'تأخر النسخ الاحتياطي لقاعدة البيانات لأكثر من 36 ساعة',
+              details: { lastBackupAt: s.last_backup_at || 'never' }
+            }).catch(() => {});
+          }
+        }
+      }
+    } catch (_) {}
   };
   app.runPurge = purge;
   purge();
@@ -244,7 +524,7 @@ function createApp(overrides = {}) {
   let autoSyncTimer = null;
   if (cfg.autoSyncIntervalMin > 0) {
     autoSyncTimer = setInterval(() => {
-      app.connectors.syncAllActiveConnections().catch((e) => console.error('[auto-sync]', e));
+      app.connectors.syncAllActiveConnections().catch((e) => logger.error('auto_sync_error', { error: e?.message || String(e) }));
     }, cfg.autoSyncIntervalMin * 60_000);
     autoSyncTimer.unref();
   }
@@ -253,7 +533,7 @@ function createApp(overrides = {}) {
   let backupTimer = null;
   if (cfg.dbFile && cfg.dbFile !== ':memory:' && cfg.backupDir) {
     backupTimer = setInterval(() => {
-      try { app.createBackup(); } catch (e) { console.error('[backup]', e); }
+      try { app.createBackup(); } catch (e) { logger.error('backup_error', { error: e?.message || String(e) }); }
     }, 24 * 3600_000);
     backupTimer.unref();
   }
@@ -272,7 +552,7 @@ function createApp(overrides = {}) {
     try {
       const u = new URL(origin);
       if (u.host === host || allowedHosts.has(u.host) || allowedOriginsSet.has(u.origin)) return true;
-      if (!cfg.production && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
+      if (!cfg.enforcedProd && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
       return false;
     } catch { return false; }
   };
@@ -292,7 +572,7 @@ function createApp(overrides = {}) {
     return true;
   };
 
-  async function handleApi(req, res, url) {
+  async function handleApi(req, res, url, reqId) {
     const corsMatched = applyCors(req, res);
     if (req.method === 'OPTIONS') {
       if (req.headers.origin && !corsMatched && !sameOrigin(req)) {
@@ -303,7 +583,7 @@ function createApp(overrides = {}) {
       return;
     }
 
-    const ip = clientIp(req, cfg.trustProxy);
+    const ip = clientIp(req, cfg.trustProxy, cfg.trustProxyHops);
     if (!limiter.hit(`api:${ip}`, 600, 60_000)) throw new HttpError(429, 'طلبات كثيرة، انتظر قليلًا ثم حاول مجددًا');
 
     const method = req.method === 'HEAD' ? 'GET' : req.method;
@@ -324,6 +604,11 @@ function createApp(overrides = {}) {
     if (sess.revoked && route.auth) {
       session.clear(res);
       throw new HttpError(401, 'تم إنهاء جلستك بواسطة الإدارة، يرجى تسجيل الدخول مجددًا', { code: 'SESSION_REVOKED', reason: sess.reason });
+    }
+
+    // TASK 4: تقييد الجلسة إذا كانت مخصصة لإعداد المصادقة الثنائية الإلزامية (setup2fa: 1)
+    if (user && user._setup2fa && !isAllowedDuring2faSetup(method, url.pathname)) {
+      throw new HttpError(403, 'يجب تفعيل المصادقة الثنائية (2FA) أولاً قبل استخدام لوحة التحكم.', { code: '2FA_SETUP_REQUIRED' });
     }
 
     // حماية مسارات المالك والمشرفين: إرجاع 404 Not Found لغير المصرح لهم لإخفاء وجود اللوحات تمامًا
@@ -352,16 +637,30 @@ function createApp(overrides = {}) {
       }
     }
 
-    const out = await route.handler({ req, res, url, query: Object.fromEntries(url.searchParams), params, body, rawBody: raw, user, ip, sess });
+    const out = await route.handler({ req, res, url, query: Object.fromEntries(url.searchParams), params, body, rawBody: raw, user, ip, sess, reqId });
     if (!res.writableEnded && !res.headersSent) sendJson(res, 200, out ?? { ok: true });
   }
 
   const server = http.createServer(async (req, res) => {
+    const reqStart = Date.now();
+    const reqId = logger.requestId();
+    res.setHeader('X-Request-Id', reqId);
     securityHeaders(res, cfg);
+    let parsedPath = req.url || '/';
     try {
       let url;
-      try { url = new URL(req.url, 'http://localhost'); } catch { throw new HttpError(400, 'عنوان غير صالح'); }
-      if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+      try { url = new URL(req.url, 'http://localhost'); parsedPath = url.pathname; } catch { throw new HttpError(400, 'عنوان غير صالح'); }
+      if (url.pathname.startsWith('/api/')) {
+        await handleApi(req, res, url, reqId);
+        logger.debug('api_request', {
+          reqId,
+          method: req.method,
+          path: url.pathname,
+          status: res.statusCode,
+          ms: Date.now() - reqStart
+        });
+        return;
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'الطريقة غير مسموحة');
 
       // حماية الوصول المباشر من شريط العنوان لمسارات المالك والمشرفين (/owner, /moderator, /admin)
@@ -379,8 +678,8 @@ function createApp(overrides = {}) {
     } catch (e) {
       if (res.headersSent) return res.end();
       if (e instanceof HttpError) return sendJson(res, e.status, { error: e.message, ...e.extra });
-      console.error('[server]', e);
-      sendJson(res, 500, { error: 'حدث خطأ في الخادم، حاول مجددًا.' });
+      logger.reportError(e, { reqId, method: req.method, path: parsedPath, source: 'http_500' });
+      sendJson(res, 500, { error: 'حدث خطأ في الخادم، حاول مجددًا.', requestId: reqId });
     }
   });
 
@@ -399,7 +698,7 @@ function createApp(overrides = {}) {
     store.close();
   };
 
-  return { server, cfg, close, app, mailer, db: store.db };
+  return { server, cfg, close, app, mailer, sms, logger, db: store.db };
 }
 
 module.exports = { createApp };

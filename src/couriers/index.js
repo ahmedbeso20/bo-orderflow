@@ -4,7 +4,7 @@
 
 const { HttpError, bad, nowIso, parseJson } = require('../util');
 const { COD } = require('../domain');
-const { assertSafeExternalUrl, assertSafeExternalUrlWithDns, callJson, maskSecret } = require('../connectors');
+const { assertSafeExternalUrl, assertSafeExternalUrlWithDns, callJson, callWithRetry, maskSecret } = require('../connectors');
 
 const COURIER_KEYS = ['bosta', 'aramex'];
 
@@ -74,6 +74,11 @@ function validateAndMergeCourierCredentials(courier, inputCreds = {}, existingCr
 }
 
 const ADAPTERS = {
+  /**
+   * 1. Bosta Egypt — Bosta Delivery API v2
+   * Docs: https://docs.bosta.co/
+   * Auth: Authorization header containing Bosta API Key
+   */
   bosta: {
     base(creds, env) {
       return assertSafeExternalUrl(
@@ -85,8 +90,11 @@ const ADAPTERS = {
       return { authorization: creds.apiKey, 'content-type': 'application/json', accept: 'application/json' };
     },
     async test(creds, env, fetchFn) {
-      const res = await callJson(fetchFn, `${this.base(creds, env)}/pickup-locations`, { headers: this.headers(creds) });
-      if (!res.ok) throw new HttpError(400, `فشل الاتصال بـ Bosta API (HTTP ${res.status})`);
+      const res = await callWithRetry(() => callJson(fetchFn, `${this.base(creds, env)}/pickup-locations`, { headers: this.headers(creds) }));
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) throw new HttpError(400, 'مفتاح Bosta API غير صحيح أو غير مخوّل (HTTP ' + res.status + ')');
+        throw new HttpError(400, `فشل الاتصال بـ Bosta API (HTTP ${res.status})`);
+      }
       return { ok: true, message: 'تم التحقق من اتصال Bosta API بنجاح.' };
     },
     async createAwb(creds, env, order, store, fetchFn) {
@@ -132,6 +140,11 @@ const ADAPTERS = {
     }
   },
 
+  /**
+   * 2. Aramex — Shipping & Tracking JSON API v2
+   * Docs: https://www.aramex.com/developers/
+   * Auth: ClientInfo JSON body (AccountNumber, AccountPin, UserName, Password, Entity, CountryCode)
+   */
   aramex: {
     base(creds, env) {
       return assertSafeExternalUrl(
@@ -151,12 +164,15 @@ const ADAPTERS = {
       };
     },
     async test(creds, env, fetchFn) {
-      const res = await callJson(fetchFn, `${this.base(creds, env)}/Tracking/Service_1_0.svc/json/TrackShipments`, {
+      const res = await callWithRetry(() => callJson(fetchFn, `${this.base(creds, env)}/Tracking/Service_1_0.svc/json/TrackShipments`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ ClientInfo: this.clientInfo(creds), Shipments: ['0000000000'] })
-      });
-      if (!res.ok) throw new HttpError(400, `فشل الاتصال بـ Aramex API (HTTP ${res.status})`);
+      }));
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) throw new HttpError(400, 'بيانات حساب أرامكس غير صحيحة أو غير مخوّلة (HTTP ' + res.status + ')');
+        throw new HttpError(400, `فشل الاتصال بـ Aramex API (HTTP ${res.status})`);
+      }
       if (res.data?.HasErrors && Array.isArray(res.data?.Notifications)) {
         const authErr = res.data.Notifications.find((n) => /auth|credential|account|pin|password/i.test(String(n.Message || n.Code || '')));
         if (authErr) throw new HttpError(400, `بيانات حساب أرامكس غير صحيحة: ${authErr.Message || authErr.Code}`);
@@ -329,7 +345,12 @@ function createCouriers(app) {
     const creds = decryptCreds(row);
     const res = await ADAPTERS[key].track(creds, row.environment || 'production', order.awb_number, guardedFetch);
     if (res.mappedOrderStatus !== null && order.status === 1 && (res.mappedOrderStatus === 2 || res.mappedOrderStatus === 3)) {
-      q('UPDATE orders SET courier_status = ?, status = ? WHERE id = ? AND user_id = ?').run(res.courierStatus, res.mappedOrderStatus, order.id, user.id);
+      if (res.mappedOrderStatus === 2) {
+        q('UPDATE orders SET courier_status = ?, status = 2, delivered_at = COALESCE(delivered_at, ?) WHERE id = ? AND user_id = ?')
+          .run(res.courierStatus, nowIso(), order.id, user.id);
+      } else {
+        q('UPDATE orders SET courier_status = ?, status = ? WHERE id = ? AND user_id = ?').run(res.courierStatus, res.mappedOrderStatus, order.id, user.id);
+      }
     } else {
       q('UPDATE orders SET courier_status = ? WHERE id = ? AND user_id = ?').run(res.courierStatus, order.id, user.id);
     }

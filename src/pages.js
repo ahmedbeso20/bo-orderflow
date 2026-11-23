@@ -2,6 +2,7 @@
 // صفحات HTML تُولَّد على الخادم للطباعة: الفاتورة الضريبية المبسطة وبوالص الشحن
 const { esc, egp, fmt, round2 } = require('./util');
 const { MARKETS, PLANS, GATEWAY_METHODS, COD, VAT } = require('./domain');
+const { generateQrSvg } = require('./qr');
 
 const CSS = `*{box-sizing:border-box}body{font:14px/1.7 Cairo,system-ui,sans-serif;margin:0;padding:24px;color:#082038;background:#F3F5FB}
 .sheet{max-width:760px;margin:0 auto 16px;background:#FFFFFF;border:1px solid #DCE5F2;border-radius:14px;padding:28px;position:relative}
@@ -16,59 +17,6 @@ table{width:100%;border-collapse:collapse;margin:16px 0}th,td{padding:8px 10px;b
 
 const page = (title, body) => `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${CSS}</style></head><body>${body}<script src="/js/print.js"></script></body></html>`;
 const date = (iso) => new Date(iso).toLocaleDateString('ar-EG', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Africa/Cairo' });
-
-/** يولد SVG كود QR متوافق بصريًا للفاتورة الإلكترونية */
-function generateQrSvg(payload) {
-  const size = 25;
-  const grid = Array.from({ length: size }, () => Array(size).fill(0));
-
-  // رسم مربعات التوجيه الثلاثة (Finder patterns)
-  function drawFinder(r0, c0) {
-    for (let r = 0; r < 7; r++) {
-      for (let c = 0; c < 7; c++) {
-        const isBorder = (r === 0 || r === 6 || c === 0 || c === 6);
-        const isCenter = (r >= 2 && r <= 4 && c >= 2 && c <= 4);
-        grid[r0 + r][c0 + c] = (isBorder || isCenter) ? 1 : 0;
-      }
-    }
-  }
-  drawFinder(0, 0);
-  drawFinder(0, size - 7);
-  drawFinder(size - 7, 0);
-
-  // خطوط التزامن (Timing lines)
-  for (let i = 8; i < size - 8; i++) {
-    grid[6][i] = i % 2 === 0 ? 1 : 0;
-    grid[i][6] = i % 2 === 0 ? 1 : 0;
-  }
-
-  // ملء بيانات تشفيرية مشتقة من بيانات الفاتورة
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < payload.length; i++) {
-    hash ^= payload.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-
-  for (let r = 0; r < size; r++) {
-    for (let c = 0; c < size; c++) {
-      // تجنب مربعات التوجيه
-      if ((r < 8 && c < 8) || (r < 8 && c >= size - 8) || (r >= size - 8 && c < 8)) continue;
-      if (r === 6 || c === 6) continue;
-      hash = (hash * 1103515245 + 12345) & 0x7fffffff;
-      grid[r][c] = (hash % 3 === 0 || (r + c) % 3 === 0) ? 1 : 0;
-    }
-  }
-
-  let rects = '';
-  for (let r = 0; r < size; r++) {
-    for (let c = 0; c < size; c++) {
-      if (grid[r][c]) {
-        rects += `<rect x="${c * 4}" y="${r * 4}" width="4" height="4" fill="#091736"/>`;
-      }
-    }
-  }
-  return `<svg width="100" height="100" viewBox="0 0 ${size * 4} ${size * 4}" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#ffffff"/>${rects}</svg>`;
-}
 
 function invoicePage(o, items, store) {
   const preTax = round2(o.total / (1 + VAT));
@@ -165,6 +113,7 @@ function subscriptionReceiptPage(pay, store, platform = {}) {
     </div>
     <div style="text-align:end">
       <h2>إيصال سداد اشتراك ضريبي (E-Receipt)</h2>
+      ${pay.receipt_no ? `<div class="mu">رقم الإيصال المتسلسل: <span dir="ltr"><b>OF-RCP-${String(pay.receipt_no).padStart(6, '0')}</b></span></div>` : ''}
       <div class="mu">رقم العملية المرجعي: <span dir="ltr"><b>${esc(pay.tx_ref)}</b></span></div>
       <div class="mu">تاريخ السداد: ${date(pay.created_at)}</div>
       <div style="margin-top:6px"><span class="stamp" style="border-color:#087F72;color:#087F72">مدفوع ومفعَّل ✓</span></div>

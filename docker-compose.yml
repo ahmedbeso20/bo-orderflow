@@ -1,4 +1,6 @@
 services:
+  # Required in .env before running in production:
+  # SESSION_SECRET (>= 32 chars), DATA_ENCRYPTION_KEY (>= 32 chars), OWNER_PASSWORD (>= 12 chars)
   api:
     build:
       context: .
@@ -14,6 +16,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       DATA_DIR: /app/data
+      DB_FILE: /app/data/omniarab.db
       DB_PATH: /app/data/omniarab.db
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001}
     volumes:

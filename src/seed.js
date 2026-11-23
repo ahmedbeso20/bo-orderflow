@@ -62,15 +62,17 @@ const pick = (rand, list) => {
   return list[list.length - 1][0];
 };
 
-function seedDemo({ q, tx }, uid) {
+function seedDemo({ q, tx, cipher }, uid) {
   const now = Date.now();
   const rand = rng(uid * 7919 + 13);
+  const enc = (v) => (cipher && v ? cipher.encrypt(String(v)) : String(v || ''));
+  const phHash = (v) => (cipher && v ? cipher.blindIndex(String(v).replace(/[^\d+]/g, '')) : '');
 
   tx(() => {
     for (const t of ['orders', 'customers', 'products', 'payouts', 'plan_payments', 'notifications']) q(`DELETE FROM ${t} WHERE user_id = ?`).run(uid);
 
     const stamp = nowIso();
-    const ids = PRODUCTS.map((p) => Number(q('INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    const ids = PRODUCTS.map((p) => Number(q("INSERT INTO products (user_id,name,sku,cat,markets,price,cost,stock,image,approval_status,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'seed',?,?)")
       .run(uid, p[0], p[1], p[6], p[2], p[3], p[5], p[4], p[7], 'approved', stamp, stamp).lastInsertRowid));
 
     const rows = []; // {t, market, customer, gov, pay, courier, status, lines}
@@ -101,8 +103,8 @@ function seedDemo({ q, tx }, uid) {
     }
 
     rows.sort((a, b) => a.t - b.t);
-    const insCustomer = q('INSERT INTO customers (user_id,name,phone,email,gov,address,notes,tags,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
-    const insOrder = q('INSERT INTO orders (user_id,no,market,customer,customer_id,phone,gov,address,pay,courier,total,cost_total,ship_fee,status,items,approval_status,return_reason,created_at,settled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    const insCustomer = q('INSERT INTO customers (user_id,name,phone,phone_hash,email,gov,address,notes,tags,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+    const insOrder = q("INSERT INTO orders (user_id,no,market,customer,customer_id,phone,phone_hash,gov,address,pay,courier,total,cost_total,ship_fee,status,items,approval_status,return_reason,source,delivered_at,created_at,settled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'seed',?,?,?)");
     const insItem = q('INSERT INTO order_items (order_id,product_id,name,qty,price,cost) VALUES (?,?,?,?,?,?)');
 
     const custByName = new Map();
@@ -117,18 +119,22 @@ function seedDemo({ q, tx }, uid) {
       });
       const age = (now - o.t) / DAY;
       const settled = o.status === 2 && o.pay === COD && age > 14 ? new Date(o.t + 6 * DAY).toISOString() : null;
+      const deliveredAt = o.status === 2 ? new Date(Math.min(now, o.t + 3 * DAY)).toISOString() : null;
       const createdAt = new Date(o.t).toISOString();
 
       let cust = custByName.get(o.customer);
       if (!cust) {
         const ph = `010${String(10000000 + ((custSeq++ * 7919 + 1234) % 89999999)).slice(0, 8)}`;
-        const cid = Number(insCustomer.run(uid, o.customer, ph, '', o.gov, '', '', '', createdAt, createdAt).lastInsertRowid);
-        cust = { id: cid, phone: ph };
+        const phH = phHash(ph);
+        const encName = enc(o.customer);
+        const encPh = enc(ph);
+        const cid = Number(insCustomer.run(uid, encName, encPh, phH, '', o.gov, '', '', '', createdAt, createdAt).lastInsertRowid);
+        cust = { id: cid, encName, encPh, phH };
         custByName.set(o.customer, cust);
       }
 
       const retReason = o.status === 3 ? RETURN_REASONS[i % RETURN_REASONS.length] : '';
-      const info = insOrder.run(uid, 1001 + i, o.market, o.customer, cust.id, cust.phone, o.gov, '', o.pay, o.courier, total, cost, COURIERS[o.courier].fee, o.status, parts.join(' + '), 'approved', retReason, createdAt, settled);
+      const info = insOrder.run(uid, 1001 + i, o.market, cust.encName, cust.id, cust.encPh, cust.phH, o.gov, '', o.pay, o.courier, total, cost, COURIERS[o.courier].fee, o.status, parts.join(' + '), 'approved', retReason, deliveredAt, createdAt, settled);
       for (const [pi, qty] of o.lines) insItem.run(Number(info.lastInsertRowid), ids[pi], PRODUCTS[pi][0], qty, PRODUCTS[pi][3], PRODUCTS[pi][5]);
     });
 

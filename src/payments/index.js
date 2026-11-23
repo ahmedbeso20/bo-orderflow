@@ -72,8 +72,17 @@ function createPayments(app) {
         const amountOk = Number.isFinite(ev.amount) && Math.abs(ev.amount - row.amount) < 0.01;
         const currencyOk = !ev.currency || ev.currency === row.currency;
         if (!amountOk || !currencyOk) {
-          // لا نفعّل الباقة عند أي تعارض — تُراجَع يدويًا
+          // لا نفعّل الباقة عند أي تعارض — تُراجَع يدويًا وتُسجَّل في سجل المراقبة
           q("UPDATE plan_payments SET status = 'review', provider_ref = COALESCE(NULLIF(?, ''), provider_ref), updated_at = ? WHERE id = ?").run(ev.providerRef || '', iso, row.id);
+          if (typeof app.logAudit === 'function') {
+            app.logAudit(row.user_id, 'payment.amount_mismatch', 'payment', row.id, {
+              txRef,
+              expectedAmount: row.amount,
+              receivedAmount: ev.amount,
+              expectedCurrency: row.currency,
+              receivedCurrency: ev.currency
+            });
+          }
           console.error(`[payments] تعارض مبلغ/عملة للعملية ${txRef}: المتوقع ${row.amount} ${row.currency} والمستلم ${ev.amount} ${ev.currency}`);
           return { row: q('SELECT * FROM plan_payments WHERE id = ?').get(row.id), changed: true, mismatch: true };
         }
@@ -84,8 +93,9 @@ function createPayments(app) {
         const start = Math.max(Date.now(), current || 0);
         const startIso = new Date(start).toISOString();
         const endIso = new Date(start + days * DAY_MS).toISOString();
-        q("UPDATE plan_payments SET status = 'paid', provider_ref = COALESCE(NULLIF(?, ''), provider_ref), period_start = ?, period_end = ?, updated_at = ? WHERE id = ?")
-          .run(ev.providerRef || '', startIso, endIso, iso, row.id);
+        const nextReceiptNo = row.receipt_no || Number(q('SELECT COALESCE(MAX(receipt_no), 0) + 1 AS n FROM plan_payments').get().n);
+        q("UPDATE plan_payments SET status = 'paid', receipt_no = ?, provider_ref = COALESCE(NULLIF(?, ''), provider_ref), period_start = ?, period_end = ?, updated_at = ? WHERE id = ?")
+          .run(nextReceiptNo, ev.providerRef || '', startIso, endIso, iso, row.id);
         q('UPDATE users SET plan = ?, plan_cycle = ?, plan_expires_at = ?, default_pay_method = ?, auto_renew = 1 WHERE id = ?')
           .run(row.plan, row.cycle, endIso, row.method, row.user_id);
       } else {
@@ -159,10 +169,39 @@ function createPayments(app) {
     const ev = provider.parseWebhook({ rawBody, headers });
     if (ev.status === 'ignore' || !ev.txRef) return { ok: true, ignored: true };
     const out = settle(ev.txRef, ev);
-    return { ok: true, status: out.row.status, duplicate: Boolean(out.duplicate) };
+    if (out.mismatch) {
+      if (typeof app.sendSecurityAlert === 'function') {
+        app.sendSecurityAlert({
+          severity: 'high',
+          title: 'تعارض مبلغ أو عملة في إشعار دفع',
+          details: { txRef: ev.txRef, expectedAmount: out.row.amount, receivedAmount: ev.amount, currency: ev.currency }
+        }).catch(() => {});
+      }
+      throw new HttpError(400, 'تعارض مبلغ أو عملة العملية مع السجل المحفوظ', { code: 'PAYMENT_MISMATCH', status: out.row.status });
+    }
+    return { ok: true, status: out.row.status, duplicate: Boolean(out.duplicate), receiptNo: out.row.receipt_no || null };
   }
 
-  return { provider, active: () => provider, publicConfig, checkout, settle, handleWebhook, find };
+  /** تسوية المدفوعات المعلّقة منذ أكثر من ٣٠ دقيقة عبر استعلام البوابة مباشرةً */
+  async function reconcilePendingPayments() {
+    if (!provider || typeof provider.queryPaymentStatus !== 'function') return { checked: 0, settled: 0 };
+    const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
+    const pending = q("SELECT * FROM plan_payments WHERE status = 'pending' AND provider = ? AND created_at < ? LIMIT 25")
+      .all(provider.id, cutoff);
+    let settled = 0;
+    for (const row of pending) {
+      try {
+        const res = await provider.queryPaymentStatus({ txRef: row.tx_ref, providerRef: row.provider_ref });
+        if (res && (res.status === 'paid' || res.status === 'failed' || res.status === 'cancelled')) {
+          const out = settle(row.tx_ref, res);
+          if (out.changed) settled++;
+        }
+      } catch (_) {}
+    }
+    return { checked: pending.length, settled };
+  }
+
+  return { provider, active: () => provider, publicConfig, checkout, settle, handleWebhook, reconcilePendingPayments, find };
 }
 
 module.exports = { createPayments };

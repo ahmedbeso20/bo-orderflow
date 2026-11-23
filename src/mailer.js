@@ -207,8 +207,168 @@ async function sendViaSmtp(cfg, entry) {
   }
 }
 
+function escHtml(v) {
+  return String(v ?? '').replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function wrapBrandedRtlHtml({ heading, badge = 'OrderFlow', accent = '#0C5CA4', bodyHtml, ctaUrl = '', ctaLabel = '', footerNote = '' }) {
+  const safeCta = ctaUrl && /^https?:\/\//i.test(ctaUrl)
+    ? `<tr><td style="padding:18px 28px 8px;text-align:center"><a href="${escHtml(ctaUrl)}" style="display:inline-block;background:${accent};color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 28px;border-radius:10px">${escHtml(ctaLabel || 'فتح OrderFlow')}</a></td></tr>`
+    : '';
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:24px 12px;background:#F3F5FB;font-family:Cairo,Tahoma,Arial,sans-serif;color:#082038;direction:rtl;text-align:right">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:580px;margin:0 auto;background:#FFFFFF;border:1px solid #DCE5F2;border-radius:14px;overflow:hidden">
+    <tr>
+      <td style="background:${accent};padding:20px 28px;color:#FFFFFF">
+        <div style="font-size:20px;font-weight:800;letter-spacing:0.2px">OrderFlow</div>
+        <div style="font-size:12px;opacity:0.9;margin-top:2px">${escHtml(badge)}</div>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:24px 28px 10px">
+        <h1 style="margin:0 0 12px;font-size:19px;line-height:1.5;color:#082038">${escHtml(heading)}</h1>
+        <div style="font-size:14.5px;line-height:1.85;color:#273B53">${bodyHtml}</div>
+      </td>
+    </tr>
+    ${safeCta}
+    <tr>
+      <td style="padding:20px 28px 24px;border-top:1px solid #E8EEF7;font-size:12px;line-height:1.7;color:#5C7089">
+        ${footerNote ? `<div style="margin-bottom:6px">${escHtml(footerNote)}</div>` : ''}
+        <div>OrderFlow — منصة إدارة متاجر أمازون ونون وجوميا في مصر</div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+function renderEmailTemplate(type, opts = {}) {
+  const url = String(opts.url || '');
+  const textBody = String(opts.text || '').trim();
+  const paragraphs = (s) => escHtml(s).replace(/\n/g, '<br>');
+
+  switch (type) {
+    case 'verify_email':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'تأكيد بريدك الإلكتروني على OrderFlow',
+          badge: 'توثيق الحساب',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'اضغط الزر التالي لتأكيد بريدك الإلكتروني وتفعيل جميع مزايا الربط مع الأسواق والدفع.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'تأكيد البريد الإلكتروني',
+          footerNote: 'إذا لم تقم بإنشاء هذا الحساب يمكنك تجاهل هذه الرسالة بأمان.'
+        }),
+        text: textBody || `تأكيد بريدك الإلكتروني على OrderFlow: ${url}`
+      };
+    case 'reset_password':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'استعادة كلمة مرور حسابك',
+          badge: 'أمان الحساب',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'تلقّينا طلبًا لإعادة تعيين كلمة المرور لحسابك. الرابط صالح لمدة 30 دقيقة فقط.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'إعادة تعيين كلمة المرور',
+          footerNote: 'إذا لم تطلب تغيير كلمة المرور، ننصح بتجاهل الرسالة وتفعيل المصادقة الثنائية (2FA).'
+        }),
+        text: textBody || `رابط إعادة تعيين كلمة المرور (صالح لمدة 30 دقيقة): ${url}`
+      };
+    case 'plan_expired':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'انتهى اشتراكك وتم التحويل للباقة المجانية',
+          badge: 'الاشتراكات والفوترة',
+          accent: '#B45309',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'انتهت صلاحية باقتك المدفوعة وتم تحويل الحساب تلقائيًا للباقة المجانية.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'تجديد الاشتراك الآن'
+        }),
+        text: textBody || `انتهى اشتراكك على OrderFlow. يمكنك التجديد عبر: ${url}`
+      };
+    case 'plan_expiring_soon':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'تذكير بقرب انتهاء اشتراكك',
+          badge: 'الاشتراكات والفوترة',
+          accent: '#0C5CA4',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'قارب اشتراكك الحالي على الانتهاء. جدّده الآن لضمان استمرار المزامنة بدون انقطاع.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'تجديد الاشتراك'
+        }),
+        text: textBody || `تذكير بقرب انتهاء اشتراكك على OrderFlow: ${url}`
+      };
+    case 'contact':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'رسالة تواصل جديدة من الموقع',
+          badge: 'الدعم والمبيعات',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'وصلت رسالة جديدة من نموذج التواصل.')}</p>`
+        }),
+        text: textBody || 'وصلت رسالة تواصل جديدة.'
+      };
+    case 'security_alert':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: opts.alertTitle || opts.subject || 'تنبيه أمني عاجل',
+          badge: `تنبيه أمني (${String(opts.severity || 'high').toUpperCase()})`,
+          accent: '#B91C1C',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'تم رصد حدث أمني يتطلب مراجعتك الفورية في لوحة المالك.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'فتح لوحة الأمان'
+        }),
+        text: textBody || `تنبيه أمني على OrderFlow: ${url}`
+      };
+    case 'account_approved':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'تم قبول وتفعيل حسابك بنجاح 🎉',
+          badge: 'تفعيل الحساب',
+          accent: '#0F766E',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'تهانينا! تمت مراجعة حسابك وتفعيله بنجاح. يمكنك الآن تسجيل الدخول وربط متاجرك على أمازون ونون وجوميا.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'تسجيل الدخول للوحة التحكم'
+        }),
+        text: textBody || `تم تفعيل حسابك على OrderFlow بنجاح. ادخل من هنا: ${url}`
+      };
+    case 'account_rejected':
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: 'تحديث بخصوص طلب إنشاء حسابك',
+          badge: 'مراجعة الحساب',
+          accent: '#991B1B',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody || 'نعتذر، لم يتم قبول طلب تفعيل حسابك حاليًا. يمكنك التواصل مع فريق الدعم لمزيد من التفاصيل.')}</p>`,
+          ctaUrl: url,
+          ctaLabel: 'التواصل مع الدعم'
+        }),
+        text: textBody || 'نعتذر، لم يتم قبول طلب تفعيل حسابك حاليًا.'
+      };
+    default:
+      return {
+        html: wrapBrandedRtlHtml({
+          heading: opts.subject || 'إشعار من OrderFlow',
+          bodyHtml: `<p style="margin:0 0 12px">${paragraphs(textBody)}</p>`,
+          ctaUrl: url,
+          ctaLabel: url ? 'فتح الرابط' : ''
+        }),
+        text: textBody
+      };
+  }
+}
+
 function createMailer(cfg = {}) {
   const sent = [];
+
+  const activeProvider = typeof cfg.mailTransport === 'function'
+    ? 'custom'
+    : (String(cfg.mailApiKey || '').trim() && String(cfg.mailFrom || '').trim())
+      ? 'resend'
+      : String(cfg.smtpHost || '').trim()
+        ? 'smtp'
+        : String(cfg.mailWebhookUrl || '').trim()
+          ? 'webhook'
+          : 'none';
+  const configured = activeProvider !== 'none';
 
   const pushSent = (entry) => {
     sent.push(entry);
@@ -216,12 +376,13 @@ function createMailer(cfg = {}) {
     return entry;
   };
 
-  async function send({ to, subject, text, html, token, url, type }) {
+  async function send({ to, subject, text, html, token, url, type, severity, alertTitle, details }) {
+    const rendered = !html ? renderEmailTemplate(type || 'general', { subject, text, url, severity, alertTitle, details }) : null;
     const entry = {
       to: String(to || '').trim(),
       subject: String(subject || ''),
-      text: String(text || ''),
-      html: html ? String(html) : null,
+      text: String(text || rendered?.text || ''),
+      html: html ? String(html) : (rendered ? rendered.html : null),
       token: token || null,
       url: url || null,
       type: type || 'general',
@@ -354,9 +515,11 @@ function createMailer(cfg = {}) {
   return {
     send,
     sent,
+    configured,
+    activeProvider,
     last: () => sent.at(-1) || null,
     clear: () => { sent.length = 0; }
   };
 }
 
-module.exports = { createMailer, sendViaSmtp, buildMimeMessage };
+module.exports = { createMailer, sendViaSmtp, buildMimeMessage, renderEmailTemplate };

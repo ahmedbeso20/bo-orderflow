@@ -108,6 +108,35 @@ function createLimiter({ maxEntries = 50_000 } = {}) {
   };
 }
 
+/** محدّد معدّل طلبات دائم محفوظ في SQLite (للمفاتيح الأمنية الحساسة) */
+function createSqliteLimiter(q) {
+  return {
+    hit(key, max, windowMs) {
+      const now = Date.now();
+      const nextReset = now + windowMs;
+      const row = q(`
+        INSERT INTO rate_limits (key, n, reset_at)
+        VALUES (?, 1, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          n = CASE WHEN rate_limits.reset_at <= ? THEN 1 ELSE rate_limits.n + 1 END,
+          reset_at = CASE WHEN rate_limits.reset_at <= ? THEN ? ELSE rate_limits.reset_at END
+        RETURNING n
+      `).get(String(key), nextReset, now, now, nextReset);
+      return (row ? Number(row.n) : 1) <= max;
+    },
+    size() {
+      return Number(q('SELECT COUNT(*) AS c FROM rate_limits WHERE reset_at > ?').get(Date.now())?.c || 0);
+    },
+    reset(key) {
+      q('DELETE FROM rate_limits WHERE key = ?').run(String(key));
+    },
+    purge() {
+      return q('DELETE FROM rate_limits WHERE reset_at <= ?').run(Date.now()).changes || 0;
+    },
+    stop() {}
+  };
+}
+
 function readBody(req, limit = 1_000_000) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -121,10 +150,13 @@ function readBody(req, limit = 1_000_000) {
   });
 }
 
-function clientIp(req, trustProxy) {
+function clientIp(req, trustProxy, hops = 1) {
   if (trustProxy) {
     const parts = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
-    if (parts.length) return parts[parts.length - 1]; // آخر عنوان أضافه الوسيط الموثوق
+    if (parts.length) {
+      const h = Math.max(1, Number(hops) || 1);
+      return parts[Math.max(0, parts.length - h)];
+    }
   }
   return req.socket.remoteAddress || '0.0.0.0';
 }
@@ -181,4 +213,4 @@ function createStatic(dir) {
   };
 }
 
-module.exports = { createRouter, createLimiter, createStatic, readBody, clientIp, sendJson, sendText, securityHeaders };
+module.exports = { createRouter, createLimiter, createSqliteLimiter, createStatic, readBody, clientIp, sendJson, sendText, securityHeaders };

@@ -6,7 +6,7 @@ const { HttpError, bad, text, integer, nowIso } = require('../util');
 const { PLANS } = require('../domain');
 
 module.exports = (r, app) => {
-  const { q, tx, notify, logAudit, model } = app;
+  const { q, tx, cfg, mailer, notify, logAudit, model } = app;
 
   const pendingClientRowOf = (u) => ({
     id: u.id,
@@ -108,7 +108,7 @@ module.exports = (r, app) => {
   }, { moderator: true, permission: 'view_pending_clients' });
 
   // 3. قبول حساب العميل (Approve) -> تحويل الحالة إلى active + توثيق في سجل المراقبة
-  r.post('/api/moderator/clients/:id/approve', ({ user, params, ip }) => {
+  r.post('/api/moderator/clients/:id/approve', async ({ user, params, ip }) => {
     const u = findClientOnly(params.id);
     if (u.status === 'suspended') {
       throw new HttpError(403, 'هذا الحساب موقوف بقرار من مالك المنصة، ولا يمكن تفعيله إلا عبر المالك.');
@@ -129,11 +129,21 @@ module.exports = (r, app) => {
       'تمت مراجعة حسابك والموافقة عليه. يمكنك الآن تسجيل الدخول واستخدام جميع خدمات OrderFlow.',
       '#/dash'
     );
+    if (u.email && mailer) {
+      await mailer.send({
+        to: u.email,
+        subject: 'تمت الموافقة على حسابك في OrderFlow ✓',
+        type: 'account_approved',
+        storeName: u.store_name,
+        url: `${cfg.appUrl || 'http://localhost:3000'}/#/login`,
+        text: `مرحبًا ${u.store_name}، تمت الموافقة على حسابك في OrderFlow ويمكنك الآن تسجيل الدخول.`
+      });
+    }
     return { ok: true, client: pendingClientRowOf(findClientOnly(u.id)) };
   }, { moderator: true, permission: 'approve_clients' });
 
   // 4. رفض حساب العميل (Reject) مع إمكانية إضافة سبب الرفض + توثيق في سجل المراقبة
-  r.post('/api/moderator/clients/:id/reject', ({ user, params, body, ip }) => {
+  r.post('/api/moderator/clients/:id/reject', async ({ user, params, body, ip }) => {
     const u = findClientOnly(params.id);
     if (u.status === 'suspended') {
       throw new HttpError(403, 'هذا الحساب موقوف بقرار من مالك المنصة.');
@@ -149,6 +159,16 @@ module.exports = (r, app) => {
       phone: u.phone,
       reason
     }, ip);
+    if (u.email && mailer) {
+      await mailer.send({
+        to: u.email,
+        subject: 'تحديث بخصوص طلب تسجيل متجرك — OrderFlow',
+        type: 'account_rejected',
+        storeName: u.store_name,
+        reason,
+        text: `مرحبًا ${u.store_name}، نعتذر لعدم قبول طلب تسجيلك حاليًا.${reason ? ` السبب: ${reason}` : ''}`
+      });
+    }
     return { ok: true, client: pendingClientRowOf(findClientOnly(u.id)) };
   }, { moderator: true, permission: 'reject_clients' });
 
@@ -211,12 +231,13 @@ module.exports = (r, app) => {
         }
       }
 
-      logAudit(modUser.id, decision === 'approved' ? 'order.approve' : 'order.reject', 'order', o.id, { no: o.no, customer: o.customer, userId: o.user_id, reason }, ip);
+      const custPlain = model.dec(o.customer);
+      logAudit(modUser.id, decision === 'approved' ? 'order.approve' : 'order.reject', 'order', o.id, { no: o.no, userId: o.user_id, reason }, ip);
       notify(
         o.user_id,
         decision === 'approved' ? 'ok' : 'warning',
         decision === 'approved' ? `تم اعتماد الطلب #${o.no} ✓` : `تم رفض الطلب #${o.no}`,
-        decision === 'approved' ? `الطلب الخاص بالعميل ${o.customer} معتمد وجاهز للمزامنة والشحن.` : `سبب الرفض: ${reason} — تم استرجاع كميات المخزون تلقائيًا.`,
+        decision === 'approved' ? `الطلب الخاص بالعميل ${custPlain} معتمد وجاهز للمزامنة والشحن.` : `سبب الرفض: ${reason} — تم استرجاع كميات المخزون تلقائيًا.`,
         '#/ord'
       );
       return { ok: true, type: 'order', item: model.orderOf(q('SELECT * FROM orders WHERE id = ?').get(o.id)) };

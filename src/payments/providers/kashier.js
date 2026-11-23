@@ -1,7 +1,9 @@
 'use strict';
 // مزوّد بوابة كاشير الخارجية (Kashier Egypt Hosted Payment Page)
-// يحوّل التاجر مباشرةً إلى صفحة الدفع المستضافة لدى كاشير (محفظة إلكترونية / بوابة كاشير)
-// بدون جمع أي بيانات بطاقة أو فيزا داخل خوادم OrderFlow، ويؤكّد الدفع عبر توقيع HMAC-SHA256.
+// التوثيق الرسمي: https://developers.kashier.io/
+// المصادقة: توقيع HMAC-SHA256 على مسار الطلب وبيانات Webhook باستخدام KASHIER_API_KEY
+// يحوّل التاجر مباشرةً إلى صفحة الدفع المستضافة لدى كاشير (محفظة إلكترونية / بطاقة / بوابة كاشير)
+// بدون جمع أي بيانات بطاقة داخل خوادم OrderFlow، ويؤكّد الدفع عبر توقيع HMAC-SHA256.
 const crypto = require('node:crypto');
 const { HttpError } = require('../../util');
 
@@ -76,7 +78,7 @@ module.exports = function createKashier(cfg) {
   return {
     id: 'kashier',
     name: 'بوابة كاشير (Kashier)',
-    mode: 'live',
+    mode: c.kashierMode === 'live' ? 'live' : 'test',
     collectsCardData: false,
     methods: ['kashier', 'wallet'],
 
@@ -110,7 +112,10 @@ module.exports = function createKashier(cfg) {
     },
 
     parseWebhook({ rawBody, headers }) {
-      const sig = headers['x-kashier-signature'] || headers['x-signature'] || '';
+      const sig = String(headers['x-kashier-signature'] || headers['x-signature'] || '').trim();
+      if (!sig) {
+        throw new HttpError(401, 'توقيع خطاف كاشير مفقود');
+      }
       let payload;
       try {
         payload = JSON.parse(rawBody.toString('utf8'));
@@ -136,6 +141,39 @@ module.exports = function createKashier(cfg) {
         providerRef: String(data.kashierOrderId || data.transactionId || ''),
         status,
         amount: Number(data.amount),
+        currency: String(data.currency || 'EGP').toUpperCase()
+      };
+    },
+
+    /** استعلام حالة دفع معلّق لدى كاشير لتسوية العمليات التي فات إشعارها (Reconciliation) */
+    async queryPaymentStatus({ txRef, fetchFn = cfg.fetch }) {
+      const merchantId = c.kashierMerchantId;
+      const apiKey = c.kashierApiKey;
+      if (!merchantId || !apiKey || !txRef) return null;
+      const base = c.kashierMode === 'live' ? 'https://api.kashier.io' : 'https://test-api.kashier.io';
+      const url = `${base}/v2/orders/${encodeURIComponent(txRef)}?merchantId=${encodeURIComponent(merchantId)}`;
+      const res = await fetchFn(url, {
+        method: 'GET',
+        headers: { Authorization: apiKey, Accept: 'application/json' }
+      });
+      if (!res || !res.ok) return null;
+      const body = await res.json().catch(() => null);
+      const data = body?.response || body?.data || body;
+      if (!data) return null;
+      const rawStatus = String(data.status || data.paymentStatus || '').toUpperCase();
+      const status = PAID_STATUS.has(rawStatus)
+        ? 'paid'
+        : FAILED_STATUS.has(rawStatus)
+          ? 'failed'
+          : CANCELLED_STATUS.has(rawStatus)
+            ? 'cancelled'
+            : 'pending';
+      return {
+        status,
+        txRef,
+        providerRef: String(data.kashierOrderId || data.transactionId || txRef),
+        eventId: `reconcile:${txRef}:${rawStatus}`,
+        amount: Number(data.amount ?? data.totalAuthorizedAmount),
         currency: String(data.currency || 'EGP').toUpperCase()
       };
     }

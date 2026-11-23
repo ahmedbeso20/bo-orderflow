@@ -9,7 +9,7 @@ const FEES = `CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' T
 const NET = `CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' THEN total - total * ${FEE_RATE_SQL} - cost_total - ship_fee WHEN status = 3 AND approval_status != 'rejected' THEN -ship_fee * 1.8 ELSE 0 END`;
 
 
-module.exports = (r, { q, tx, model, cipher, couriers, limiter, logAudit }) => {
+module.exports = (r, { q, tx, model, cipher, connectors, couriers, limiter, logAudit }) => {
   const iso = (t) => new Date(t).toISOString();
   const pct = (cur, prev) => (prev ? Math.round(((cur - prev) / Math.abs(prev)) * 1000) / 10 : null);
   const ipaOf = (u) => (cipher ? cipher.decrypt(u.instapay) : String(u.instapay || ''));
@@ -19,7 +19,8 @@ module.exports = (r, { q, tx, model, cipher, couriers, limiter, logAudit }) => {
   r.get('/api/dashboard', ({ user, query }) => {
     const range = [7, 30, 90].includes(+query.range) ? +query.range : 30;
     const market = MARKETS[query.market] ? query.market : null;
-    const mk = market ? ' AND market = ?' : '';
+    const sourceFilter = query.source === 'connected' ? 'connected' : 'all';
+    const mk = (market ? ' AND market = ?' : '') + (sourceFilter === 'connected' ? " AND source IN ('amazon','noon','jumia','trendyol','kenzz')" : '');
     const now = Date.now();
     const win = (from, to) => q(`SELECT COALESCE(SUM(${REV}), 0) gross, COALESCE(SUM(${FEES}), 0) fees, COALESCE(SUM(${NET}), 0) net,
         COUNT(*) orders, COALESCE(SUM(status = 2), 0) delivered, COALESCE(SUM(status = 3), 0) returned
@@ -40,7 +41,8 @@ module.exports = (r, { q, tx, model, cipher, couriers, limiter, logAudit }) => {
     });
 
     const since = iso(now - range * DAY);
-    const mRows = q(`SELECT market, COALESCE(SUM(${REV}), 0) amount FROM orders WHERE user_id = ? AND created_at >= ? GROUP BY market`).all(user.id, since);
+    const srcOnly = sourceFilter === 'connected' ? " AND source IN ('amazon','noon','jumia','trendyol','kenzz')" : '';
+    const mRows = q(`SELECT market, COALESCE(SUM(${REV}), 0) amount FROM orders WHERE user_id = ? AND created_at >= ?${srcOnly} GROUP BY market`).all(user.id, since);
     const mTotal = mRows.reduce((s, x) => s + x.amount, 0);
     const marketShare = Object.fromEntries(Object.keys(MARKETS).map((k) => {
       const amount = round2(mRows.find((x) => x.market === k)?.amount);
@@ -48,15 +50,17 @@ module.exports = (r, { q, tx, model, cipher, couriers, limiter, logAudit }) => {
     }));
 
     const payShare = { cod: 0, wallet: 0, card: 0 };
-    const pRows = q('SELECT pay, COUNT(*) n FROM orders WHERE user_id = ? AND created_at >= ? GROUP BY pay').all(user.id, since);
+    const pRows = q(`SELECT pay, COUNT(*) n FROM orders WHERE user_id = ? AND created_at >= ?${srcOnly} GROUP BY pay`).all(user.id, since);
     const pTotal = pRows.reduce((s, x) => s + x.n, 0);
     for (const x of pRows) payShare[PAY_BUCKET[x.pay] || 'card'] += x.n;
     for (const k of Object.keys(payShare)) payShare[k] = pTotal ? Math.round((payShare[k] / pTotal) * 1000) / 10 : 0;
 
     const recent = q(`SELECT * FROM orders WHERE user_id = ?${mk} ORDER BY created_at DESC, id DESC LIMIT 5`).all(...[user.id, ...(market ? [market] : [])]).map(model.orderOf);
+    const conns = connectors ? connectors.listForUser(user.id) : [];
+    const hasActiveConnection = conns.some((c) => c.configured && c.enabled);
 
     return {
-      range, market: market || 'all',
+      range, market: market || 'all', source: sourceFilter, hasActiveConnection,
       kpis: {
         gross: round2(cur.gross), net: round2(cur.net), fees: round2(cur.fees), orders: cur.orders,
         margin: cur.gross ? Math.round((cur.net / cur.gross) * 1000) / 10 : 0,
@@ -146,8 +150,14 @@ module.exports = (r, { q, tx, model, cipher, couriers, limiter, logAudit }) => {
   r.post('/api/orders/:id/awb/create', async ({ user, params, body, ip }) => {
     noDemoCourier(user);
     if (!limiter.hit(`awb-create:${user.id}`, 30, 600_000)) throw new HttpError(429, 'طلبات إنشاء بوالص كثيرة، انتظر قليلًا');
-    const order = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(Number(params.id) || 0, user.id);
-    if (!order) throw new HttpError(404, 'الطلب غير موجود');
+    const rawOrder = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(Number(params.id) || 0, user.id);
+    if (!rawOrder) throw new HttpError(404, 'الطلب غير موجود');
+    const order = {
+      ...rawOrder,
+      customer: model.dec(rawOrder.customer),
+      phone: model.dec(rawOrder.phone),
+      address: model.dec(rawOrder.address)
+    };
     const out = await couriers.createAwb(user, order, body?.courier);
     const fresh = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(order.id, user.id);
     logAudit(user.id, 'courier.awb_created', 'order', order.id, { courier: body?.courier || order.courier, awbNumber: out.awbNumber }, ip);

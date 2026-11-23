@@ -91,15 +91,19 @@ test('Kashier end-to-end checkout redirect + signed webhook plan activation', as
   const reg = await fetch(`${base}/api/auth/register`, {
     method: 'POST',
     headers: H,
-    body: JSON.stringify({ store: 'متجر كاشير', phone: '01077112233', email: 'kashier@test.eg', password: 'NileFlow!9482' })
+    body: JSON.stringify({ store: 'متجر كاشير', phone: '01077112233', email: 'kashier@test.eg', password: 'NileFlow!9482', termsAccepted: true })
   }).then((r) => r.json());
+  assert.equal(reg.ok, true);
   app.app.q("UPDATE users SET status = 'active' WHERE email = ?").run('kashier@test.eg');
-  const login = await fetch(`${base}/api/auth/login`, {
+  const loginRes = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: H,
     body: JSON.stringify({ email: 'kashier@test.eg', password: 'NileFlow!9482' })
-  }).then((r) => r.json());
-  const auth = { ...H, Authorization: `Bearer ${login.token}` };
+  });
+  const loginCookie = (loginRes.headers.get('set-cookie') || '').split(';')[0];
+  const login = await loginRes.json();
+  assert.equal(login.token, undefined, 'Session token must not appear in JSON body');
+  const auth = { ...H, Cookie: loginCookie };
 
   // Start Kashier checkout -> returns pending + signed Kashier redirect URL
   const ck = await fetch(`${base}/api/billing/checkout`, {

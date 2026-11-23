@@ -6,7 +6,9 @@ const { sendText } = require('../http');
 
 const STATUS_LABEL = ['قيد التجهيز', 'تم الشحن', 'تم التسليم', 'مرتجع', 'ملغي'];
 
-module.exports = (r, { q, tx, model, cipher }) => {
+module.exports = (r, app) => {
+  const { q, tx, model, cipher, limiter, logPiiAccess, sendSecurityAlert } = app;
+
   const find = (uid, id) => {
     const o = q('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(Number(id) || 0, uid);
     if (!o) throw new HttpError(404, 'الطلب غير موجود');
@@ -23,7 +25,18 @@ module.exports = (r, { q, tx, model, cipher }) => {
     return restored;
   };
 
-  r.get('/api/orders', ({ user, query }) => {
+  const trackBulkExport = (user, ip, target) => {
+    if (!limiter || !sendSecurityAlert) return;
+    if (!limiter.hit(`bulk-exp:${user.id}`, 3, 600_000)) {
+      sendSecurityAlert({
+        severity: 'high',
+        title: 'تصدير بيانات متكرر بشكل غير معتاد',
+        details: { userId: user.id, storeName: user.store_name, target, ip }
+      }).catch(() => {});
+    }
+  };
+
+  r.get('/api/orders', ({ user, query, ip }) => {
     const where = ['user_id = ?'];
     const args = [user.id];
     const status = Number(query.status);
@@ -32,20 +45,50 @@ module.exports = (r, { q, tx, model, cipher }) => {
       where.push('approval_status = ?');
       args.push(query.approval);
     }
-    const search = String(query.q ?? '').trim().slice(0, 60);
-    if (search) {
-      const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
-      const no = Number(latin(search));
-      where.push(`(customer LIKE ? ESCAPE '\\' OR gov LIKE ? ESCAPE '\\' OR courier LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\'${Number.isInteger(no) ? ' OR no = ?' : ''})`);
-      args.push(like, like, like, like);
-      if (Number.isInteger(no)) args.push(no);
+    if (query.source === 'connected') {
+      where.push("source IN ('amazon','noon','jumia','trendyol','kenzz')");
     }
     const perPage = Math.min(100, Math.max(5, Number(query.limit) || 25));
-    const total = q(`SELECT COUNT(*) n FROM orders WHERE ${where.join(' AND ')}`).get(...args).n;
-    const pages = Math.max(1, Math.ceil(total / perPage));
-    const page = Math.min(pages, Math.max(1, Number(query.page) || 1));
-    const items = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
-      .all(...args, perPage, (page - 1) * perPage).map(model.orderOf);
+    const search = String(query.q ?? '').trim().slice(0, 60);
+
+    let items, total, pages, page;
+    if (search) {
+      // Because buyer names/phones are encrypted at rest with random IVs (AES-256-GCM),
+      // substring search decrypts up to 5000 merchant orders in memory before filtering.
+      const needle = search.toLowerCase();
+      const needleLatin = latin(search).toLowerCase();
+      const noSearch = Number(latin(search));
+      const all = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT 5000`)
+        .all(...args)
+        .map(model.orderOf)
+        .filter((o) => {
+          if (Number.isInteger(noSearch) && o.no === noSearch) return true;
+          const hay = `${o.customer} ${o.phone} ${o.gov} ${o.courier} ${o.items}`.toLowerCase();
+          return hay.includes(needle) || hay.includes(needleLatin);
+        });
+      total = all.length;
+      pages = Math.max(1, Math.ceil(total / perPage));
+      page = Math.min(pages, Math.max(1, Number(query.page) || 1));
+      items = all.slice((page - 1) * perPage, page * perPage);
+    } else {
+      total = q(`SELECT COUNT(*) n FROM orders WHERE ${where.join(' AND ')}`).get(...args).n;
+      pages = Math.max(1, Math.ceil(total / perPage));
+      page = Math.min(pages, Math.max(1, Number(query.page) || 1));
+      items = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
+        .all(...args, perPage, (page - 1) * perPage).map(model.orderOf);
+    }
+
+    if (logPiiAccess && items.length > 0) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: user._impersonatedBy ? 'impersonate_view_orders' : 'orders_list',
+        targetType: 'order',
+        count: items.length,
+        ip
+      });
+    }
+
     return { items, total, page, pages, perPage, counts: model.counts(user.id) };
   });
 
@@ -83,9 +126,13 @@ module.exports = (r, { q, tx, model, cipher }) => {
       const itemsText = lines.map(({ p, qty }) => `${p.name}${qty > 1 ? ` (${qty} قطع)` : ''}`).join(' + ').slice(0, 500);
       const approvalStatus = user.role === 'owner' ? 'approved' : 'pending';
       const customerId = model.upsertCustomerForOrder({ userId: user.id, name: customer, phone: ph, gov, address, now });
-      const id = q(`INSERT INTO orders (user_id,no,market,customer,customer_id,phone,gov,address,pay,courier,total,cost_total,ship_fee,status,items,approval_status,reject_reason,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`).run(user.id, no, market, customer, customerId, ph, gov, address, pay, courier,
-        Math.round(total * 100) / 100, Math.round(cost * 100) / 100, COURIERS[courier].fee, itemsText, approvalStatus, '', now).lastInsertRowid;
+      const id = q(`INSERT INTO orders (user_id,no,market,customer,customer_id,phone,phone_hash,gov,address,pay,courier,total,cost_total,ship_fee,status,items,approval_status,reject_reason,source,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,'manual',?)`).run(
+        user.id, no, market,
+        model.enc(customer), customerId, model.enc(ph), model.phoneHash(ph),
+        gov, model.enc(address), pay, courier,
+        Math.round(total * 100) / 100, Math.round(cost * 100) / 100, COURIERS[courier].fee, itemsText, approvalStatus, '', now
+      ).lastInsertRowid;
       for (const { p, qty } of lines) q('INSERT INTO order_items (order_id,product_id,name,qty,price,cost) VALUES (?,?,?,?,?,?)').run(id, p.id, p.name, qty, p.price, p.cost);
       return q('SELECT * FROM orders WHERE id = ?').get(id);
     });
@@ -103,6 +150,8 @@ module.exports = (r, { q, tx, model, cipher }) => {
         q('UPDATE orders SET status = 4, cancel_reason = ?, cancelled_at = ? WHERE id = ?').run(reason || 'إلغاء الطلب قبل الشحن', nowIso(), o.id);
       } else if (next === 3) {
         q('UPDATE orders SET status = 3, return_reason = COALESCE(NULLIF(?, \'\'), return_reason) WHERE id = ?').run(reason, o.id);
+      } else if (next === 2) {
+        q('UPDATE orders SET status = 2, delivered_at = ? WHERE id = ?').run(nowIso(), o.id);
       } else {
         q('UPDATE orders SET status = ? WHERE id = ?').run(next, o.id);
       }
@@ -130,15 +179,14 @@ module.exports = (r, { q, tx, model, cipher }) => {
 
   // صفحة المرتجعات وتحليلات RTO
   r.get('/api/returns', ({ user, query }) => {
-    const search = String(query.q ?? '').trim().slice(0, 60);
-    const where = ['user_id = ?', 'status = 3'];
-    const args = [user.id];
+    const search = String(query.q ?? '').trim().slice(0, 60).toLowerCase();
+    let returns = q('SELECT * FROM orders WHERE user_id = ? AND status = 3 ORDER BY created_at DESC, id DESC LIMIT 500')
+      .all(user.id).map(model.orderOf);
     if (search) {
-      const like = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
-      where.push(`(customer LIKE ? ESCAPE '\\' OR gov LIKE ? ESCAPE '\\' OR courier LIKE ? ESCAPE '\\' OR items LIKE ? ESCAPE '\\')`);
-      args.push(like, like, like, like);
+      // Decrypt-then-filter in memory because buyer names/phones are encrypted at rest
+      returns = returns.filter((o) => `${o.customer} ${o.phone} ${o.gov} ${o.courier} ${o.items}`.toLowerCase().includes(search));
     }
-    const returns = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT 100`).all(...args).map(model.orderOf);
+    returns = returns.slice(0, 100);
     const stats = q(`SELECT
         COALESCE(SUM(status = 3), 0) totalReturns,
         COALESCE(SUM(status = 2), 0) totalDelivered,
@@ -193,7 +241,8 @@ module.exports = (r, { q, tx, model, cipher }) => {
     return row ? model.customerOf(row) : null;
   };
 
-  r.get('/api/customers', ({ user, query }) => {
+  r.get('/api/customers', ({ user, query, ip }) => {
+    // Customer names/phones/addresses are encrypted at rest; decrypt merchant's CRM rows in memory for filtering
     const rows = q(`SELECT
         c.*,
         COUNT(o.id) AS ordersCount,
@@ -207,7 +256,7 @@ module.exports = (r, { q, tx, model, cipher }) => {
       LEFT JOIN orders o ON o.customer_id = c.id AND o.user_id = c.user_id
       WHERE c.user_id = ?
       GROUP BY c.id
-      ORDER BY totalSpent DESC, ordersCount DESC, c.id DESC`).all(user.id).map(model.customerOf);
+      ORDER BY totalSpent DESC, ordersCount DESC, c.id DESC LIMIT 5000`).all(user.id).map(model.customerOf);
 
     const search = String(query.q ?? '').trim().toLowerCase();
     const seg = String(query.segment ?? 'all');
@@ -219,8 +268,20 @@ module.exports = (r, { q, tx, model, cipher }) => {
       return true;
     });
 
+    const outCustomers = filtered.slice(0, 150);
+    if (logPiiAccess && outCustomers.length > 0) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: user._impersonatedBy ? 'impersonate_view_customers' : 'customers_crm_view',
+        targetType: 'customer',
+        count: outCustomers.length,
+        ip
+      });
+    }
+
     return {
-      customers: filtered.slice(0, 150),
+      customers: outCustomers,
       total: filtered.length,
       summary: {
         totalCustomers: rows.length,
@@ -242,9 +303,9 @@ module.exports = (r, { q, tx, model, cipher }) => {
     const now = nowIso();
     let id;
     try {
-      id = Number(q(`INSERT INTO customers (user_id, name, phone, email, gov, address, notes, tags, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(user.id, name, ph, mail, gov, address, notes, tags, now, now).lastInsertRowid);
+      id = Number(q(`INSERT INTO customers (user_id, name, phone, phone_hash, email, gov, address, notes, tags, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(user.id, model.enc(name), model.enc(ph), model.phoneHash(ph), mail, gov, model.enc(address), notes, tags, now, now).lastInsertRowid);
     } catch (e) {
       if (/UNIQUE/i.test(e.message)) throw new HttpError(409, 'يوجد عميل مسجّل بنفس رقم الموبايل بالفعل');
       throw e;
@@ -255,11 +316,15 @@ module.exports = (r, { q, tx, model, cipher }) => {
   r.put('/api/customers/:id', ({ user, params, body }) => {
     const cur = findCustomer(user.id, params.id);
     const patch = {};
-    if (body.name !== undefined) patch.name = text(body.name, 'اسم العميل', { min: 2, max: 80 });
-    if (body.phone !== undefined) patch.phone = phone(body.phone, { optional: true });
+    if (body.name !== undefined) patch.name = model.enc(text(body.name, 'اسم العميل', { min: 2, max: 80 }));
+    if (body.phone !== undefined) {
+      const ph = phone(body.phone, { optional: true });
+      patch.phone = model.enc(ph);
+      patch.phone_hash = model.phoneHash(ph);
+    }
     if (body.email !== undefined) patch.email = email(body.email) || '';
     if (body.gov !== undefined) patch.gov = text(body.gov, 'المحافظة', { max: 40, optional: true });
-    if (body.address !== undefined) patch.address = text(body.address, 'العنوان', { max: 240, optional: true });
+    if (body.address !== undefined) patch.address = model.enc(text(body.address, 'العنوان', { max: 240, optional: true }));
     if (body.notes !== undefined) patch.notes = text(body.notes, 'الملاحظات', { max: 1000, optional: true });
     if (body.tags !== undefined) patch.tags = text(body.tags, 'الوسوم', { max: 200, optional: true });
     const keys = Object.keys(patch);
@@ -280,25 +345,90 @@ module.exports = (r, { q, tx, model, cipher }) => {
     return { ok: true, deletedId: cur.id };
   });
 
-  r.get('/api/orders/export.csv', ({ user, res }) => {
-    const rows = [['رقم الطلب', 'التاريخ', 'السوق', 'العميل', 'الموبايل', 'المحافظة', 'الدفع', 'الشحن', 'الإجمالي', 'الحالة', 'حالة الاعتماد', 'المنتجات']];
-    for (const o of q('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, id DESC').all(user.id)) {
-      rows.push([o.no, o.created_at.slice(0, 10), MARKETS[o.market]?.name, o.customer, o.phone, o.gov, o.pay, o.courier, o.total, STATUS_LABEL[o.status], o.approval_status, o.items]);
+  r.get('/api/customers/export.csv', ({ user, res, ip }) => {
+    trackBulkExport(user, ip, 'customers.csv');
+    const rows = [['الاسم', 'الموبايل', 'البريد الإلكتروني', 'المحافظة', 'العنوان', 'الوسوم', 'الملاحظات']];
+    const list = q('SELECT * FROM customers WHERE user_id = ? ORDER BY id DESC').all(user.id).map(model.customerOf);
+    for (const c of list) {
+      rows.push([c.name, c.phone, c.email, c.gov, c.address, c.tags, c.notes]);
+    }
+    if (logPiiAccess) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: 'customers_export_csv',
+        targetType: 'customer',
+        count: list.length,
+        ip
+      });
+    }
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="orderflow-customers.csv"', 'Cache-Control': 'no-store' });
+    res.end(toCsv(rows));
+  });
+
+  r.get('/api/orders/export.csv', ({ user, res, ip }) => {
+    trackBulkExport(user, ip, 'orders.csv');
+    const rows = [['رقم الطلب', 'التاريخ', 'السوق', 'العميل', 'الموبايل', 'المحافظة', 'الدفع', 'الشحن', 'الإجمالي', 'الحالة', 'حالة الاعتماد', 'المصدر', 'المنتجات']];
+    const list = q('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, id DESC').all(user.id).map(model.orderOf);
+    for (const o of list) {
+      rows.push([o.no, String(o.createdAt || '').slice(0, 10), MARKETS[o.market]?.name, o.customer, o.phone, o.gov, o.pay, o.courier, o.total, STATUS_LABEL[o.status], o.approvalStatus, o.source, o.items]);
+    }
+    if (logPiiAccess) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: 'orders_export_csv',
+        targetType: 'order',
+        count: list.length,
+        ip
+      });
     }
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="omniarab-orders.csv"', 'Cache-Control': 'no-store' });
     res.end(toCsv(rows));
   });
 
-  r.get('/api/orders/awb', ({ user, res }) => {
-    const list = q('SELECT * FROM orders WHERE user_id = ? AND status = 0 ORDER BY created_at LIMIT 200').all(user.id);
+  r.get('/api/orders/awb', ({ user, res, ip }) => {
+    const rawList = q('SELECT * FROM orders WHERE user_id = ? AND status = 0 ORDER BY created_at LIMIT 200').all(user.id);
+    const list = rawList.map((o) => ({
+      ...o,
+      customer: model.dec(o.customer),
+      phone: model.dec(o.phone),
+      address: model.dec(o.address)
+    }));
+    if (logPiiAccess) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: 'orders_awb_print',
+        targetType: 'order',
+        count: list.length,
+        ip
+      });
+    }
     sendText(res, 200, awbPage(list, user), { 'Content-Type': 'text/html; charset=utf-8' });
   });
 
-  r.get('/api/orders/:id/invoice', ({ user, params, res }) => {
-    const o = find(user.id, params.id);
+  r.get('/api/orders/:id/invoice', ({ user, params, res, ip }) => {
+    const raw = find(user.id, params.id);
+    const o = {
+      ...raw,
+      customer: model.dec(raw.customer),
+      phone: model.dec(raw.phone),
+      address: model.dec(raw.address)
+    };
     const items = q('SELECT name, qty, price FROM order_items WHERE order_id = ?').all(o.id);
     const store = cipher ? { ...user, tax_id: cipher.decrypt(user.tax_id) } : user;
+    if (logPiiAccess) {
+      logPiiAccess({
+        actorId: user._impersonatedBy || user.id,
+        ownerUserId: user.id,
+        action: 'order_invoice_print',
+        targetType: 'order',
+        targetId: o.id,
+        count: 1,
+        ip
+      });
+    }
     sendText(res, 200, invoicePage(o, items, store), { 'Content-Type': 'text/html; charset=utf-8' });
   });
 };
-

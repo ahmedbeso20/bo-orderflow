@@ -22,13 +22,25 @@ function deriveSubkey(masterSecret, purpose, length = 32) {
   return Buffer.from(crypto.hkdfSync('sha256', ikm, KDF_SALT, info, length));
 }
 
+let decryptMismatchLogged = false;
+
 /** تشفير حقول قاعدة البيانات الحساسة أثناء السكون (Encryption at Rest) بخوارزمية AES-256-GCM */
-function createFieldCipher(keyMaterial) {
+function createFieldCipher(keyMaterial, { onDecryptFailure } = {}) {
   const key = Buffer.isBuffer(keyMaterial) && keyMaterial.length === 32
     ? keyMaterial
     : deriveSubkey(keyMaterial, 'db-field-encryption-v1', 32);
 
   const isEncrypted = (value) => typeof value === 'string' && value.startsWith(ENC_PREFIX);
+
+  function reportMismatch() {
+    if (!decryptMismatchLogged) {
+      decryptMismatchLogged = true;
+      console.error('DATA_ENCRYPTION_KEY mismatch');
+    }
+    if (typeof onDecryptFailure === 'function') {
+      try { onDecryptFailure(); } catch { /* ignore */ }
+    }
+  }
 
   function encrypt(plaintext) {
     if (plaintext === null || plaintext === undefined) return '';
@@ -50,6 +62,7 @@ function createFieldCipher(keyMaterial) {
     if (!isEncrypted(str)) return str;
     const parts = str.slice(ENC_PREFIX.length).split(':');
     if (parts.length !== 3) {
+      reportMismatch();
       if (strict) throw new Error('صيغة البيانات المشفرة غير صالحة');
       return '';
     }
@@ -62,6 +75,7 @@ function createFieldCipher(keyMaterial) {
       decipher.setAuthTag(tag);
       return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
     } catch (err) {
+      reportMismatch();
       if (strict) throw err;
       return '';
     }

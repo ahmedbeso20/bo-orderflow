@@ -192,7 +192,8 @@ test('End-to-end encrypted API connectors: save, encrypt at rest, mask, test, an
     store: 'متجر النخبة',
     phone: '01022334455',
     email: 'merchant@elite.eg',
-    password: 'NileFlow!9482'
+    password: 'NileFlow!9482',
+    termsAccepted: true
   });
   assert.equal(reg.status, 200);
   const uRow = app.app.q("SELECT id FROM users WHERE phone = '01022334455'").get();

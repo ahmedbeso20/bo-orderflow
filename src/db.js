@@ -455,10 +455,152 @@ ALTER TABLE support_tickets ADD COLUMN updated_at TEXT;
 
 ALTER TABLE service_requests ADD COLUMN admin_notes TEXT NOT NULL DEFAULT '';
 ALTER TABLE service_requests ADD COLUMN updated_at TEXT;
-`];
+`, {
+  sql: `
+-- الترحيل 10: حماية 2FA والرموز الاحتياطية، حدود الطلبات الدائمة، تشفير بيانات المشترين والاحتفاظ بها وسجل الوصول، التنبيهات الأمنية، مصدر البيانات، سجلات المزامنة، OTP الهاتف، رقم الإيصال المتسلسل، وحقوق البيانات (قانون 151/2020)
 
+-- TASK 4: حماية ضد إعادة استخدام رموز TOTP + رموز الاسترداد الاحتياطية
+ALTER TABLE users ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE totp_recovery_codes (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX totp_recovery_codes_user ON totp_recovery_codes(user_id);
+
+-- TASK 6: جدول حدود المحاولات الدائم في SQLite
+CREATE TABLE rate_limits (
+  key TEXT PRIMARY KEY,
+  n INTEGER NOT NULL,
+  reset_at INTEGER NOT NULL
+);
+CREATE INDEX rate_limits_reset ON rate_limits(reset_at);
+
+-- TASK 7: الفهرس الأعمى لأرقام هواتف المشترين والعملاء (تشفير PII أثناء السكون)
+ALTER TABLE orders ADD COLUMN phone_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX orders_user_phone_hash ON orders(user_id, phone_hash) WHERE phone_hash <> '';
+
+ALTER TABLE customers ADD COLUMN phone_hash TEXT NOT NULL DEFAULT '';
+DROP INDEX IF EXISTS customers_user_phone;
+CREATE UNIQUE INDEX customers_user_phone_hash ON customers(user_id, phone_hash) WHERE phone_hash <> '';
+
+-- TASK 8: الاحتفاظ ببيانات المشترين وحذفها تلقائيًا بعد المدة المحددة
+ALTER TABLE orders ADD COLUMN delivered_at TEXT;
+ALTER TABLE orders ADD COLUMN pii_purged_at TEXT;
+ALTER TABLE customers ADD COLUMN pii_purged_at TEXT;
+INSERT OR IGNORE INTO platform_settings (key, value, updated_at) VALUES
+  ('pii_retention_days', '30', '2026-01-01T00:00:00.000Z');
+
+-- TASK 9: سجل الوصول للبيانات الحساسة (Amazon DPP)
+CREATE TABLE pii_access_log (
+  id INTEGER PRIMARY KEY,
+  actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action TEXT NOT NULL,
+  target_type TEXT NOT NULL DEFAULT '',
+  target_id INTEGER,
+  count INTEGER NOT NULL DEFAULT 1,
+  ip TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX pii_access_log_created ON pii_access_log(created_at DESC);
+CREATE INDEX pii_access_log_owner ON pii_access_log(owner_user_id, created_at DESC);
+
+-- TASK 10: أحداث وتنبيهات الأمان + تتبع عناوين IP الأخيرة للمالك
+CREATE TABLE security_events (
+  id INTEGER PRIMARY KEY,
+  severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+  title TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '{}',
+  acknowledged_at TEXT,
+  acknowledged_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX security_events_created ON security_events(created_at DESC);
+
+CREATE TABLE owner_login_ips (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ip TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE (user_id, ip)
+);
+
+-- TASK 11: التفرقة بين البيانات التجريبية واليدوية والمتصلة بالأسواق
+ALTER TABLE orders ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE products ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
+CREATE INDEX orders_user_source ON orders(user_id, source);
+CREATE INDEX products_user_source ON products(user_id, source);
+
+-- TASK 12: سجل عمليات المزامنة لكل سوق ولكل مستخدم
+CREATE TABLE connector_sync_runs (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  orders_new INTEGER NOT NULL DEFAULT 0,
+  orders_updated INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX connector_sync_runs_user ON connector_sync_runs(user_id, platform, started_at DESC);
+
+-- TASK 15: توسيع auth_tokens لدعم phone_otp وعدد المحاولات + توثيق رقم الهاتف
+ALTER TABLE users ADD COLUMN phone_verified_at TEXT;
+
+CREATE TABLE auth_tokens_new (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL CHECK (type IN ('reset_password', 'verify_email', 'phone_otp')),
+  token_hash TEXT NOT NULL UNIQUE,
+  target TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+INSERT INTO auth_tokens_new (id, user_id, type, token_hash, target, attempts, expires_at, used_at, created_at)
+SELECT id, user_id, type, token_hash, '', 0, expires_at, used_at, created_at FROM auth_tokens;
+DROP TABLE auth_tokens;
+ALTER TABLE auth_tokens_new RENAME TO auth_tokens;
+CREATE INDEX auth_tokens_user_type ON auth_tokens(user_id, type);
+CREATE INDEX auth_tokens_expires ON auth_tokens(expires_at);
+
+-- TASK 16: رقم إيصال متسلسل على مستوى المنصة للمدفوعات
+ALTER TABLE plan_payments ADD COLUMN receipt_no INTEGER;
+CREATE UNIQUE INDEX plan_payments_receipt_no ON plan_payments(receipt_no) WHERE receipt_no IS NOT NULL;
+
+-- TASK 17: حقوق المستخدم في بياناته (فترة سماح الحذف 14 يومًا، قبول الشروط، أرشيف مدفوعات مجهول الهوية)
+ALTER TABLE users ADD COLUMN deletion_requested_at TEXT;
+ALTER TABLE users ADD COLUMN terms_accepted_at TEXT;
+ALTER TABLE users ADD COLUMN terms_version TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE anonymized_payments (
+  id INTEGER PRIMARY KEY,
+  receipt_no INTEGER,
+  tx_ref TEXT NOT NULL,
+  plan TEXT NOT NULL,
+  cycle TEXT NOT NULL,
+  amount REAL NOT NULL,
+  discount REAL NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'EGP',
+  method TEXT NOT NULL,
+  status TEXT NOT NULL,
+  paid_at TEXT,
+  created_at TEXT NOT NULL,
+  anonymized_at TEXT NOT NULL
+);
+`
+}];
+
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { deriveSubkey } = require('./security');
+
+const BACKUP_MAGIC = Buffer.from('OFBK0001', 'ascii'); // 8 bytes
 
 function enforceDbFilePermissions(file) {
   if (!file || file === ':memory:') return;
@@ -497,7 +639,7 @@ function initDb(file) {
   return db;
 }
 
-const BACKUP_RE = /^orderflow-backup-\d{8}-\d{6}-\d{3}\.db$/;
+const BACKUP_RE = /^orderflow-backup-\d{8}-\d{6}-\d{3}\.db(\.enc)?$/;
 
 function listBackups(backupDir) {
   if (!backupDir || !fs.existsSync(backupDir)) return [];
@@ -507,17 +649,167 @@ function listBackups(backupDir) {
       const full = path.join(backupDir, filename);
       const st = fs.statSync(full, { throwIfNoEntry: false });
       return st && st.isFile()
-        ? { filename, file: full, size: st.size, createdAt: st.mtime.toISOString() }
+        ? { filename, file: full, size: st.size, encrypted: filename.endsWith('.enc'), createdAt: st.mtime.toISOString() }
         : null;
     })
     .filter(Boolean)
     .sort((a, b) => b.filename.localeCompare(a.filename));
 }
 
+function deriveBackupKey(keyMaterial) {
+  if (!keyMaterial || String(keyMaterial).length < 16) {
+    throw new Error('مفتاح تشفير النسخ الاحتياطي (BACKUP_ENCRYPTION_KEY) يجب أن يكون 16 حرفًا على الأقل');
+  }
+  return deriveSubkey(String(keyMaterial), 'db-backup-aes256gcm-v1', 32);
+}
+
+/** تشفير ملف النسخة الاحتياطية بـ AES-256-GCM بنظام الدفعات: [8-byte magic][12-byte iv][ciphertext][16-byte tag] */
+function encryptBackupFile(srcPath, destPath, keyMaterial) {
+  const key = deriveBackupKey(keyMaterial);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const inFd = fs.openSync(srcPath, 'r');
+  const outFd = fs.openSync(destPath, 'w', 0o600);
+  try {
+    fs.writeSync(outFd, BACKUP_MAGIC);
+    fs.writeSync(outFd, iv);
+    const buf = Buffer.allocUnsafe(64 * 1024);
+    let bytesRead;
+    while ((bytesRead = fs.readSync(inFd, buf, 0, buf.length, null)) > 0) {
+      const encChunk = cipher.update(buf.subarray(0, bytesRead));
+      if (encChunk.length) fs.writeSync(outFd, encChunk);
+    }
+    const finalChunk = cipher.final();
+    if (finalChunk.length) fs.writeSync(outFd, finalChunk);
+    fs.writeSync(outFd, cipher.getAuthTag());
+  } catch (err) {
+    try { fs.closeSync(outFd); } catch (_) {}
+    try { fs.unlinkSync(destPath); } catch (_) {}
+    throw err;
+  } finally {
+    try { fs.closeSync(inFd); } catch (_) {}
+    try { fs.closeSync(outFd); } catch (_) {}
+  }
+  try { fs.chmodSync(destPath, 0o600); } catch (_) {}
+  return destPath;
+}
+
+/** فك تشفير ملف نسخة احتياطية .db.enc والتحقق من AuthTag قبل الاعتماد */
+function decryptBackupFile(encPath, outPath, keyMaterial) {
+  const key = deriveBackupKey(keyMaterial);
+  const stat = fs.statSync(encPath);
+  const headerLen = BACKUP_MAGIC.length + 12;
+  const tagLen = 16;
+  if (stat.size < headerLen + tagLen) {
+    throw new Error('ملف النسخة الاحتياطية المشفر تالف أو قصير جدًا');
+  }
+  const inFd = fs.openSync(encPath, 'r');
+  const tmpOut = `${outPath}.tmp.${process.pid}`;
+  const outFd = fs.openSync(tmpOut, 'w', 0o600);
+  try {
+    const header = Buffer.alloc(headerLen);
+    fs.readSync(inFd, header, 0, headerLen, 0);
+    if (!header.subarray(0, BACKUP_MAGIC.length).equals(BACKUP_MAGIC)) {
+      throw new Error('صيغة ملف النسخة الاحتياطية غير معروفة');
+    }
+    const iv = header.subarray(BACKUP_MAGIC.length);
+    const tag = Buffer.alloc(tagLen);
+    fs.readSync(inFd, tag, 0, tagLen, stat.size - tagLen);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+
+    let pos = headerLen;
+    const end = stat.size - tagLen;
+    const buf = Buffer.allocUnsafe(64 * 1024);
+    while (pos < end) {
+      const toRead = Math.min(buf.length, end - pos);
+      const n = fs.readSync(inFd, buf, 0, toRead, pos);
+      if (n <= 0) break;
+      pos += n;
+      const plain = decipher.update(buf.subarray(0, n));
+      if (plain.length) fs.writeSync(outFd, plain);
+    }
+    const finalPlain = decipher.final();
+    if (finalPlain.length) fs.writeSync(outFd, finalPlain);
+    fs.closeSync(outFd);
+    fs.renameSync(tmpOut, outPath);
+    try { fs.chmodSync(outPath, 0o600); } catch (_) {}
+    return outPath;
+  } catch (err) {
+    try { fs.closeSync(outFd); } catch (_) {}
+    try { fs.unlinkSync(tmpOut); } catch (_) {}
+    throw err;
+  } finally {
+    try { fs.closeSync(inFd); } catch (_) {}
+  }
+}
+
+/** رفع نسخة احتياطية إلى تخزين متوافق مع S3 (Cloudflare R2 / AWS S3 / Backblaze B2) باستخدام AWS SigV4 بـ node:crypto */
+async function uploadBackupToS3(filePath, cfg) {
+  if (!cfg.backupS3Endpoint || !cfg.backupS3Bucket || !cfg.backupS3AccessKey || !cfg.backupS3Secret) {
+    return { uploaded: false, skipped: true, reason: 'not_configured' };
+  }
+  const fetchFn = cfg.fetch || globalThis.fetch;
+  const endpoint = String(cfg.backupS3Endpoint).replace(/\/+$/, '');
+  const bucket = encodeURIComponent(cfg.backupS3Bucket);
+  const objectKey = `backups/${path.basename(filePath)}`;
+  const urlStr = `${endpoint}/${bucket}/${objectKey}`;
+  const u = new URL(urlStr);
+  const body = fs.readFileSync(filePath);
+  const payloadHash = crypto.createHash('sha256').update(body).digest('hex');
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const region = cfg.backupS3Region || 'auto';
+  const service = 's3';
+
+  const canonicalUri = u.pathname;
+  const canonicalHeaders = `host:${u.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    crypto.createHash('sha256').update(canonicalRequest).digest('hex')
+  ].join('\n');
+
+  const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+  const kDate = hmac(`AWS4${cfg.backupS3Secret}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  const kSigning = hmac(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+  const authorization = `AWS4-HMAC-SHA256 Credential=${cfg.backupS3AccessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const res = await fetchFn(urlStr, {
+    method: 'PUT',
+    headers: {
+      Host: u.host,
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': payloadHash,
+      Authorization: authorization,
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(body.length)
+    },
+    body
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`فشل رفع النسخة الاحتياطية إلى S3 (${res.status}): ${errText.slice(0, 160)}`);
+  }
+  return { uploaded: true, key: objectKey, status: res.status };
+}
+
 /**
- * إنشاء نسخة احتياطية آمنة ومتسقة باستخدام SQLite VACUUM INTO مع الاحتفاظ بآخر keepCount نسخ فقط
+ * إنشاء نسخة احتياطية آمنة ومتسقة باستخدام SQLite VACUUM INTO
+ * مع التشفير التلقائي AES-256-GCM عند ضبط encryptionKey وحذف النسخة غير المشفرة والاحتفاظ بآخر keepCount نسخ فقط
  */
-function backupDatabase(db, backupDir, keepCount = 7) {
+function backupDatabase(db, backupDir, keepCount = 7, opts = {}) {
   const dir = path.resolve(backupDir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const now = new Date();
@@ -526,7 +818,7 @@ function backupDatabase(db, backupDir, keepCount = 7) {
   let filename = `orderflow-backup-${stamp}.db`;
   let dest = path.join(dir, filename);
   let seq = 1;
-  while (fs.existsSync(dest)) {
+  while (fs.existsSync(dest) || fs.existsSync(`${dest}.enc`)) {
     const ms = pad((now.getUTCMilliseconds() + seq++) % 1000, 3);
     filename = `orderflow-backup-${stamp.slice(0, -3)}${ms}.db`;
     dest = path.join(dir, filename);
@@ -538,6 +830,17 @@ function backupDatabase(db, backupDir, keepCount = 7) {
   db.exec(`VACUUM INTO '${escapedDest}'`);
   try { fs.chmodSync(dest, 0o600); } catch (_) {}
 
+  let finalFilename = filename;
+  let finalDest = dest;
+  let encrypted = false;
+  if (opts.encryptionKey) {
+    finalFilename = `${filename}.enc`;
+    finalDest = `${dest}.enc`;
+    encryptBackupFile(dest, finalDest, opts.encryptionKey);
+    try { fs.unlinkSync(dest); } catch (_) {}
+    encrypted = true;
+  }
+
   const all = listBackups(dir);
   const keep = Math.max(1, Number(keepCount) || 7);
   const pruned = [];
@@ -548,11 +851,12 @@ function backupDatabase(db, backupDir, keepCount = 7) {
     } catch (_) {}
   }
 
-  const st = fs.statSync(dest);
+  const st = fs.statSync(finalDest);
   return {
-    filename,
-    file: dest,
+    filename: finalFilename,
+    file: finalDest,
     size: st.size,
+    encrypted,
     createdAt: now.toISOString(),
     kept: Math.min(all.length, keep),
     pruned
@@ -598,4 +902,5 @@ function openDb(file) {
   return { db, q, tx, close: () => db.close() };
 }
 
-module.exports = { openDb, backupDatabase, listBackups };
+module.exports = { openDb, backupDatabase, listBackups, encryptBackupFile, decryptBackupFile, uploadBackupToS3 };
+

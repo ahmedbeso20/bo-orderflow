@@ -18,7 +18,11 @@
     ownerAuditQuery: '',
     modClientStatus: 'pending',
     modClientQuery: '',
-    modApprovalStatus: 'pending'
+    modApprovalStatus: 'pending',
+    ownerPiiAction: '',
+    ownerPiiMerchantId: '',
+    ownerPiiFrom: '',
+    ownerPiiTo: ''
   };
 
   const CLIENT_STATUS_META = {
@@ -75,6 +79,8 @@
     { id: 'owner/payments', icon: 'pay', title: 'المدفوعات والاشتراكات' },
     { id: 'owner/coupons', icon: 'ticket', title: 'الكوبونات' },
     { id: 'owner/settings', icon: 'set', title: 'إعدادات المنصة' },
+    { id: 'owner/security', icon: 'shield', title: 'التنبيهات الأمنية' },
+    { id: 'owner/pii-log', icon: 'lock', title: 'سجل البيانات الشخصية' },
     { id: 'owner/audit', icon: 'scroll', title: 'سجل المراقبة' }
   ];
 
@@ -272,6 +278,13 @@
       action: rbacState.ownerAuditAction,
       q: rbacState.ownerAuditQuery
     })}`);
+    loaders['owner/pii-log'] = () => api('GET', `/api/owner/pii-log?${new URLSearchParams({
+      action: rbacState.ownerPiiAction,
+      merchantId: rbacState.ownerPiiMerchantId,
+      from: rbacState.ownerPiiFrom,
+      to: rbacState.ownerPiiTo
+    })}`);
+    loaders['owner/security'] = () => api('GET', '/api/owner/security');
 
     loaders.moderator = async () => {
       const dash = await api('GET', '/api/moderator/dashboard');
@@ -292,7 +305,29 @@
       const k = (d && d.kpis) || {};
       const pending = (d && d.pendingQueue) || [];
       const audit = (d && d.recentAudit) || [];
+      const sys = (d && d.systemStatus) || null;
+      const sysStrip = sys ? `
+        <div class="card" style="margin-bottom:18px;padding:14px 18px">
+          <div class="row-wrap" style="gap:14px;align-items:center">
+            <strong style="font-size:13.5px">حالة النظام:</strong>
+            <span class="rbac-status ${sys.mailConfigured ? 'ok' : 'wn'}">
+              ${sys.mailConfigured ? `البريد: ${esc(sys.mailProvider || 'مفعّل')} ✓` : '⚠️ البريد غير مهيّأ (وضع التطوير)'}
+            </span>
+            <span class="rbac-status ${sys.isProduction && sys.paymentMode === 'test' ? 'er' : (sys.paymentMode === 'live' ? 'ok' : 'pr')}">
+              الدفع (${esc(sys.paymentProvider || 'hosted')}): ${sys.paymentMode === 'live' ? 'حي (Live)' : 'تجريبي (Test)'}${sys.isProduction && sys.paymentMode === 'test' ? ' ⚠️' : ''}
+            </span>
+            <span class="rbac-status ${sys.lastBackup ? 'ok' : 'wn'}">
+              النسخ الاحتياطي: ${sys.lastBackup ? `${timeAgo(sys.lastBackup.createdAt)}${sys.lastBackup.encrypted ? ' · مشفّر 🔒' : ''}${sys.lastBackup.s3Uploaded ? ' · S3 ✓' : ''}` : 'لا توجد نسخ بعد'}
+            </span>
+            <span class="sp"></span>
+            <a href="#/owner/security" class="btn btn-sm ${sys.unackSecurityEvents > 0 ? 'btn-er' : 'btn-gh'}">
+              🛡️ التنبيهات الأمنية${sys.unackSecurityEvents > 0 ? ` (${fmtNum(sys.unackSecurityEvents)})` : ''}
+            </a>
+          </div>
+        </div>
+      ` : '';
       return `
+        ${sysStrip}
         <div class="grid-kpi" style="margin-bottom:20px">
           <div class="card kpi-card">
             <span class="mu" style="font-size:13px;font-weight:700">طلبات حسابات قيد المراجعة</span>
@@ -412,6 +447,9 @@
                   </div>
                   <div style="text-align:end">
                     ${renderStatusText(m.status)}
+                    <div style="margin-top:4px">
+                      <span class="rbac-status ${m.totpEnabled ? 'ok' : 'wn'}" style="font-size:11.5px">${m.totpEnabled ? '🛡️ 2FA مفعّلة' : '⚠️ بانتظار تفعيل 2FA'}</span>
+                    </div>
                     <div class="rbac-inline-meta" style="margin-top:4px;justify-content:flex-end">
                       <span>قبول: <b>${fmtNum(m.approvedCount)}</b></span>
                       <span aria-hidden="true">·</span>
@@ -715,6 +753,9 @@
               <label for="os-notice">إشعار الصيانة أو تنبيه المنصة (اختياري)</label>
               <input id="os-notice" value="${esc(s.maintenance_notice || '')}" placeholder="اتركه فارغًا في الوضع الطبيعي">
 
+              <label for="os-pii-days">مدة الاحتفاظ بالبيانات الشخصية للعملاء بعد التسليم (بالأيام — ٧ إلى ٣٦٥٠)</label>
+              <input id="os-pii-days" type="number" min="7" max="3650" dir="ltr" value="${esc(s.pii_retention_days || '30')}">
+
               <div class="rbac-perm-list" style="margin:16px 0 20px">
                 <label class="rbac-perm-toggle">
                   <input type="checkbox" id="os-reg-open" ${s.registration_open !== '0' ? 'checked' : ''}>
@@ -730,6 +771,13 @@
                     <small class="mu">يُحفظ كل حساب جديد بحالة «قيد المراجعة» ولا يدخل إلا بعد موافقة المالك أو أحد المشرفين</small>
                   </span>
                 </label>
+                <label class="rbac-perm-toggle">
+                  <input type="checkbox" id="os-req-email-verify" ${s.require_email_verification === '1' ? 'checked' : ''}>
+                  <span>
+                    <b>إلزام توثيق البريد الإلكتروني قبل الدفع أو ربط الأسواق</b>
+                    <small class="mu">يمنع استخدام بوابات الدفع وربط API الأسواق قبل تأكيد البريد الإلكتروني</small>
+                  </span>
+                </label>
               </div>
               <button type="submit" class="btn btn-ac">حفظ إعدادات المنصة</button>
             </form>
@@ -738,13 +786,15 @@
           <div>
             <div class="card" style="margin-bottom:16px">
               <h3 style="margin-bottom:6px">💾 النسخ الاحتياطي لقاعدة البيانات</h3>
-              <p class="mu" style="font-size:13px;margin-bottom:14px">يُنشئ النظام نسخة احتياطية يومية تلقائية عبر <code>SQLite VACUUM INTO</code> داخل <code>data/backups/</code> مع الاحتفاظ بآخر ٧ نسخ فقط.</p>
+              <p class="mu" style="font-size:13px;margin-bottom:14px">يُنشئ النظام نسخة احتياطية يومية تلقائية عبر <code>SQLite VACUUM INTO</code> مع التشفير بـ AES-256-GCM عند تفعيل <code>BACKUP_ENCRYPTION_KEY</code> ورفع اختياري إلى S3.</p>
               <button type="button" class="btn btn-ac" style="width:100%;margin-bottom:14px" data-a="owner-create-backup">💾 إنشاء نسخة احتياطية فورية الآن</button>
               ${backups.length ? `
                 <div style="border:1px solid var(--bd);border-radius:10px;overflow:hidden">
                   ${backups.map((b) => `
-                    <div class="row" style="padding:8px 12px;border-bottom:1px solid var(--bd);font-size:12.5px">
+                    <div class="row" style="padding:8px 12px;border-bottom:1px solid var(--bd);font-size:12.5px;gap:8px">
                       <code dir="ltr" class="sp">${esc(b.file)}</code>
+                      ${b.encrypted ? '<span class="rbac-status ok" style="font-size:11px">🔒 مشفّر</span>' : ''}
+                      ${b.s3Uploaded ? '<span class="rbac-status pr" style="font-size:11px">S3 ✓</span>' : ''}
                       <span class="mu">${fmtNum(Math.max(1, Math.round((b.size || 0) / 1024)))} KB</span>
                     </div>
                   `).join('')}
@@ -752,12 +802,101 @@
               ` : '<p class="mu" style="font-size:12.5px;margin:0">لا توجد نسخ احتياطية محفوظة حتى الآن.</p>'}
             </div>
 
+            <div class="card" style="margin-bottom:16px">
+              <h3 style="margin-bottom:6px">📧 اختبار خدمة البريد الإلكتروني</h3>
+              <p class="mu" style="font-size:13px;margin-bottom:12px">تحقق من وصول رسائل التفعيل والقبول والتنبيهات الأمنية إلى بريدك الإلكتروني.</p>
+              <button type="button" class="btn btn-gh" style="width:100%" data-a="owner-test-mail">📧 إرسال إيميل تجريبي إلى بريدي</button>
+            </div>
+
             <div class="card">
               <h3 style="margin-bottom:6px">🛡️ أمان حساب المالك (2FA)</h3>
-              <p class="mu" style="font-size:13px;margin-bottom:14px">نوصي بشدة بتفعيل المصادقة الثنائية (TOTP) لحماية لوحة تحكم المالك.</p>
-              <button type="button" class="btn btn-gh" style="width:100%" data-a="open-2fa-modal">إدارة المصادقة الثنائية (2FA)</button>
+              <p class="mu" style="font-size:13px;margin-bottom:14px">المصادقة الثنائية (TOTP) إلزامية لحسابات المالك والمشرفين ولا يمكن تعطيلها.</p>
+              <button type="button" class="btn btn-gh" style="width:100%" data-a="open-2fa-modal">حالة المصادقة الثنائية (2FA)</button>
             </div>
           </div>
+        </div>
+      `;
+    };
+
+    // --- Owner Security Events (#/owner/security) ---
+    const SEVERITY_META = {
+      critical: { label: 'حرج', cls: 'er' },
+      high: { label: 'مرتفع', cls: 'er' },
+      medium: { label: 'متوسط', cls: 'wn' },
+      low: { label: 'منخفض', cls: 'pr' }
+    };
+    views['owner/security'] = (d) => {
+      const events = (d && d.events) || [];
+      return `
+        <div class="card">
+          <div class="row-wrap" style="margin-bottom:16px;gap:10px;justify-content:space-between">
+            <div>
+              <h3 style="margin:0">التنبيهات الأمنية (Security Events)</h3>
+              <small class="mu">مراقبة محاولات الدخول المشبوهة، أخطاء الدفع، الدخول من IP جديد، وتصديرات البيانات الكثيفة.</small>
+            </div>
+          </div>
+          ${events.length ? renderTable(
+            ['#', 'التوقيت', 'الخطورة', 'الحدث', 'التفاصيل', 'الحالة / الإجراء'],
+            events.map((ev) => {
+              const sev = SEVERITY_META[ev.severity] || { label: ev.severity, cls: '' };
+              const detailText = ev.details && typeof ev.details === 'object'
+                ? Object.entries(ev.details).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' · ')
+                : '—';
+              return [
+                `#${ev.id}`,
+                `<small class="mu">${fmtDate(ev.createdAt)} · ${timeAgo(ev.createdAt)}</small>`,
+                `<span class="rbac-status ${sev.cls}">${sev.label}</span>`,
+                `<b>${esc(ev.title)}</b><br><code dir="ltr" style="font-size:11px">${esc(ev.type)}</code>`,
+                `<small class="mu" style="white-space:normal;max-width:320px;display:inline-block">${esc(detailText)}</small>`,
+                ev.acknowledged
+                  ? `<span class="rbac-status ok">تمت المراجعة ✓</span>`
+                  : `<button type="button" class="btn btn-ac btn-sm" data-a="owner-ack-security" data-id="${ev.id}">تمت المراجعة</button>`
+              ];
+            })
+          ) : emptyState('shield', 'لا توجد تنبيهات أمنية مسجّلة', 'عند رصد أي نشاط مشبوه أو حدث أمني سيظهر هنا فورًا مع إرسال إشعار بريدي.')}
+        </div>
+      `;
+    };
+
+    // --- Owner PII Access Log (#/owner/pii-log) ---
+    views['owner/pii-log'] = (d) => {
+      const logs = (d && d.logs) || [];
+      return `
+        <div class="card">
+          <div class="row-wrap" style="margin-bottom:16px;gap:10px">
+            <div>
+              <h3 style="margin:0">سجل الوصول للبيانات الشخصية (PII Access Log)</h3>
+              <small class="mu">توثيق جميع عمليات استعراض أو طباعة أو تصدير بيانات العملاء وفق متطلبات الامتثال وحماية البيانات.</small>
+            </div>
+            <span class="sp"></span>
+            <select style="width:auto;margin:0" data-i="owner-pii-action" aria-label="تصفية بنوع العملية">
+              <option value="" ${!rbacState.ownerPiiAction ? 'selected' : ''}>كل العمليات</option>
+              <option value="orders.list" ${rbacState.ownerPiiAction === 'orders.list' ? 'selected' : ''}>استعراض الطلبات</option>
+              <option value="orders.invoice" ${rbacState.ownerPiiAction === 'orders.invoice' ? 'selected' : ''}>طباعة فاتورة</option>
+              <option value="orders.awb" ${rbacState.ownerPiiAction === 'orders.awb' ? 'selected' : ''}>طباعة بوالص شحن</option>
+              <option value="orders.export" ${rbacState.ownerPiiAction === 'orders.export' ? 'selected' : ''}>تصدير طلبات CSV</option>
+              <option value="customers.list" ${rbacState.ownerPiiAction === 'customers.list' ? 'selected' : ''}>استعراض العملاء (CRM)</option>
+              <option value="customers.export" ${rbacState.ownerPiiAction === 'customers.export' ? 'selected' : ''}>تصدير العملاء CSV</option>
+              <option value="account.export" ${rbacState.ownerPiiAction === 'account.export' ? 'selected' : ''}>تصدير أرشيف الحساب ZIP</option>
+            </select>
+            <input type="text" style="width:120px;margin:0" dir="ltr" placeholder="معرّف التاجر" value="${esc(rbacState.ownerPiiMerchantId)}" data-i="owner-pii-merchant" aria-label="معرّف التاجر">
+            <input type="date" style="width:auto;margin:0" value="${esc(rbacState.ownerPiiFrom)}" data-i="owner-pii-from" aria-label="من تاريخ">
+            <input type="date" style="width:auto;margin:0" value="${esc(rbacState.ownerPiiTo)}" data-i="owner-pii-to" aria-label="إلى تاريخ">
+            <button type="button" class="btn btn-gh btn-sm" data-a="owner-export-pii-csv">📥 تصدير CSV</button>
+          </div>
+          ${logs.length ? renderTable(
+            ['#', 'التوقيت', 'المستخدم', 'معرّف التاجر', 'العملية', 'المورد', 'عدد السجلات', 'IP'],
+            logs.map((l) => [
+              `#${l.id}`,
+              `<small class="mu">${fmtDate(l.createdAt)} · ${timeAgo(l.createdAt)}</small>`,
+              `<b>${esc(l.actorName || ('#' + l.actorId))}</b><br>${renderRoleText(l.actorRole)}`,
+              `<code>#${fmtNum(l.merchantId)}</code>`,
+              `<code>${esc(l.action)}</code>`,
+              `<span>${esc(l.resourceType)}${l.resourceId ? ` #${esc(l.resourceId)}` : ''}</span>`,
+              `<b>${fmtNum(l.recordCount || 1)}</b>`,
+              `<code dir="ltr" style="font-size:11.5px">${esc(l.ip || '—')}</code>`
+            ])
+          ) : emptyState('lock', 'لا توجد سجلات وصول مطابقة', 'يُسجّل كل استعراض أو طباعة أو تصدير لبيانات العملاء الشخصية هنا تلقائيًا.')}
         </div>
       `;
     };
@@ -1146,8 +1285,10 @@
         support_email: document.querySelector('#os-email')?.value.trim(),
         support_phone: document.querySelector('#os-phone')?.value.trim(),
         maintenance_notice: document.querySelector('#os-notice')?.value.trim(),
+        pii_retention_days: document.querySelector('#os-pii-days')?.value.trim(),
         registration_open: Boolean(document.querySelector('#os-reg-open')?.checked),
-        require_client_approval: Boolean(document.querySelector('#os-req-approval')?.checked)
+        require_client_approval: Boolean(document.querySelector('#os-req-approval')?.checked),
+        require_email_verification: Boolean(document.querySelector('#os-req-email-verify')?.checked)
       });
       showToast('تم حفظ إعدادات المنصة والبيانات الضريبية بنجاح ✓');
       renderApp(true);
@@ -1158,6 +1299,38 @@
       showToast(`💾 تم إنشاء النسخة الاحتياطية بنجاح (${r.backup?.file || ''}) ✓`, 4500);
       renderApp(true);
     });
+
+    act('owner-test-mail', async () => {
+      const r = await api('POST', '/api/owner/mail/test', {});
+      showToast(r.message || 'تم إرسال رسالة البريد التجريبية ✓', 4500);
+    });
+
+    act('owner-ack-security', async (el) => {
+      await api('POST', `/api/owner/security/${encodeURIComponent(el.dataset.id)}/ack`);
+      showToast('تم تأكيد مراجعة التنبيه الأمني ✓');
+      renderApp(true);
+    });
+
+    inputs['owner-pii-action'] = (el) => { rbacState.ownerPiiAction = el.value; renderApp(true); };
+    let ownerPiiTimer;
+    inputs['owner-pii-merchant'] = (el) => {
+      rbacState.ownerPiiMerchantId = el.value.trim();
+      clearTimeout(ownerPiiTimer);
+      ownerPiiTimer = setTimeout(() => renderApp(true), 300);
+    };
+    inputs['owner-pii-from'] = (el) => { rbacState.ownerPiiFrom = el.value; renderApp(true); };
+    inputs['owner-pii-to'] = (el) => { rbacState.ownerPiiTo = el.value; renderApp(true); };
+    actions['owner-export-pii-csv'] = () => {
+      const qs = new URLSearchParams({
+        action: rbacState.ownerPiiAction,
+        merchantId: rbacState.ownerPiiMerchantId,
+        from: rbacState.ownerPiiFrom,
+        to: rbacState.ownerPiiTo
+      }).toString();
+      if (ctx.downloadFile) {
+        ctx.downloadFile(`/api/owner/pii-log/export.csv?${qs}`, 'orderflow-pii-log.csv', 'سجل البيانات الشخصية CSV');
+      }
+    };
 
     inputs['owner-audit-role'] = (el) => { rbacState.ownerAuditRole = el.value; renderApp(true); };
     inputs['owner-audit-actor'] = (el) => { rbacState.ownerAuditActorId = el.value; renderApp(true); };

@@ -350,12 +350,13 @@ module.exports = (r, app) => {
       }
 
       const action = decision === 'approved' ? 'order.approve' : 'order.reject';
-      logAudit(adminUser.id, action, 'order', o.id, { no: o.no, customer: o.customer, userId: o.user_id, reason }, ip);
+      const custPlain = model.dec(o.customer);
+      logAudit(adminUser.id, action, 'order', o.id, { no: o.no, userId: o.user_id, reason }, ip);
       notify(
         o.user_id,
         decision === 'approved' ? 'ok' : 'warning',
         decision === 'approved' ? `تم اعتماد الطلب #${o.no} ✓` : `تم رفض الطلب #${o.no}`,
-        decision === 'approved' ? `الطلب الخاص بالعميل ${o.customer} معتمد وجاهز للمزامنة والشحن.` : `سبب الرفض: ${reason}`,
+        decision === 'approved' ? `الطلب الخاص بالعميل ${custPlain} معتمد وجاهز للمزامنة والشحن.` : `سبب الرفض: ${reason}`,
         '#/ord'
       );
       return { ok: true, type: 'order', item: model.orderOf(q('SELECT * FROM orders WHERE id = ?').get(o.id)) };
