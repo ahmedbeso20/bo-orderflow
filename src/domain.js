@@ -74,7 +74,17 @@ function calcSubscriptionQuote(planId, cycle = 'monthly', couponOrCode = null) {
 // حالات الطلب: 0 قيد التجهيز، 1 تم الشحن، 2 تم التسليم، 3 مرتجع، 4 ملغي
 const STATUS_NEXT = { 0: [1, 4], 1: [2, 3] };
 
-const INTEGRATION_KEYS = ['a', 'n', 'j', 't', 'k', 'bs', 'ar', 'my', 'eta', 'fw', 'vc'];
+const INTEGRATION_KEYS = ['a', 'n', 'j', 't', 'k', 'bs', 'ar', 'my'];
+const INTEGRATION_KEY_SET = new Set(INTEGRATION_KEYS);
+function sanitizeIntegrations(obj) {
+  const out = {};
+  if (obj && typeof obj === 'object') {
+    for (const k of Object.keys(obj)) {
+      if (INTEGRATION_KEY_SET.has(k)) out[k] = obj[k];
+    }
+  }
+  return out;
+}
 const NOTIFICATION_KEYS = ['s', 'o', 'f', 'w'];
 
 const EXPERT_SERVICES = {
@@ -128,6 +138,6 @@ const FEE_RATE_SQL = `(CASE market WHEN 'a' THEN ${MARKETS.a.fee} WHEN 'n' THEN 
 module.exports = {
   VAT, MARKETS, COURIERS, COURIER_BY_KEY, COD, PAYMENTS, PAY_BUCKET,
   PLANS, GATEWAY_METHODS, calcSubscriptionQuote,
-  STATUS_NEXT, INTEGRATION_KEYS, NOTIFICATION_KEYS, EXPERT_SERVICES, FEE_RATE_SQL
+  STATUS_NEXT, INTEGRATION_KEYS, sanitizeIntegrations, NOTIFICATION_KEYS, EXPERT_SERVICES, FEE_RATE_SQL
 };
 

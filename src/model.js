@@ -1,6 +1,6 @@
 'use strict';
 // تحويل صفوف قاعدة البيانات إلى كائنات JSON يرسلها الخادم للواجهة
-const { PLANS, GATEWAY_METHODS, COURIERS, COD } = require('./domain');
+const { PLANS, GATEWAY_METHODS, COURIERS, COD, sanitizeIntegrations } = require('./domain');
 const { parseJson, round2, nowIso } = require('./util');
 
 function createModel(q, cipher = null, opts = {}) {
@@ -156,7 +156,7 @@ function createModel(q, cipher = null, opts = {}) {
     storePhone: u.is_demo ? '01012345678' : u.phone,
     taxId: dec(u.tax_id),
     instaPayHandle: dec(u.instapay),
-    integrations: parseJson(u.integrations, {}),
+    integrations: sanitizeIntegrations(parseJson(u.integrations, {})),
     notifications: parseJson(u.notifications, {}),
     lastSyncAt: u.last_sync_at
   });

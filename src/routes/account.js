@@ -1,7 +1,7 @@
 'use strict';
 const { verifyPassword, hashPassword, generateTotpSecret, verifyTotpCode, buildTotpUri } = require('../auth');
 const { HttpError, bad, text, phone, email, password, oneOf, latin, nowIso, parseJson } = require('../util');
-const { PLANS, INTEGRATION_KEYS, NOTIFICATION_KEYS } = require('../domain');
+const { PLANS, INTEGRATION_KEYS, sanitizeIntegrations, NOTIFICATION_KEYS } = require('../domain');
 const { generateQrSvg } = require('../pages');
 const { seedDemo } = require('../seed');
 
@@ -148,7 +148,7 @@ module.exports = (r, app) => {
   r.put('/api/settings/integrations', ({ user, body }) => {
     const key = oneOf(body.key, INTEGRATION_KEYS, 'الربط');
     const on = body.on ? 1 : 0;
-    const cur = parseJson(user.integrations, {});
+    const cur = sanitizeIntegrations(parseJson(user.integrations, {}));
     const plan = model.planOf(user);
     if (on && MARKET_KEYS.includes(key) && MARKET_KEYS.filter((k) => k !== key && cur[k]).length >= plan.markets) {
       throw new HttpError(402, `${plan.name} تتيح ربط ${plan.markets} أسواق فقط. رقّ باقتك لربط المزيد.`, { code: 'PLAN_LIMIT' });

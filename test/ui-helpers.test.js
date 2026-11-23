@@ -212,5 +212,33 @@ test('Backend API: consultations, managed service requests, AI price radar, AI s
   const togK = await call('PUT', '/api/settings/integrations', { key: 'k', on: true });
   assert.equal(togK.status, 200);
   assert.ok(Boolean(togK.data.integrations.k));
+
+  // 7. Removed Egyptian Payments & Tax Authority integration keys (eta, fw, vc) are rejected and absent
+  const { INTEGRATION_KEYS, sanitizeIntegrations } = require('../src/domain');
+  for (const removedKey of ['eta', 'fw', 'vc']) {
+    assert.ok(!INTEGRATION_KEYS.includes(removedKey), `removed integration key still in INTEGRATION_KEYS: ${removedKey}`);
+    const rej = await call('PUT', '/api/settings/integrations', { key: removedKey, on: true });
+    assert.equal(rej.status, 400, `expected 400 for removed integration key ${removedKey}`);
+  }
+  assert.deepEqual(
+    sanitizeIntegrations({ a: 1, bs: 1, eta: 1, fw: 1, vc: 1 }),
+    { a: 1, bs: 1 }
+  );
+
+  const boot = await call('GET', '/api/bootstrap');
+  assert.equal(boot.status, 200);
+  for (const removedKey of ['eta', 'fw', 'vc']) {
+    assert.equal(boot.data.settings.integrations[removedKey], undefined);
+  }
+
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const appJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  assert.ok(!appJs.includes('المدفوعات ومنظومة الضرائب المصرية'));
+  assert.ok(!appJs.includes('منظومة الفاتورة الإلكترونية (ETA)'));
+  assert.ok(!appJs.includes("key: 'eta'"));
+  assert.ok(!appJs.includes("key: 'fw'"));
+  assert.ok(!appJs.includes("key: 'vc'"));
 });
+
 

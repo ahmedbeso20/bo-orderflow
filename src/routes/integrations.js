@@ -1,6 +1,6 @@
 'use strict';
 const { HttpError, oneOf, parseJson } = require('../util');
-const { PLANS } = require('../domain');
+const { PLANS, sanitizeIntegrations } = require('../domain');
 const { PLATFORM_KEYS, PLATFORM_SCHEMAS } = require('../connectors');
 
 module.exports = (r, app) => {
@@ -13,7 +13,7 @@ module.exports = (r, app) => {
   r.get('/api/integrations/connections', ({ user }) => ({
     schemas: PLATFORM_SCHEMAS,
     connections: connectors.listForUser(user.id),
-    integrations: parseJson(user.integrations, {})
+    integrations: sanitizeIntegrations(parseJson(user.integrations, {}))
   }));
 
   /** حفظ أو تحديث مفاتيح API لمنصة محددة (تُشفّر بـ AES-256-GCM في قاعدة البيانات) */
@@ -24,7 +24,7 @@ module.exports = (r, app) => {
       throw new HttpError(429, 'طلبات كثيرة لتحديث بيانات الربط، انتظر قليلًا');
     }
 
-    const curInts = parseJson(user.integrations, {});
+    const curInts = sanitizeIntegrations(parseJson(user.integrations, {}));
     const plan = app.model.planOf(user);
     const enableMarket = body?.enabled !== false;
     if (enableMarket) {
@@ -113,7 +113,7 @@ module.exports = (r, app) => {
     noDemo(user);
     const platform = oneOf(params.platform, PLATFORM_KEYS, 'المنصة');
     connectors.deleteConnection(user.id, platform);
-    const curInts = parseJson(user.integrations, {});
+    const curInts = sanitizeIntegrations(parseJson(user.integrations, {}));
     curInts[platform] = 0;
     q('UPDATE users SET integrations = ? WHERE id = ?').run(JSON.stringify(curInts), user.id);
     logAudit(user.id, 'integration.credentials_deleted', 'marketplace', null, { platform }, ip);

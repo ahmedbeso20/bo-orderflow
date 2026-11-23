@@ -274,7 +274,7 @@ module.exports = (r, app) => {
       const tag = crypto.randomBytes(6).toString('hex');
       const info = q(`INSERT INTO users (phone,pass_hash,store_name,full_name,role,status,plan,is_demo,integrations,tax_id,tax_id_hash,instapay,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(`demo-${tag}`, '!', 'متجر النور للإلكترونيات', 'متجر النور للإلكترونيات', 'client', 'active', 'pro', 1,
-        JSON.stringify({ a: 1, n: 1, j: 1, bs: 1, ar: 1, my: 0, fw: 1, vc: 1, eta: 1 }), cipher.encrypt('412-890-115'), cipher.blindIndex('412-890-115'), cipher.encrypt('elnoor.store@instapay'), nowIso());
+        JSON.stringify({ a: 1, n: 1, j: 1, bs: 1, ar: 1, my: 0 }), cipher.encrypt('412-890-115'), cipher.blindIndex('412-890-115'), cipher.encrypt('elnoor.store@instapay'), nowIso());
       seedDemo(app, Number(info.lastInsertRowid));
       return info.lastInsertRowid;
     });
