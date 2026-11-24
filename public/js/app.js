@@ -911,7 +911,7 @@ const renderLanding = () => `
           <span dir="ltr">Amazon Egypt · Noon · Jumia · Trendyol · Kenzz</span>
         </div>
         <h1>
-          أدِر كل متاجرك من شاشة واحدة، وزوّد <span class="hl">صافي أرباحك</span>
+          أدِر كل متاجرك من شاشة واحدة و زوّد <span class="hl">صافي أرباحك</span>
         </h1>
         <div class="hero-cta-group">
           <button class="btn btn-ac btn-lg" data-a="auth" data-m="1">ابدأ مجانًا الآن</button>
@@ -3421,6 +3421,26 @@ const renderVerifyEmailPage = (query) => {
     ${renderSiteFooter()}
   `;
 };
+
+const renderSetup2faPage = () => `
+  ${renderPublicHeader()}
+  <main class="container public-page-wrap" style="max-width:540px">
+    <div class="card">
+      <span class="sec-kicker">حماية لوحة التحكم</span>
+      <h2>🛡️ تفعيل المصادقة الثنائية الإلزامية (2FA)</h2>
+      <p class="mu" style="font-size:13.5px;line-height:1.7;margin-bottom:16px">
+        لحماية حساب المالك والمشرفين، يجب ربط الحساب بتطبيق مصادقة (Google Authenticator أو Authy) قبل متابعة الدخول إلى لوحة التحكم.
+      </p>
+      <div id="forced-2fa-slot">
+        <p class="mu" style="text-align:center;padding:18px 0">جارٍ تجهيز رمز المصادقة الثنائية...</p>
+      </div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--bd);text-align:center">
+        <button type="button" class="btn btn-gh btn-sm" data-a="logout">تسجيل الخروج والعودة للرئيسية</button>
+      </div>
+    </div>
+  </main>
+  ${renderSiteFooter()}
+`;
 
 const renderNotFoundPage = (badRoute) => `
   ${renderPublicHeader()}

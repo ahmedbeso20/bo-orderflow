@@ -308,7 +308,13 @@ module.exports = (r, app) => {
       ok: true,
       secret,
       otpauthUri,
-      qrSvg: generateQrSvg(otpauthUri)
+      qrSvg: generateQrSvg(otpauthUri, {
+        pixelSize: 220,
+        margin: 4,
+        darkColor: '#000000',
+        lightColor: '#ffffff',
+        errorCorrectionLevel: 'M'
+      })
     };
   });
 

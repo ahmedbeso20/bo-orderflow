@@ -183,7 +183,7 @@ module.exports = (r, app) => {
   // فحص صامت لحالة الجلسة عبر كوكي HttpOnly بدون أخطاء 401 في الصفحات العامة
   r.get('/api/auth/session', ({ req }) => {
     const uid = session.read(req);
-    return { authenticated: Boolean(uid) };
+    return { authenticated: Boolean(uid), setup2faRequired: Boolean(uid && uid._setup2fa) };
   }, { auth: false });
 
   // تسجيل حساب عميل جديد — يُحفظ تلقائيًا بحالة قيد المراجعة (pending) ولا يُمنح جلسة دخول حتى تتم الموافقة

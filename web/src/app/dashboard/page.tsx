@@ -3,9 +3,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { AppShell } from '@/components/AppShell';
+import { SalesProfitChart } from '@/components/SalesProfitChart';
 import { api } from '@/lib/api';
 import { useBootstrap } from '@/lib/useBootstrap';
 import { fmtEGP, fmtNum, MARKET_NAMES, ORDER_STATUS_LABELS } from '@/lib/format';
+import type { MonthRow } from '@/lib/chartData';
 
 interface MarketShareRow {
   key: string;
@@ -14,12 +16,6 @@ interface MarketShareRow {
   sales?: number;
   orders?: number;
   pct?: number;
-}
-
-interface MonthRow {
-  ym: string;
-  revenue: number;
-  profit: number;
 }
 
 interface DashboardSummary {
@@ -93,7 +89,6 @@ export default function DashboardOverviewPage() {
   }, [dash]);
 
   const maxSales = Math.max(1, ...markets.map((m) => m.sales));
-  const maxMonthVal = Math.max(1, ...months.map((m) => Math.max(m.revenue || 0, Math.abs(m.profit || 0))));
 
   return (
     <AppShell
@@ -163,39 +158,7 @@ export default function DashboardOverviewPage() {
         </div>
       </div>
 
-      {months.length > 0 && (
-        <section className="of-card p-6 mb-6 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h2 className="font-extrabold text-base">المبيعات مقابل صافي الربح (آخر 12 شهرًا)</h2>
-              <p className="text-xs text-[var(--muted)]">مقارنة شهرية بالجنيه المصري بعد عمولات المنصات والشحن والمرتجعات</p>
-            </div>
-            <div className="flex items-center gap-4 text-xs font-bold">
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-[#0C5CA4]" /> المبيعات
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" /> صافي الربح
-              </span>
-            </div>
-          </div>
-          <div className="grid grid-cols-6 sm:grid-cols-12 gap-2 items-end h-44 pt-4">
-            {months.map((m) => {
-              const revH = Math.max(4, Math.round(((m.revenue || 0) / maxMonthVal) * 100));
-              const profH = Math.max(4, Math.round((Math.max(0, m.profit || 0) / maxMonthVal) * 100));
-              return (
-                <div key={m.ym} className="flex flex-col items-center gap-1.5 h-full justify-end" title={`${m.ym}: مبيعات ${fmtEGP(m.revenue)} · ربح ${fmtEGP(m.profit)}`}>
-                  <div className="w-full flex items-end justify-center gap-1 flex-1">
-                    <div className="w-2.5 rounded-t bg-[#0C5CA4]" style={{ height: `${revH}%` }} />
-                    <div className="w-2.5 rounded-t bg-emerald-500" style={{ height: `${profH}%` }} />
-                  </div>
-                  <span className="text-[10px] font-mono-num text-[var(--muted)]" dir="ltr">{m.ym.slice(5)}</span>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
+      {months.length > 0 && <SalesProfitChart months={months} />}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         <section className="of-card p-6 space-y-4">

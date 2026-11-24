@@ -133,7 +133,7 @@ export default function LandingPage() {
         <section className="max-w-3xl space-y-6">
           <p className="text-sm font-bold text-[var(--primary)]">منصة التجارة متعددة القنوات في مصر · بالجنيه المصري</p>
           <h1 className="text-4xl lg:text-6xl font-extrabold leading-tight">
-            أدِر متاجرك على أمازون مصر ونون وجوميا من لوحة واحدة
+            أدِر كل متاجرك من شاشة واحدة و زوّد صافي أرباحك
           </h1>
           <p className="text-lg text-[var(--muted)] leading-relaxed">
             مخزون موحّد، إصدار بوالص شحن، مطابقة تحصيلات الدفع عند الاستلام (COD)، فواتير بـ QR، واستوديو ذكاء اصطناعي — بتجربة ويب سريعة وتثبيت PWA.
