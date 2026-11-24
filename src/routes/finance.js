@@ -68,6 +68,7 @@ module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter,
     const recent = q(`SELECT * FROM orders WHERE user_id = ?${mk} ORDER BY created_at DESC, id DESC LIMIT 5`).all(...[user.id, ...(market ? [market] : [])]).map(model.orderOf);
     const conns = connectors ? connectors.listForUser(user.id) : [];
     const hasActiveConnection = conns.some((c) => c.configured && c.enabled);
+    const unpricedCostCount = Number(q('SELECT COUNT(*) n FROM products WHERE user_id = ? AND cost <= 0').get(user.id)?.n || 0);
 
     return {
       range, market: market || 'all', source: sourceFilter, hasActiveConnection,
@@ -76,6 +77,7 @@ module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter,
         delivered: Number(cur.delivered || 0),
         returned: Number(cur.returned || 0),
         avgOrder: cur.orders ? round2(cur.gross / cur.orders) : 0,
+        unpricedCostCount,
         margin: cur.gross ? Math.round((cur.net / cur.gross) * 1000) / 10 : 0,
         deliveryRate: finished ? Math.round((cur.delivered / finished) * 1000) / 10 : 0,
         grossDelta: pct(cur.gross, prev.gross), netDelta: pct(cur.net, prev.net),

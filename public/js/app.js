@@ -5740,7 +5740,7 @@ act('open-api-cfg', async (el) => {
         <button type="button" class="btn btn-gh btn-sm" data-a="close-dlg">إغلاق</button>
         ${!isDemo ? `
           <button type="button" class="btn btn-gh btn-sm" data-a="save-api-conn-only" data-k="${key}">حفظ فقط</button>
-          <button type="button" class="btn btn-ac btn-sm" data-a="save-api-conn" data-k="${key}">${ico('zap', 14)} حفظ واختبار الاتصال</button>
+          <button type="button" class="btn btn-ac btn-sm" data-a="save-api-conn" data-k="${key}">${ico('zap', 14)} حفظ واختبار وسحب البيانات</button>
         ` : ''}
       </div>
     </div>
@@ -5773,13 +5773,18 @@ async function submitApiConnection(key, testNow) {
     credentials,
     environment,
     enabled: true,
-    testNow
+    testNow,
+    syncNow: Boolean(testNow)
   });
   state.integrations = r.integrations || state.integrations;
   state.marketplaceConnections = r.connections || state.marketplaceConnections;
   closeDlg();
-  if (r.testResult) {
-    showToast(r.testResult.ok ? `✓ ${r.testResult.message}` : `⚠️ تم حفظ المفاتيح لكن فشل الاختبار: ${r.testResult.message}`, 5200);
+  if (r.syncResult && r.syncResult.ok) {
+    await loadSession();
+    showToast(`✓ تم الربط وسحب البيانات: +${r.syncResult.importedProducts || 0} منتج جديد، ${r.syncResult.updatedProducts || 0} محدّث، +${r.syncResult.importedOrders || 0} طلب جديد`, 6000);
+  } else if (r.testResult) {
+    const syncErr = r.syncResult && !r.syncResult.ok ? ` (فشل السحب: ${r.syncResult.error || 'خطأ غير معروف'})` : '';
+    showToast(r.testResult.ok ? `✓ ${r.testResult.message}${syncErr}` : `⚠️ تم حفظ المفاتيح لكن فشل الاختبار: ${r.testResult.message}`, 5600);
   } else {
     showToast('🔒 تم حفظ وتشفير مفاتيح API بنجاح ✓', 3600);
   }

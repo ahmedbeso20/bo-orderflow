@@ -62,12 +62,31 @@ module.exports = (r, app) => {
       testResult = await connectors.testConnection(user.id, platform);
     }
 
+    let syncResult = null;
+    if (body?.syncNow && enableMarket && (!body?.testNow || testResult?.ok)) {
+      syncResult = await connectors.syncPlatform(user.id, platform);
+      if (syncResult?.ok) {
+        q('UPDATE users SET last_sync_at = ? WHERE id = ?').run(new Date().toISOString(), user.id);
+        logAudit(user.id, 'integration.live_sync', 'marketplace', null, {
+          platform,
+          importedProducts: syncResult.importedProducts,
+          updatedProducts: syncResult.updatedProducts,
+          importedOrders: syncResult.importedOrders
+        }, ip);
+      }
+    }
+
+    const connections = connectors.listForUser(user.id);
+    const updatedConn = connections.find((c) => c.platform === platform) || (testResult ? testResult.connection : connection);
+
     return {
       ok: true,
-      connection: testResult ? testResult.connection : connection,
+      connection: updatedConn,
       testResult,
+      syncResult,
       integrations: curInts,
-      connections: connectors.listForUser(user.id)
+      connections,
+      syncRuns: connectors.listSyncRuns ? connectors.listSyncRuns(user.id, 10) : []
     };
   });
 
@@ -103,6 +122,7 @@ module.exports = (r, app) => {
     if (!result.ok) {
       throw new HttpError(502, result.error || 'تعذّر سحب البيانات من المنصة');
     }
+    q('UPDATE users SET last_sync_at = ? WHERE id = ?').run(new Date().toISOString(), user.id);
     logAudit(user.id, 'integration.live_sync', 'marketplace', null, {
       platform,
       importedProducts: result.importedProducts,
@@ -112,6 +132,7 @@ module.exports = (r, app) => {
     return {
       ...result,
       connections: connectors.listForUser(user.id),
+      syncRuns: connectors.listSyncRuns ? connectors.listSyncRuns(user.id, 10) : [],
       message: `تم سحب البيانات من ${result.name}: +${result.importedProducts} منتج جديد، ${result.updatedProducts} محدّث، +${result.importedOrders} طلب جديد.`
     };
   });
