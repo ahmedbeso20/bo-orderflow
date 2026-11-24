@@ -13,20 +13,27 @@ export default function SettingsPage() {
 
   // بيانات المتجر
   const [storeName, setStoreName] = useState('');
+  const [storeEmail, setStoreEmail] = useState('');
+  const [storePhone, setStorePhone] = useState('');
   const [taxId, setTaxId] = useState('');
   const [instaPayHandle, setInstaPayHandle] = useState('');
+  const [profileCurrentPw, setProfileCurrentPw] = useState('');
+  const [profileTotp, setProfileTotp] = useState('');
 
   // المصادقة الثنائية 2FA
   const [totpSecret, setTotpSecret] = useState('');
   const [totpQrSvg, setTotpQrSvg] = useState('');
   const [totpCode, setTotpCode] = useState('');
   const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
+  const [reconfigPw, setReconfigPw] = useState('');
+  const [reconfigCode, setReconfigCode] = useState('');
   const [disablePw, setDisablePw] = useState('');
   const [disableCode, setDisableCode] = useState('');
 
   // كلمة المرور والجلسات
   const [curPw, setCurPw] = useState('');
   const [nextPw, setNextPw] = useState('');
+  const [pwTotp, setPwTotp] = useState('');
 
   // توثيق البريد والهاتف
   const [emailToken, setEmailToken] = useState('');
@@ -39,13 +46,23 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
 
+  const origEmail = boot?.settings?.storeEmail || boot?.settings?.email || boot?.me?.email || '';
+  const origPhone = boot?.settings?.storePhone || boot?.settings?.phone || boot?.me?.phone || '';
+
   useEffect(() => {
     const s = boot?.settings;
     if (!s && !boot?.me) return;
     setStoreName(s?.storeName || boot?.me?.storeName || '');
+    setStoreEmail(s?.storeEmail || s?.email || boot?.me?.email || '');
+    setStorePhone(s?.storePhone || s?.phone || boot?.me?.phone || '');
     setTaxId(s?.taxId || boot?.me?.taxId || '');
     setInstaPayHandle(s?.instaPayHandle || boot?.me?.instaPayHandle || '');
   }, [boot?.settings, boot?.me]);
+
+  const contactChanged =
+    !boot?.me?.isDemo &&
+    (storeEmail.trim().toLowerCase() !== origEmail.trim().toLowerCase() ||
+      storePhone.trim() !== origPhone.trim());
 
   async function saveProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -54,9 +71,15 @@ export default function SettingsPage() {
     try {
       await api.put('/api/settings', {
         storeName: storeName.trim(),
+        storeEmail: storeEmail.trim(),
+        storePhone: storePhone.trim(),
         taxId: taxId.trim(),
-        instaPayHandle: instaPayHandle.trim()
+        instaPayHandle: instaPayHandle.trim(),
+        ...(contactChanged && profileCurrentPw ? { currentPassword: profileCurrentPw } : {}),
+        ...(contactChanged && profileTotp.trim() ? { totpCode: profileTotp.trim() } : {})
       });
+      setProfileCurrentPw('');
+      setProfileTotp('');
       setNotice('تم حفظ بيانات المتجر والرقم الضريبي بنجاح ✓');
       await reload();
     } catch (err) {
@@ -64,13 +87,19 @@ export default function SettingsPage() {
     }
   }
 
-  async function setup2fa() {
+  async function setup2fa(e?: React.FormEvent) {
+    if (e) e.preventDefault();
     setError('');
     setNotice('');
     try {
-      const res = await api.post<{ secret?: string; qrSvg?: string }>('/api/account/2fa/setup', {});
+      const payload = boot?.me?.totpEnabled
+        ? { password: reconfigPw, totpCode: reconfigCode.trim() }
+        : {};
+      const res = await api.post<{ secret?: string; qrSvg?: string }>('/api/account/2fa/setup', payload);
       setTotpSecret(res.secret || '');
       setTotpQrSvg(res.qrSvg || '');
+      setReconfigPw('');
+      setReconfigCode('');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر بدء إعداد 2FA');
     }
@@ -113,9 +142,14 @@ export default function SettingsPage() {
     setError('');
     setNotice('');
     try {
-      await api.post('/api/account/password', { current: curPw, next: nextPw });
+      await api.post('/api/account/password', {
+        current: curPw,
+        next: nextPw,
+        ...(boot?.me?.totpEnabled ? { totpCode: pwTotp.trim() } : {})
+      });
       setCurPw('');
       setNextPw('');
+      setPwTotp('');
       setNotice('تم تغيير كلمة المرور وإنهاء جميع الجلسات الأخرى بنجاح ✓');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر تغيير كلمة المرور');
@@ -240,6 +274,43 @@ export default function SettingsPage() {
             <label className="text-xs font-bold block">اسم المتجر</label>
             <input className="of-input" value={storeName} onChange={(e) => setStoreName(e.target.value)} required />
           </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-xs font-bold block">البريد الإلكتروني</label>
+              <input type="email" className="of-input" dir="ltr" value={storeEmail} onChange={(e) => setStoreEmail(e.target.value)} />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold block">رقم الموبايل</label>
+              <input className="of-input" dir="ltr" value={storePhone} onChange={(e) => setStorePhone(e.target.value)} />
+            </div>
+          </div>
+          {contactChanged && (
+            <div className="rounded-xl border border-amber-500/40 bg-amber-50/50 dark:bg-amber-950/20 p-3 space-y-2">
+              <div className="text-xs font-bold text-amber-800 dark:text-amber-200">
+                تأكيد الهوية مطلوب عند تعديل البريد الإلكتروني أو رقم الموبايل:
+              </div>
+              <input
+                type="password"
+                dir="ltr"
+                className="of-input"
+                placeholder="كلمة المرور الحالية"
+                value={profileCurrentPw}
+                onChange={(e) => setProfileCurrentPw(e.target.value)}
+                required
+              />
+              {boot?.me?.totpEnabled && (
+                <input
+                  dir="ltr"
+                  className="of-input font-mono-num"
+                  maxLength={6}
+                  placeholder="رمز المصادقة الثنائية 2FA (6 أرقام)"
+                  value={profileTotp}
+                  onChange={(e) => setProfileTotp(e.target.value)}
+                  required
+                />
+              )}
+            </div>
+          )}
           <div className="space-y-1">
             <label className="text-xs font-bold block">الرقم الضريبي (مشفّر AES-256-GCM مع فهرس بحث آمن)</label>
             <input className="of-input" dir="ltr" value={taxId} onChange={(e) => setTaxId(e.target.value)} placeholder="412-890-115" />
@@ -293,6 +364,14 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
+          {boot?.me?.totpEnabled && !totpSecret && (
+            <form onSubmit={(e) => void setup2fa(e)} className="space-y-2 pt-2 border-t border-[var(--border)]">
+              <div className="text-xs font-bold text-[var(--muted)]">تدوير مفتاح 2FA (يتطلب كلمة المرور والرمز الحالي)</div>
+              <input type="password" dir="ltr" className="of-input" placeholder="كلمة المرور الحالية" value={reconfigPw} onChange={(e) => setReconfigPw(e.target.value)} required />
+              <input dir="ltr" className="of-input font-mono-num" maxLength={6} placeholder="رمز 2FA الحالي" value={reconfigCode} onChange={(e) => setReconfigCode(e.target.value)} required />
+              <button type="submit" className="rounded-xl border border-[var(--border)] px-4 py-2 text-xs font-bold">إنشاء مفتاح 2FA جديد</button>
+            </form>
+          )}
           {boot?.me?.totpEnabled && !isStaff && (
             <form onSubmit={disable2fa} className="space-y-2 pt-2 border-t border-[var(--border)]">
               <div className="text-xs font-bold text-[var(--muted)]">تعطيل المصادقة الثنائية</div>
@@ -308,6 +387,9 @@ export default function SettingsPage() {
           <form onSubmit={changePassword} className="space-y-3">
             <input type="password" dir="ltr" className="of-input" placeholder="كلمة المرور الحالية" value={curPw} onChange={(e) => setCurPw(e.target.value)} required />
             <input type="password" dir="ltr" className="of-input" placeholder="كلمة المرور الجديدة (8 أحرف فأكثر)" value={nextPw} onChange={(e) => setNextPw(e.target.value)} required />
+            {boot?.me?.totpEnabled && (
+              <input dir="ltr" className="of-input font-mono-num" maxLength={6} placeholder="رمز المصادقة الثنائية 2FA (مطلوب)" value={pwTotp} onChange={(e) => setPwTotp(e.target.value)} required />
+            )}
             <div className="flex flex-wrap gap-2">
               <button type="submit" className="rounded-xl bg-[#0C5CA4] px-5 py-2.5 text-xs font-bold text-white">تحديث كلمة المرور</button>
               <button type="button" onClick={() => void logoutAll()} className="rounded-xl border border-rose-500/40 px-4 py-2.5 text-xs font-bold text-rose-600">
@@ -321,7 +403,7 @@ export default function SettingsPage() {
           <h2 className="font-extrabold text-base">توثيق البريد الإلكتروني ورقم الموبايل</h2>
           <div className="space-y-2 pb-3 border-b border-[var(--border)]">
             <div className="flex items-center justify-between text-xs">
-              <span>البريد الإلكتروني: <strong dir="ltr">{boot?.me?.email || 'غير مضاف'}</strong></span>
+              <span>البريد الإلكتروني: <strong dir="ltr">{boot?.me?.email || storeEmail || 'غير مضاف'}</strong></span>
               <span className={boot?.me?.emailVerified ? 'text-emerald-600 font-bold' : 'text-amber-600 font-bold'}>
                 {boot?.me?.emailVerified ? 'موثّق ✓' : 'غير موثّق'}
               </span>
@@ -332,7 +414,7 @@ export default function SettingsPage() {
                   إرسال رمز التأكيد للبريد
                 </button>
                 <form onSubmit={confirmEmailVerify} className="flex gap-2">
-                  <input className="of-input" dir="ltr" placeholder="أدخل رمز البريد" value={emailToken} onChange={(e) => setEmailToken(e.target.value)} required />
+                  <input className="of-input" placeholder="أدخل رمز التأكيد المرسل لبريدك" value={emailToken} onChange={(e) => setEmailToken(e.target.value)} required />
                   <button type="submit" className="rounded-xl bg-[#0C5CA4] px-4 text-xs font-bold text-white shrink-0">تأكيد</button>
                 </form>
               </div>
@@ -341,7 +423,7 @@ export default function SettingsPage() {
 
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs">
-              <span>الموبايل: <strong dir="ltr">{boot?.me?.phone || 'غير مضاف'}</strong></span>
+              <span>الموبايل: <strong dir="ltr">{(boot?.me?.phone && !boot.me.phone.startsWith('demo-') ? boot.me.phone : storePhone) || 'غير مضاف'}</strong></span>
               <span className={boot?.me?.phoneVerified ? 'text-emerald-600 font-bold' : 'text-amber-600 font-bold'}>
                 {boot?.me?.phoneVerified ? 'موثّق ✓' : 'غير موثّق'}
               </span>
@@ -352,7 +434,7 @@ export default function SettingsPage() {
                   إرسال رمز SMS OTP
                 </button>
                 <form onSubmit={confirmPhoneOtp} className="flex gap-2">
-                  <input className="of-input font-mono-num" dir="ltr" maxLength={6} placeholder="رمز OTP (6 أرقام)" value={phoneOtp} onChange={(e) => setPhoneOtp(e.target.value)} required />
+                  <input className="of-input font-mono-num" maxLength={6} placeholder="أدخل رمز SMS المكوّن من 6 أرقام" value={phoneOtp} onChange={(e) => setPhoneOtp(e.target.value)} required />
                   <button type="submit" className="rounded-xl bg-[#0C5CA4] px-4 text-xs font-bold text-white shrink-0">تأكيد</button>
                 </form>
               </div>

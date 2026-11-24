@@ -23,6 +23,9 @@ jobs:
       - name: Syntax & lint check
         run: npm run lint
 
+      - name: Root build check
+        run: npm run build
+
       - name: Run unit & integration test suite
         run: npm test
 

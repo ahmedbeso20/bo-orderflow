@@ -1,26 +1,46 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { AppShell } from '@/components/AppShell';
 import { api } from '@/lib/api';
 import { useBootstrap } from '@/lib/useBootstrap';
 import { fmtEGP, fmtNum, MARKET_NAMES, ORDER_STATUS_LABELS } from '@/lib/format';
 
+interface MarketShareRow {
+  key: string;
+  name?: string;
+  amount?: number;
+  sales?: number;
+  orders?: number;
+  pct?: number;
+}
+
+interface MonthRow {
+  ym: string;
+  revenue: number;
+  profit: number;
+}
+
 interface DashboardSummary {
   kpis?: {
     gross?: number;
     net?: number;
     orders?: number;
+    delivered?: number;
+    returned?: number;
     codReady?: number;
     margin?: number;
     deliveryRate?: number;
     avgOrder?: number;
-    returned?: number;
   };
-  marketShare?: Array<{ key: string; name?: string; sales: number; orders: number; pct?: number }>;
+  months?: MonthRow[];
+  marketShare?:
+    | MarketShareRow[]
+    | Record<string, { amount?: number; sales?: number; orders?: number; pct?: number }>;
+  marketShareList?: MarketShareRow[];
   recent?: Array<{ id: number; no: number; customer: string; market: string; total: number; status: number }>;
-  hasConnectedData?: boolean;
+  hasActiveConnection?: boolean;
 }
 
 export default function DashboardOverviewPage() {
@@ -37,9 +57,43 @@ export default function DashboardOverviewPage() {
   }, [boot?.me, range, source]);
 
   const k = dash?.kpis || {};
-  const markets = dash?.marketShare || [];
   const recent = dash?.recent || [];
-  const maxSales = Math.max(1, ...markets.map((m) => Number(m.sales || 0)));
+  const months = dash?.months || [];
+
+  const markets = useMemo(() => {
+    if (!dash) return [];
+    if (Array.isArray(dash.marketShareList) && dash.marketShareList.length > 0) {
+      return dash.marketShareList.map((m) => ({
+        key: m.key,
+        name: m.name || MARKET_NAMES[m.key] || m.key,
+        sales: Number(m.amount ?? m.sales ?? 0),
+        orders: Number(m.orders ?? 0),
+        pct: m.pct
+      }));
+    }
+    if (Array.isArray(dash.marketShare)) {
+      return dash.marketShare.map((m) => ({
+        key: m.key,
+        name: m.name || MARKET_NAMES[m.key] || m.key,
+        sales: Number(m.amount ?? m.sales ?? 0),
+        orders: Number(m.orders ?? 0),
+        pct: m.pct
+      }));
+    }
+    if (dash.marketShare && typeof dash.marketShare === 'object') {
+      return Object.entries(dash.marketShare).map(([key, v]) => ({
+        key,
+        name: MARKET_NAMES[key] || key,
+        sales: Number(v?.amount ?? v?.sales ?? 0),
+        orders: Number(v?.orders ?? 0),
+        pct: v?.pct
+      }));
+    }
+    return [];
+  }, [dash]);
+
+  const maxSales = Math.max(1, ...markets.map((m) => m.sales));
+  const maxMonthVal = Math.max(1, ...months.map((m) => Math.max(m.revenue || 0, Math.abs(m.profit || 0))));
 
   return (
     <AppShell
@@ -88,7 +142,9 @@ export default function DashboardOverviewPage() {
         <div className="of-card p-5 space-y-1">
           <div className="text-xs font-bold text-[var(--muted)]">إجمالي المبيعات</div>
           <div className="text-2xl font-extrabold font-mono-num">{fmtEGP(k.gross)}</div>
-          <div className="text-[11px] text-[var(--muted)]">نسبة التسليم: {fmtNum(k.deliveryRate)}%</div>
+          <div className="text-[11px] text-[var(--muted)]">
+            تم التسليم: {fmtNum(k.delivered)} · نسبة التسليم: {fmtNum(k.deliveryRate)}%
+          </div>
         </div>
         <div className="of-card p-5 space-y-1">
           <div className="text-xs font-bold text-[var(--muted)]">صافي الربح التقديري</div>
@@ -103,9 +159,43 @@ export default function DashboardOverviewPage() {
         <div className="of-card p-5 space-y-1">
           <div className="text-xs font-bold text-[var(--muted)]">رصيد COD الجاهز للتحويل</div>
           <div className="text-2xl font-extrabold font-mono-num text-amber-600">{fmtEGP(k.codReady)}</div>
-          <div className="text-[11px] text-[var(--muted)]">متوسط الطلب: {fmtEGP(k.avgOrder)}</div>
+          <div className="text-[11px] text-[var(--muted)]">متوسط قيمة الطلب: {fmtEGP(k.avgOrder)}</div>
         </div>
       </div>
+
+      {months.length > 0 && (
+        <section className="of-card p-6 mb-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="font-extrabold text-base">المبيعات مقابل صافي الربح (آخر 12 شهرًا)</h2>
+              <p className="text-xs text-[var(--muted)]">مقارنة شهرية بالجنيه المصري بعد عمولات المنصات والشحن والمرتجعات</p>
+            </div>
+            <div className="flex items-center gap-4 text-xs font-bold">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-[#0C5CA4]" /> المبيعات
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" /> صافي الربح
+              </span>
+            </div>
+          </div>
+          <div className="grid grid-cols-6 sm:grid-cols-12 gap-2 items-end h-44 pt-4">
+            {months.map((m) => {
+              const revH = Math.max(4, Math.round(((m.revenue || 0) / maxMonthVal) * 100));
+              const profH = Math.max(4, Math.round((Math.max(0, m.profit || 0) / maxMonthVal) * 100));
+              return (
+                <div key={m.ym} className="flex flex-col items-center gap-1.5 h-full justify-end" title={`${m.ym}: مبيعات ${fmtEGP(m.revenue)} · ربح ${fmtEGP(m.profit)}`}>
+                  <div className="w-full flex items-end justify-center gap-1 flex-1">
+                    <div className="w-2.5 rounded-t bg-[#0C5CA4]" style={{ height: `${revH}%` }} />
+                    <div className="w-2.5 rounded-t bg-emerald-500" style={{ height: `${profH}%` }} />
+                  </div>
+                  <span className="text-[10px] font-mono-num text-[var(--muted)]" dir="ltr">{m.ym.slice(5)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         <section className="of-card p-6 space-y-4">
@@ -118,15 +208,15 @@ export default function DashboardOverviewPage() {
           ) : (
             <div className="space-y-3">
               {markets.map((m) => {
-                const pct = m.pct ?? Math.round((Number(m.sales || 0) / maxSales) * 100);
+                const pct = m.pct ?? Math.round((m.sales / maxSales) * 100);
                 return (
                   <div key={m.key} className="space-y-1">
                     <div className="flex items-center justify-between text-xs font-bold">
-                      <span>{m.name || MARKET_NAMES[m.key] || m.key} ({fmtNum(m.orders)} طلب)</span>
-                      <span className="font-mono-num">{fmtEGP(m.sales)}</span>
+                      <span>{m.name} ({fmtNum(m.orders)} طلب)</span>
+                      <span className="font-mono-num">{fmtEGP(m.sales)} ({fmtNum(pct)}%)</span>
                     </div>
                     <div className="h-2.5 rounded-full bg-[var(--surface-alt)] overflow-hidden">
-                      <div className="h-full rounded-full bg-[#0C5CA4]" style={{ width: `${Math.max(4, pct)}%` }} />
+                      <div className="h-full rounded-full bg-[#0C5CA4]" style={{ width: `${Math.max(m.sales > 0 ? 4 : 0, Math.min(100, pct))}%` }} />
                     </div>
                   </div>
                 );
@@ -149,9 +239,9 @@ export default function DashboardOverviewPage() {
               <div className="font-bold text-sm">🧾 الطلبات والفواتير</div>
               <div className="text-xs text-[var(--muted)] mt-1">{fmtNum(boot?.counts?.pendingOrders || 0)} قيد التجهيز</div>
             </Link>
-            <Link href="/dashboard/ai" className="rounded-xl border border-[var(--border)] p-4 hover:bg-[var(--surface-alt)]">
-              <div className="font-bold text-sm">✨ استوديو الذكاء</div>
-              <div className="text-xs text-[var(--muted)] mt-1">A+ ورادار تسعير ومستشار</div>
+            <Link href="/dashboard/returns" className="rounded-xl border border-[var(--border)] p-4 hover:bg-[var(--surface-alt)]">
+              <div className="font-bold text-sm">↩️ المرتجعات وRTO</div>
+              <div className="text-xs text-[var(--muted)] mt-1">تحليل خسائر الشحن والمرتجعات</div>
             </Link>
             <Link href="/dashboard/cod" className="rounded-xl border border-[var(--border)] p-4 hover:bg-[var(--surface-alt)]">
               <div className="font-bold text-sm">💰 حاسبة الأرباح وCOD</div>

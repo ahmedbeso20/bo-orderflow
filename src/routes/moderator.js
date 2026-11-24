@@ -135,7 +135,7 @@ module.exports = (r, app) => {
         subject: 'تمت الموافقة على حسابك في OrderFlow ✓',
         type: 'account_approved',
         storeName: u.store_name,
-        url: `${cfg.appUrl || 'http://localhost:3000'}/#/login`,
+        url: app.appUrlPath('/login'),
         text: `مرحبًا ${u.store_name}، تمت الموافقة على حسابك في OrderFlow ويمكنك الآن تسجيل الدخول.`
       });
     }

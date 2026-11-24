@@ -593,6 +593,62 @@ CREATE TABLE anonymized_payments (
   anonymized_at TEXT NOT NULL
 );
 `
+}, {
+  disableForeignKeys: true,
+  sql: `
+-- الترحيل 11: فصل سر 2FA المعلّق، حصة رفع الصور، طابور مزامنة المخزون الثنائي، دقة محاسبة المزامنة، ودعم شركة شحن Mylerz
+ALTER TABLE users ADD COLUMN totp_pending_secret_enc TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE orders ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN fulfillment_channel TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE user_uploads (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL UNIQUE,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX user_uploads_user ON user_uploads(user_id);
+
+CREATE TABLE sync_outbox (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL CHECK (platform IN ('a', 'n', 'j', 't', 'k')),
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  sku TEXT NOT NULL,
+  qty INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'done', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  next_retry_at TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX sync_outbox_pending ON sync_outbox(status, next_retry_at);
+CREATE INDEX sync_outbox_user_sku ON sync_outbox(user_id, platform, sku);
+
+CREATE TABLE courier_connections_new (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  courier TEXT NOT NULL CHECK (courier IN ('bosta', 'aramex', 'mylerz')),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  environment TEXT NOT NULL DEFAULT 'production' CHECK (environment IN ('production', 'sandbox')),
+  creds_enc TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'disconnected' CHECK (status IN ('disconnected', 'configured', 'connected', 'error')),
+  last_tested_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (user_id, courier)
+);
+INSERT INTO courier_connections_new (id, user_id, courier, enabled, environment, creds_enc, status, last_tested_at, last_error, created_at, updated_at)
+SELECT id, user_id, courier, enabled, environment, creds_enc, status, last_tested_at, last_error, created_at, updated_at FROM courier_connections;
+DROP TABLE courier_connections;
+ALTER TABLE courier_connections_new RENAME TO courier_connections;
+CREATE INDEX courier_connections_user ON courier_connections(user_id);
+`
 }];
 
 const crypto = require('node:crypto');

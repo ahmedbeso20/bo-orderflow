@@ -1,14 +1,34 @@
 services:
   # Required in .env before running in production:
+  # DOMAIN=app.orderflow.eg (or localhost for local TLS)
   # SESSION_SECRET (>= 32 chars), DATA_ENCRYPTION_KEY (>= 32 chars), OWNER_PASSWORD (>= 12 chars)
+  caddy:
+    image: caddy:2-alpine
+    container_name: orderflow-caddy
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: orderflow-api
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     env_file:
       - .env
     environment:
@@ -18,8 +38,10 @@ services:
       DATA_DIR: /app/data
       DB_FILE: /app/data/omniarab.db
       DB_PATH: /app/data/omniarab.db
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001}
-      APP_URL: ${APP_URL:-http://localhost:3001}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
+      APP_URL: ${APP_URL:-https://localhost}
+      FRONTEND_ROUTING: ${FRONTEND_ROUTING:-path}
+      SERVE_LEGACY_SPA: ${SERVE_LEGACY_SPA:-0}
       TRUST_PROXY: ${TRUST_PROXY:-1}
       ALLOW_IFRAME: ${ALLOW_IFRAME:-0}
     volumes:
@@ -39,8 +61,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       NODE_ENV: production
       API_ORIGIN: http://api:3000
@@ -53,3 +75,5 @@ services:
 
 volumes:
   orderflow_data:
+  caddy_data:
+  caddy_config:

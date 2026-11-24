@@ -116,7 +116,11 @@ export default function RegisterPage() {
                 required
               />
               <span>
-                أوافق على شروط الاستخدام وسياسة حماية البيانات الشخصية وفق القانون المصري رقم ١٥١ لسنة ٢٠٢٠ (إخفاء بيانات المشترين تلقائيًا بعد ٣٠ يومًا).
+                أوافق على{' '}
+                <Link href="/terms" className="text-[var(--primary)] underline font-bold" target="_blank">شروط الاستخدام</Link>
+                {' '}و{' '}
+                <Link href="/privacy" className="text-[var(--primary)] underline font-bold" target="_blank">سياسة الخصوصية وحماية البيانات</Link>
+                {' '}وفق القانون المصري رقم ١٥١ لسنة ٢٠٢٠ (إخفاء بيانات المشترين تلقائيًا بعد ٣٠ يومًا).
               </span>
             </label>
 

@@ -127,7 +127,48 @@ module.exports = (r, app) => {
     };
   });
 
-  r.put('/api/settings', ({ user, body }) => {
+  async function verifyCurrentTotpWithReplay(cur, rawCode, { allowRecovery = false } = {}) {
+    const code = String(rawCode || '').trim();
+    if (!code) return { ok: false };
+    const secret = cipher.decrypt(cur.totp_secret_enc);
+    const step = verifyTotpCode(secret, code);
+    if (step) {
+      if (step <= Number(cur.totp_last_step || 0)) {
+        throw new HttpError(401, 'تم استخدام رمز المصادقة الثنائية هذا بالفعل؛ انتظر الرمز التالي.', { code: 'REPLAY_2FA' });
+      }
+      q('UPDATE users SET totp_last_step = ? WHERE id = ?').run(step, cur.id);
+      return { ok: true, step, usedRecovery: false };
+    }
+    if (allowRecovery) {
+      const normRec = normalizeRecoveryCode(code);
+      if (normRec.length >= 8) {
+        const recs = q('SELECT id, code_hash FROM totp_recovery_codes WHERE user_id = ? AND used_at IS NULL').all(cur.id);
+        for (const rec of recs) {
+          if (await verifyPassword(normRec, rec.code_hash)) {
+            q('UPDATE totp_recovery_codes SET used_at = ? WHERE id = ?').run(nowIso(), rec.id);
+            return { ok: true, step: 0, usedRecovery: true };
+          }
+        }
+      }
+    }
+    return { ok: false };
+  }
+
+  async function requireSensitiveReauth(user, body, actionLabel = 'تعديل بيانات الحساب الحساسة') {
+    const cur = reload(user.id);
+    const curPass = String(body.currentPassword ?? body.password ?? '');
+    if (!curPass || !(await verifyPassword(curPass, cur.pass_hash))) {
+      throw new HttpError(403, `أدخل كلمة المرور الحالية لتأكيد ${actionLabel}`, { code: 'REAUTH_REQUIRED' });
+    }
+    if (cur.totp_enabled === 1 && cur.totp_secret_enc) {
+      const check = await verifyCurrentTotpWithReplay(cur, body.totpCode || body.code || body.otp, { allowRecovery: false });
+      if (!check.ok) {
+        throw new HttpError(401, `أدخل رمز المصادقة الثنائية الصحيح لتأكيد ${actionLabel}`, { code: '2FA_REQUIRED' });
+      }
+    }
+  }
+
+  r.put('/api/settings', async ({ user, body }) => {
     const f = {};
     if (body.storeName !== undefined) f.store_name = text(body.storeName, 'اسم المتجر', { min: 2, max: 60 });
     if (body.taxId !== undefined) {
@@ -140,15 +181,25 @@ module.exports = (r, app) => {
       const cleanIpa = text(body.instaPayHandle, 'عنوان InstaPay', { max: 60, optional: true });
       f.instapay = cleanIpa ? cipher.encrypt(cleanIpa) : '';
     }
+    let changingContact = false;
     if (!user.is_demo) { // الموبايل والبريد هما بيانات الدخول، فلا تُعدَّل في الحساب التجريبي
       if (body.storePhone !== undefined) {
         f.phone = phone(body.storePhone);
-        if (f.phone !== user.phone) f.phone_verified_at = null;
+        if (f.phone !== user.phone) {
+          f.phone_verified_at = null;
+          changingContact = true;
+        }
       }
       if (body.storeEmail !== undefined) {
         f.email = email(body.storeEmail);
-        if (f.email !== user.email) f.email_verified_at = null;
+        if ((f.email || null) !== (user.email || null)) {
+          f.email_verified_at = null;
+          changingContact = true;
+        }
       }
+    }
+    if (changingContact) {
+      await requireSensitiveReauth(user, body, 'تعديل البريد الإلكتروني أو رقم الموبايل');
     }
     if (f.phone && q('SELECT 1 FROM users WHERE phone = ? AND id <> ?').get(f.phone, user.id)) throw new HttpError(409, 'رقم الموبايل مستخدم في حساب آخر');
     if (f.email && q('SELECT 1 FROM users WHERE email = ? AND id <> ?').get(f.email, user.id)) throw new HttpError(409, 'البريد الإلكتروني مستخدم في حساب آخر');
@@ -165,10 +216,11 @@ module.exports = (r, app) => {
     let targetEmail = user.email;
     if (body && body.email) {
       targetEmail = email(body.email);
-      if (targetEmail && q('SELECT 1 FROM users WHERE email = ? AND id <> ?').get(targetEmail, user.id)) {
-        throw new HttpError(409, 'البريد الإلكتروني مستخدم في حساب آخر');
-      }
-      if (targetEmail !== user.email) {
+      if (targetEmail !== (user.email || null)) {
+        await requireSensitiveReauth(user, body, 'تغيير البريد الإلكتروني');
+        if (targetEmail && q('SELECT 1 FROM users WHERE email = ? AND id <> ?').get(targetEmail, user.id)) {
+          throw new HttpError(409, 'البريد الإلكتروني مستخدم في حساب آخر');
+        }
         q('UPDATE users SET email = ?, email_verified_at = NULL WHERE id = ?').run(targetEmail, user.id);
       }
     }
@@ -179,7 +231,7 @@ module.exports = (r, app) => {
       subject: 'تأكيد البريد الإلكتروني — OrderFlow',
       type: 'verify_email',
       token,
-      url: `${cfg.appUrl || 'http://localhost:3000'}/#/verify-email?token=${token}`,
+      url: app.appUrlPath(`/verify-email?token=${token}`),
       text: `رمز تأكيد بريدك الإلكتروني في OrderFlow هو: ${token}`
     });
     return { ok: true, email: targetEmail, ...(!cfg.enforcedProd ? { devToken: token } : {}) };
@@ -188,10 +240,15 @@ module.exports = (r, app) => {
   // تأكيد البريد الإلكتروني لحساب مسجّل الدخول
   r.post('/api/account/verify-email/confirm', ({ user, body }) => {
     noDemo(user);
-    const row = app.consumeOneTimeToken(body.token, 'verify_email');
-    if (row.user_id !== user.id) throw bad('الرمز غير مخصص لهذا الحساب');
+    const row = app.consumeOneTimeToken(body.token, 'verify_email', (tokenRow) => {
+      if (tokenRow.user_id !== user.id) throw bad('الرمز غير مخصص لهذا الحساب');
+      const cur = reload(user.id);
+      if (!tokenRow.target || !cur.email || cur.email.toLowerCase() !== tokenRow.target.toLowerCase()) {
+        throw bad('الرمز لم يعد مطابقًا لبريدك الإلكتروني الحالي');
+      }
+    });
     const now = nowIso();
-    q('UPDATE users SET email_verified_at = ? WHERE id = ?').run(now, user.id);
+    q('UPDATE users SET email_verified_at = ? WHERE id = ?').run(now, row.user_id);
     const fresh = reload(user.id);
     return { ok: true, me: model.meOf(fresh), settings: model.settingsOf(fresh) };
   });
@@ -225,13 +282,26 @@ module.exports = (r, app) => {
     };
   });
 
-  r.post('/api/account/2fa/setup', ({ user }) => {
+  r.post('/api/account/2fa/setup', async ({ user, body }) => {
     noDemo(user);
+    const cur = reload(user.id);
+    if (cur.totp_enabled === 1) {
+      if (!limiter.hit(`2fa-setup:${user.id}`, 6, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
+      const pwOk = Boolean(body.password && (await verifyPassword(String(body.password), cur.pass_hash)));
+      if (!pwOk) {
+        throw new HttpError(403, 'المصادقة الثنائية مفعّلة بالفعل. أدخل كلمة المرور الحالية ورمز المصادقة الثنائية الحالي لإعادة الإعداد.', { code: '2FA_ALREADY_ENABLED' });
+      }
+      const totpRes = await verifyCurrentTotpWithReplay(cur, body.totpCode || body.code || body.otp, { allowRecovery: false });
+      if (!totpRes.ok) {
+        throw new HttpError(403, 'المصادقة الثنائية مفعّلة بالفعل. أدخل رمز المصادقة الثنائية الحالي الصحيح لإعادة الإعداد.', { code: '2FA_ALREADY_ENABLED' });
+      }
+    }
     const secret = generateTotpSecret();
-    q('UPDATE users SET totp_secret_enc = ?, totp_enabled = 0, totp_last_step = 0 WHERE id = ?').run(cipher.encrypt(secret), user.id);
+    // نخزّن السر الجديد في عمود معلّق فقط دون تعطيل 2FA الحالي أو المساس بـ totp_secret_enc
+    q('UPDATE users SET totp_pending_secret_enc = ? WHERE id = ?').run(cipher.encrypt(secret), user.id);
     const otpauthUri = buildTotpUri({
       secret,
-      accountName: user.email || user.phone || `user-${user.id}`,
+      accountName: cur.email || cur.phone || `user-${cur.id}`,
       issuer: 'OrderFlow'
     });
     return {
@@ -245,14 +315,14 @@ module.exports = (r, app) => {
   r.post('/api/account/2fa/enable', async ({ user, body, res, ip }) => {
     noDemo(user);
     const cur = reload(user.id);
-    if (!cur.totp_secret_enc) throw bad('ابدأ إعداد المصادقة الثنائية أولًا للحصول على المفتاح');
-    const secret = cipher.decrypt(cur.totp_secret_enc);
+    if (!cur.totp_pending_secret_enc) throw bad('ابدأ إعداد المصادقة الثنائية أولًا للحصول على المفتاح');
+    const secret = cipher.decrypt(cur.totp_pending_secret_enc);
     const code = String(body.code || body.totpCode || body.otp || '').trim();
     const step = verifyTotpCode(secret, code);
     if (!step) {
       throw bad('رمز التحقق غير صحيح. تأكد من إدخال الرمز المكوّن من ٦ أرقام من تطبيق المصادقة.');
     }
-    if (step <= Number(cur.totp_last_step || 0)) {
+    if (cur.totp_enabled === 0 && step <= Number(cur.totp_last_step || 0)) {
       throw bad('تم استخدام هذا الرمز بالفعل، انتظر الرمز التالي.');
     }
 
@@ -261,7 +331,7 @@ module.exports = (r, app) => {
     const hashes = await Promise.all(recoveryCodes.map((c) => hashPassword(normalizeRecoveryCode(c))));
     const now = nowIso();
     tx(() => {
-      q('UPDATE users SET totp_enabled = 1, totp_last_step = ? WHERE id = ?').run(step, user.id);
+      q("UPDATE users SET totp_secret_enc = totp_pending_secret_enc, totp_pending_secret_enc = '', totp_enabled = 1, totp_last_step = ? WHERE id = ?").run(step, user.id);
       q('DELETE FROM totp_recovery_codes WHERE user_id = ?').run(user.id);
       const ins = q('INSERT INTO totp_recovery_codes (user_id, code_hash, created_at) VALUES (?, ?, ?)');
       for (const h of hashes) ins.run(user.id, h, now);
@@ -295,13 +365,13 @@ module.exports = (r, app) => {
     }
     const cur = reload(user.id);
     if (cur.totp_enabled && cur.totp_secret_enc) {
-      const code = String(body.code || body.totpCode || body.otp || '').trim();
-      if (!code || !verifyTotpCode(cipher.decrypt(cur.totp_secret_enc), code)) {
+      const check = await verifyCurrentTotpWithReplay(cur, body.code || body.totpCode || body.otp, { allowRecovery: false });
+      if (!check.ok) {
         throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتعطيل الحماية');
       }
     }
     tx(() => {
-      q("UPDATE users SET totp_enabled = 0, totp_secret_enc = '', totp_last_step = 0 WHERE id = ?").run(user.id);
+      q("UPDATE users SET totp_enabled = 0, totp_secret_enc = '', totp_pending_secret_enc = '', totp_last_step = 0 WHERE id = ?").run(user.id);
       q('DELETE FROM totp_recovery_codes WHERE user_id = ?').run(user.id);
     });
     logAudit(user.id, 'security.2fa_disabled', 'user', user.id, { role: user.role }, ip);
@@ -381,10 +451,11 @@ module.exports = (r, app) => {
     if (!(await verifyPassword(String(body.password ?? ''), user.pass_hash))) {
       throw new HttpError(403, 'كلمة المرور غير صحيحة');
     }
-    if (user.totp_enabled && user.totp_secret_enc) {
-      const code = String(body.code || body.totpCode || body.otp || '').trim();
-      if (!code || !verifyTotpCode(cipher.decrypt(user.totp_secret_enc), code)) {
-        throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد طلب حذف الحساب');
+    const cur = reload(user.id);
+    if (cur.totp_enabled && cur.totp_secret_enc) {
+      const check = await verifyCurrentTotpWithReplay(cur, body.code || body.totpCode || body.otp, { allowRecovery: true });
+      if (!check.ok) {
+        throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد طلب حذف الحساب', { code: '2FA_REQUIRED' });
       }
     }
     const now = nowIso();
@@ -562,8 +633,15 @@ module.exports = (r, app) => {
   r.post('/api/account/password', async ({ user, body, res, ip }) => {
     noDemo(user);
     if (!limiter.hit(`pw:${user.id}`, 5, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
-    if (!(await verifyPassword(String(body.current ?? ''), user.pass_hash))) throw new HttpError(403, 'كلمة المرور الحالية غير صحيحة');
-    const hash = await hashPassword(password(body.next, user.phone));
+    const cur = reload(user.id);
+    if (!(await verifyPassword(String(body.current ?? ''), cur.pass_hash))) throw new HttpError(403, 'كلمة المرور الحالية غير صحيحة');
+    if (cur.totp_enabled === 1 && cur.totp_secret_enc) {
+      const check = await verifyCurrentTotpWithReplay(cur, body.totpCode || body.code || body.otp, { allowRecovery: false });
+      if (!check.ok) {
+        throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد تغيير كلمة المرور', { code: '2FA_REQUIRED' });
+      }
+    }
+    const hash = await hashPassword(password(body.next, cur.phone));
     q('UPDATE users SET pass_hash = ?, token_ver = token_ver + 1 WHERE id = ?').run(hash, user.id);
     logAudit(user.id, 'security.password_change', 'user', user.id, { role: user.role }, ip);
     session.issue(res, reload(user.id)); // تنتهي الجلسات الأخرى ونُبقي هذه
@@ -576,24 +654,11 @@ module.exports = (r, app) => {
     }
     if (!user.is_demo) {
       if (!limiter.hit(`pw:${user.id}`, 5, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
-      if (!(await verifyPassword(String(body.password ?? ''), user.pass_hash))) throw new HttpError(403, 'كلمة المرور غير صحيحة');
-      if (user.totp_enabled && user.totp_secret_enc) {
-        const code = String(body.code || body.totpCode || body.otp || '').trim();
-        let valid2fa = Boolean(code && verifyTotpCode(cipher.decrypt(user.totp_secret_enc), code));
-        if (!valid2fa && code) {
-          const normRec = normalizeRecoveryCode(code);
-          if (normRec.length >= 8) {
-            const recs = q('SELECT id, code_hash FROM totp_recovery_codes WHERE user_id = ? AND used_at IS NULL').all(user.id);
-            for (const rec of recs) {
-              if (await verifyPassword(normRec, rec.code_hash)) {
-                q('UPDATE totp_recovery_codes SET used_at = ? WHERE id = ?').run(nowIso(), rec.id);
-                valid2fa = true;
-                break;
-              }
-            }
-          }
-        }
-        if (!valid2fa) {
+      const cur = reload(user.id);
+      if (!(await verifyPassword(String(body.password ?? ''), cur.pass_hash))) throw new HttpError(403, 'كلمة المرور غير صحيحة');
+      if (cur.totp_enabled && cur.totp_secret_enc) {
+        const check = await verifyCurrentTotpWithReplay(cur, body.code || body.totpCode || body.otp, { allowRecovery: true });
+        if (!check.ok) {
           throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد حذف الحساب', { code: '2FA_REQUIRED' });
         }
       }

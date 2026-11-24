@@ -27,7 +27,7 @@
    ```
 3. أوقف الخادم مؤقتًا (وضع صيانة) لمنع الكتابة المتزامنة أثناء التدوير، ثم نفّذ سكربت التدوير الذرّي (داخل معاملة SQLite واحدة):
    ```bash
-   OLD_KEY="<المفتاح_القديم>" NEW_KEY="<المفتاح_الجديد>" DB_PATH="data/orderflow.db" node scripts/rotate-encryption-key.js
+   OLD_KEY="<المفتاح_القديم>" NEW_KEY="<المفتاح_الجديد>" DB_PATH="data/omniarab.db" node scripts/rotate-encryption-key.js
    ```
 4. حدّث `DATA_ENCRYPTION_KEY` بالقيمة الجديدة في بيئة التشغيل وأعد تشغيل الخادم.
 5. تحقق من صحة عرض الطلبات والعملاء وربط المنصات، ثم احذف المفتاح القديم من مدير الأسرار.

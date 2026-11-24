@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, setImpersonationToken } from '@/lib/api';
 import { useBootstrap } from '@/lib/useBootstrap';
 import { fmtDate, fmtEGP, fmtNum } from '@/lib/format';
 import type { ServiceRequest, SupportTicket } from '@/lib/types';
@@ -29,8 +30,21 @@ interface ClientRow {
   phone: string;
   planName: string;
   plan?: string;
+  planCycle?: string;
+  planExpiresAt?: string | null;
   status: string;
+  rejectReason?: string;
+  productsCount?: number;
+  ordersCount?: number;
+  totalPaid?: number;
   createdAt: string;
+}
+
+interface ClientDetailData {
+  client: ClientRow;
+  counts?: { products?: number; orders?: number; lowStock?: number };
+  payments?: PaymentRow[];
+  auditLogs?: AuditRow[];
 }
 
 interface ModeratorRow {
@@ -130,11 +144,20 @@ interface ReadinessData {
 }
 
 export default function OwnerPanelPage() {
+  const router = useRouter();
   const { data: boot } = useBootstrap('owner');
   const [tab, setTab] = useState<OwnerTab>('overview');
   const [kpis, setKpis] = useState<Record<string, number>>({});
   const [clients, setClients] = useState<ClientRow[]>([]);
   const [clientQuery, setClientQuery] = useState('');
+  const [selectedClient, setSelectedClient] = useState<ClientDetailData | null>(null);
+  const [loadingClientDetail, setLoadingClientDetail] = useState(false);
+  const [planForm, setPlanForm] = useState<{ plan: string; cycle: string }>({ plan: 'pro', cycle: 'monthly' });
+  const [rejectModalClient, setRejectModalClient] = useState<ClientRow | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [refundModalPayment, setRefundModalPayment] = useState<PaymentRow | null>(null);
+  const [refundReason, setRefundReason] = useState('استرداد بناءً على طلب العميل');
+  const [refundDowngrade, setRefundDowngrade] = useState(true);
   const [moderators, setModerators] = useState<ModeratorRow[]>([]);
   const [permMeta, setPermMeta] = useState<Array<{ key: string; label: string }>>([]);
   const [modForm, setModForm] = useState({ fullName: '', email: '', phone: '', password: '' });
@@ -153,6 +176,33 @@ export default function OwnerPanelPage() {
   const [replyText, setReplyText] = useState<Record<number, string>>({});
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+
+  async function openClientDetail(clientId: number) {
+    setLoadingClientDetail(true);
+    setError('');
+    try {
+      const res = await api.get<ClientDetailData>(`/api/owner/clients/${clientId}`);
+      setSelectedClient(res);
+      setPlanForm({ plan: res.client.plan || 'free', cycle: res.client.planCycle || 'monthly' });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'تعذر تحميل تفاصيل العميل');
+    } finally {
+      setLoadingClientDetail(false);
+    }
+  }
+
+  async function startImpersonation(client: ClientRow) {
+    setError('');
+    try {
+      const res = await api.post<{ token?: string; impersonationToken?: string }>(`/api/owner/clients/${client.id}/impersonate`, {});
+      const tok = res.token || res.impersonationToken;
+      if (!tok) throw new ApiError(500, 'لم يتم استلام رمز المعاينة');
+      setImpersonationToken(tok, client.storeName);
+      router.push('/dashboard');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'تعذر بدء معاينة حساب العميل');
+    }
+  }
 
   async function loadTab(activeTab: OwnerTab, q = clientQuery) {
     setError('');
@@ -424,25 +474,160 @@ export default function OwnerPanelPage() {
                     <td className="p-3 text-xs" dir="ltr">{c.email || c.phone}</td>
                     <td className="p-3">{c.planName}</td>
                     <td className="p-3">{c.status}</td>
-                    <td className="p-3 flex flex-wrap gap-1.5">
-                      {c.status !== 'active' && (
-                        <button type="button" onClick={() => void runAction(async () => { await api.post(`/api/owner/clients/${c.id}/approve`, {}); }, 'تم تفعيل حساب العميل ✓')} className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-bold text-white">
-                          تفعيل
+                      <td className="p-3 flex flex-wrap gap-1.5">
+                        <button type="button" onClick={() => void openClientDetail(c.id)} className="rounded-lg border border-[var(--border)] px-2.5 py-1 text-xs font-bold">
+                          التفاصيل والباقة
                         </button>
-                      )}
-                      {c.status === 'active' && (
-                        <button type="button" onClick={() => void runAction(async () => { await api.post(`/api/owner/clients/${c.id}/status`, { status: 'suspended', reason: 'إيقاف إداري' }); }, 'تم تعليق الحساب')} className="rounded-lg border border-rose-500/40 px-3 py-1 text-xs font-bold text-rose-600">
-                          تعليق
+                        <button type="button" onClick={() => void startImpersonation(c)} className="rounded-lg border border-[#0C5CA4]/40 px-2.5 py-1 text-xs font-bold text-[#0C5CA4] dark:text-sky-400">
+                          معاينة (قراءة فقط)
                         </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                        {c.status !== 'active' && (
+                          <button type="button" onClick={() => void runAction(async () => { await api.post(`/api/owner/clients/${c.id}/approve`, {}); }, 'تم تفعيل حساب العميل ✓')} className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-bold text-white">
+                            تفعيل
+                          </button>
+                        )}
+                        {c.status === 'pending' && (
+                          <button type="button" onClick={() => { setRejectModalClient(c); setRejectReason(''); }} className="rounded-lg bg-rose-600 px-2.5 py-1 text-xs font-bold text-white">
+                            رفض
+                          </button>
+                        )}
+                        {c.status === 'active' && (
+                          <button type="button" onClick={() => void runAction(async () => { await api.post(`/api/owner/clients/${c.id}/status`, { status: 'suspended', reason: 'إيقاف إداري' }); }, 'تم تعليق الحساب')} className="rounded-lg border border-rose-500/40 px-2.5 py-1 text-xs font-bold text-rose-600">
+                            تعليق
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {loadingClientDetail && (
+              <div className="of-card p-5 text-sm text-[var(--muted)]">جارٍ تحميل تفاصيل المتجر...</div>
+            )}
+
+            {selectedClient && (
+              <section className="of-card p-6 space-y-5 border-2 border-[#0C5CA4]/30">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-lg font-extrabold">{selectedClient.client.storeName}</h3>
+                    <div className="text-xs text-[var(--muted)]">
+                      {selectedClient.client.fullName} · <span dir="ltr">{selectedClient.client.email || selectedClient.client.phone}</span> · الحالة: <strong>{selectedClient.client.status}</strong>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => void startImpersonation(selectedClient.client)} className="rounded-lg bg-[#0C5CA4] px-3 py-1.5 text-xs font-bold text-white">
+                      دخول معاينة قراءة فقط
+                    </button>
+                    <button type="button" onClick={() => setSelectedClient(null)} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-bold">
+                      إغلاق
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+                  <div className="rounded-xl bg-[var(--surface-alt)] p-3">
+                    <div className="text-[11px] text-[var(--muted)]">المنتجات</div>
+                    <div className="text-lg font-extrabold font-mono-num">{fmtNum(selectedClient.counts?.products ?? selectedClient.client.productsCount)}</div>
+                  </div>
+                  <div className="rounded-xl bg-[var(--surface-alt)] p-3">
+                    <div className="text-[11px] text-[var(--muted)]">الطلبات</div>
+                    <div className="text-lg font-extrabold font-mono-num">{fmtNum(selectedClient.counts?.orders ?? selectedClient.client.ordersCount)}</div>
+                  </div>
+                  <div className="rounded-xl bg-[var(--surface-alt)] p-3">
+                    <div className="text-[11px] text-[var(--muted)]">الباقة الحالية</div>
+                    <div className="text-sm font-extrabold">{selectedClient.client.planName}</div>
+                  </div>
+                  <div className="rounded-xl bg-[var(--surface-alt)] p-3">
+                    <div className="text-[11px] text-[var(--muted)]">إجمالي المدفوع</div>
+                    <div className="text-lg font-extrabold font-mono-num text-emerald-600">{fmtEGP(selectedClient.client.totalPaid)}</div>
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void runAction(async () => {
+                      await api.post(`/api/owner/clients/${selectedClient.client.id}/plan`, planForm);
+                      await openClientDetail(selectedClient.client.id);
+                    }, 'تم تحديث باقة التاجر بنجاح ✓');
+                  }}
+                  className="rounded-xl border border-[var(--border)] p-4 flex flex-wrap items-end gap-3"
+                >
+                  <div>
+                    <label className="text-xs font-bold block mb-1">تغيير الباقة</label>
+                    <select className="of-input" value={planForm.plan} onChange={(e) => setPlanForm((p) => ({ ...p, plan: e.target.value }))}>
+                      <option value="free">مجانية (Free)</option>
+                      <option value="pro">احترافية (Pro)</option>
+                      <option value="business">أعمال (Business)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold block mb-1">دورة الفوترة</label>
+                    <select className="of-input" value={planForm.cycle} onChange={(e) => setPlanForm((p) => ({ ...p, cycle: e.target.value }))}>
+                      <option value="monthly">شهري (30 يومًا)</option>
+                      <option value="yearly">سنوي (365 يومًا)</option>
+                    </select>
+                  </div>
+                  <button type="submit" className="rounded-xl bg-[#0C5CA4] px-4 py-2.5 text-xs font-bold text-white">
+                    حفظ الباقة
+                  </button>
+                </form>
+
+                {selectedClient.payments && selectedClient.payments.length > 0 && (
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-extrabold">آخر المدفوعات ({selectedClient.payments.length})</h4>
+                    <div className="space-y-1.5">
+                      {selectedClient.payments.slice(0, 5).map((p) => (
+                        <div key={p.id} className="rounded-lg border border-[var(--border)] px-3 py-2 flex justify-between text-xs">
+                          <span className="font-mono-num" dir="ltr">{p.txRef}</span>
+                          <span>{p.plan} · {fmtEGP(p.amount)} · <strong>{p.status}</strong></span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {rejectModalClient && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const target = rejectModalClient;
+                    setRejectModalClient(null);
+                    void runAction(async () => {
+                      await api.post(`/api/owner/clients/${target.id}/reject`, { reason: rejectReason.trim() });
+                    }, 'تم رفض طلب العميل وإرسال الإشعار ✓');
+                  }}
+                  className="of-card w-full max-w-md p-6 space-y-4"
+                >
+                  <h3 className="font-extrabold text-base">رفض حساب المتجر: {rejectModalClient.storeName}</h3>
+                  <div>
+                    <label className="text-xs font-bold block mb-1">سبب الرفض (سيظهر للتاجر في البريد)</label>
+                    <textarea
+                      className="of-input min-h-[90px]"
+                      placeholder="مثال: بيانات السجل التجاري غير مكتملة..."
+                      value={rejectReason}
+                      onChange={(e) => setRejectReason(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button type="button" onClick={() => setRejectModalClient(null)} className="rounded-xl border border-[var(--border)] px-4 py-2 text-xs font-bold">
+                      إلغاء
+                    </button>
+                    <button type="submit" className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white">
+                      تأكيد الرفض
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        )}
 
       {tab === 'moderators' && (
         <div className="space-y-6">
@@ -574,6 +759,7 @@ export default function OwnerPanelPage() {
                   <th className="p-3">المبلغ</th>
                   <th className="p-3">الحالة</th>
                   <th className="p-3">التاريخ</th>
+                  <th className="p-3">إجراءات</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--border)]">
@@ -585,11 +771,60 @@ export default function OwnerPanelPage() {
                     <td className="p-3 font-mono-num font-bold">{fmtEGP(p.amount)}</td>
                     <td className="p-3">{p.status}</td>
                     <td className="p-3 text-xs text-[var(--muted)]">{fmtDate(p.createdAt)}</td>
+                    <td className="p-3">
+                      {p.status === 'paid' && (
+                        <button
+                          type="button"
+                          onClick={() => { setRefundModalPayment(p); setRefundReason('استرداد بناءً على طلب العميل'); setRefundDowngrade(true); }}
+                          className="rounded-lg border border-rose-500/40 px-2.5 py-1 text-xs font-bold text-rose-600"
+                        >
+                          استرداد
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          {refundModalPayment && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const target = refundModalPayment;
+                  setRefundModalPayment(null);
+                  void runAction(async () => {
+                    await api.post(`/api/owner/payments/${target.id}/refund`, {
+                      reason: refundReason.trim(),
+                      downgrade: refundDowngrade
+                    });
+                  }, `تم تسجيل استرداد العملية #${target.txRef} بنجاح ✓`);
+                }}
+                className="of-card w-full max-w-md p-6 space-y-4"
+              >
+                <h3 className="font-extrabold text-base">تأكيد استرداد دفعة ({fmtEGP(refundModalPayment.amount)})</h3>
+                <p className="text-xs text-[var(--muted)]">المرجع: <span dir="ltr" className="font-mono-num">{refundModalPayment.txRef}</span> — المتجر: {refundModalPayment.storeName || '—'}</p>
+                <div>
+                  <label className="text-xs font-bold block mb-1">سبب الاسترداد</label>
+                  <input className="of-input" value={refundReason} onChange={(e) => setRefundReason(e.target.value)} required />
+                </div>
+                <label className="flex items-center gap-2 text-xs font-bold cursor-pointer">
+                  <input type="checkbox" checked={refundDowngrade} onChange={(e) => setRefundDowngrade(e.target.checked)} />
+                  <span>إرجاع المتجر للباقة المجانية (Free) فور الاسترداد</span>
+                </label>
+                <div className="flex justify-end gap-2">
+                  <button type="button" onClick={() => setRefundModalPayment(null)} className="rounded-xl border border-[var(--border)] px-4 py-2 text-xs font-bold">
+                    إلغاء
+                  </button>
+                  <button type="submit" className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white">
+                    تأكيد الاسترداد
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
 
           <section className="of-card p-5 space-y-4">
             <h3 className="font-extrabold text-sm">إدارة كوبونات الخصم</h3>
@@ -799,7 +1034,10 @@ export default function OwnerPanelPage() {
             <div className="flex items-center justify-between">
               <h2 className="font-extrabold text-base">النسخ الاحتياطي المشفّر</h2>
               <div className="flex gap-2">
-                <button type="button" onClick={() => void runAction(async () => { await api.post('/api/owner/backups/test-s3', {}); }, 'تم اختبار اتصال S3')} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-bold">
+                <button type="button" onClick={() => void runAction(async () => {
+                  const r = await api.post<{ ok?: boolean; error?: string }>('/api/owner/backups/test-s3', {});
+                  if (!r.ok) throw new ApiError(500, r.error || 'فشل الاتصال بـ S3');
+                }, 'نجح اختبار اتصال S3 ✓')} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-bold">
                   اختبار S3
                 </button>
                 <button type="button" onClick={() => void runAction(async () => { await api.post('/api/owner/backup', {}); }, 'تم إنشاء نسخة احتياطية جديدة ✓')} className="rounded-lg bg-[#0C5CA4] px-3 py-1.5 text-xs font-bold text-white">

@@ -2757,6 +2757,19 @@ views.set = () => `
         </div>
       </div>
 
+      ${!me.isDemo ? `
+      <div class="grid-equal" style="gap:12px;margin-top:8px">
+        <div>
+          <label for="set-cur-pass">كلمة المرور الحالية (مطلوبة عند تغيير البريد أو الموبايل)</label>
+          <input id="set-cur-pass" type="password" autocomplete="current-password" placeholder="أدخل كلمة المرور للتأكيد">
+        </div>
+        ${me.totpEnabled ? `
+        <div>
+          <label for="set-cur-totp">رمز المصادقة الثنائية 2FA (٦ أرقام)</label>
+          <input id="set-cur-totp" dir="ltr" inputmode="numeric" maxlength="6" placeholder="123456">
+        </div>` : ''}
+      </div>` : ''}
+
       <button class="btn" data-a="save-settings">💾 حفظ إعدادات المتجر</button>
     </div>
 
@@ -5819,6 +5832,10 @@ act('save-settings', async () => {
   if (!me.isDemo) {
     body.storePhone = $('#set-phone').value.trim() || state.storePhone;
     body.storeEmail = $('#set-email').value.trim();
+    const curPass = $('#set-cur-pass')?.value || '';
+    const curTotp = $('#set-cur-totp')?.value?.trim() || '';
+    if (curPass) body.currentPassword = curPass;
+    if (curTotp) body.totpCode = curTotp;
   }
   const r = await api('PUT', '/api/settings', body);
   Object.assign(state, r.settings);

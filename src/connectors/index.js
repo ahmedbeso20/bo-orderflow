@@ -520,6 +520,32 @@ const ADAPTERS = {
         cat: 'أمازون مصر'
       })).filter((p) => p.sku);
 
+      // سحب عروض التاجر (FBM / Listings Items) لدمج المنتجات غير المخزّنة في FBA
+      try {
+        const listRes = await callWithRetry(
+          () => callJson(fetchFn, `${base}/listings/2021-08-01/items/${encodeURIComponent(creds.sellerId)}?marketplaceIds=${encodeURIComponent(mpId)}&includedData=summaries,fulfillmentAvailability`, { headers: invHeaders }),
+          { ...ctx.retryOpts, maxRetries: 1 }
+        ).catch(() => ({ ok: false, data: {} }));
+        if (listRes.ok) {
+          const seen = new Set(products.map((p) => p.sku));
+          const items = listRes.data?.items || listRes.data?.payload?.items || [];
+          for (const it of items) {
+            const sku = String(it.sku || '').trim();
+            if (!sku || seen.has(sku)) continue;
+            seen.add(sku);
+            const sum = Array.isArray(it.summaries) ? it.summaries[0] : {};
+            const avail = Array.isArray(it.fulfillmentAvailability) ? it.fulfillmentAvailability[0] : {};
+            products.push({
+              sku,
+              name: String(sum?.itemName || sku).trim(),
+              price: Number(it.offers?.[0]?.price?.amount || 0) || 100,
+              stock: Math.max(0, Number(avail?.quantity ?? 0) || 0),
+              cat: 'أمازون مصر (FBM)'
+            });
+          }
+        }
+      } catch (_) {}
+
       const orders = [];
       for (const o of rawOrders) {
         const externalRef = String(o.AmazonOrderId || '').trim();
@@ -546,6 +572,8 @@ const ADAPTERS = {
           }
         } catch (_) {}
 
+        const fulfillmentChannel = String(o.FulfillmentChannel || 'MFN').toUpperCase();
+        const isFba = fulfillmentChannel === 'AFN';
         orders.push({
           externalRef,
           customer: String(o.BuyerInfo?.BuyerName || o.ShippingAddress?.Name || 'عميل أمازون').trim(),
@@ -554,6 +582,9 @@ const ADAPTERS = {
           address: String(o.ShippingAddress?.AddressLine1 || '').trim(),
           total: Math.max(1, Number(o.OrderTotal?.Amount || 0) || 1),
           pay: o.PaymentMethod === 'COD' ? 'عند الاستلام' : 'بطاقة بنكية',
+          courier: isFba ? 'شحن أمازون (FBA)' : 'بوسطة',
+          shipFee: isFba ? 0 : 38,
+          fulfillmentChannel,
           status: this.mapOrderStatus(o),
           items: itemsText,
           orderItems,
@@ -562,6 +593,27 @@ const ADAPTERS = {
       }
 
       return { products, orders };
+    },
+
+    async pushStock(creds, env, sku, qty, fetchFn, ctx = {}) {
+      const token = await this.getAccessToken(creds, fetchFn, ctx);
+      const base = env === 'sandbox' ? PLATFORM_SCHEMAS.a.sandboxBaseUrl : PLATFORM_SCHEMAS.a.defaultBaseUrl;
+      const mpId = creds.marketplaceId || 'ARBP9OOSHTCHU';
+      const url = `${base}/listings/2021-08-01/items/${encodeURIComponent(creds.sellerId)}/${encodeURIComponent(sku)}?marketplaceIds=${encodeURIComponent(mpId)}`;
+      const res = await callWithRetry(() => callJson(fetchFn, url, {
+        method: 'PATCH',
+        headers: { 'x-amz-access-token': token, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          productType: 'PRODUCT',
+          patches: [{
+            op: 'replace',
+            path: '/attributes/fulfillment_availability',
+            value: [{ fulfillment_channel_code: 'DEFAULT', quantity: Math.max(0, Math.round(Number(qty) || 0)) }]
+          }]
+        })
+      }), ctx.retryOpts);
+      if (!res.ok) throw connectorHttpError('Amazon SP-API', res, 'تحديث مخزون');
+      return { ok: true, sku, qty };
     }
   },
 
@@ -623,20 +675,43 @@ const ADAPTERS = {
         cat: 'نون مصر'
       })).filter((p) => p.sku);
 
-      const orders = rawOrders.map((o) => ({
-        externalRef: String(o.order_nr || o.id || '').trim(),
-        customer: String(o.customer_name || 'عميل نون').trim(),
-        phone: String(o.customer_phone || o.phone || '').trim(),
-        gov: String(o.city || o.governorate || 'القاهرة').trim(),
-        address: String(o.address || '').trim(),
-        total: Math.max(1, Number(o.total_amount || o.price || 0) || 1),
-        pay: /cod/i.test(String(o.payment_method || '')) ? 'عند الاستلام' : 'بطاقة بنكية',
-        status: /deliver/i.test(String(o.status || '')) ? 2 : /ship/i.test(String(o.status || '')) ? 1 : /cancel/i.test(String(o.status || '')) ? 4 : 0,
-        items: `طلب نون #${o.order_nr || o.id || ''}`,
-        createdAt: o.created_at || nowIso()
-      })).filter((o) => o.externalRef);
+      const orders = rawOrders.map((o) => {
+        const isFbn = /fbn|express/i.test(String(o.fulfillment_type || o.fulfillment_channel || ''));
+        return {
+          externalRef: String(o.order_nr || o.id || '').trim(),
+          customer: String(o.customer_name || 'عميل نون').trim(),
+          phone: String(o.customer_phone || o.phone || '').trim(),
+          gov: String(o.city || o.governorate || 'القاهرة').trim(),
+          address: String(o.address || '').trim(),
+          total: Math.max(1, Number(o.total_amount || o.price || 0) || 1),
+          pay: /cod/i.test(String(o.payment_method || '')) ? 'عند الاستلام' : 'بطاقة بنكية',
+          courier: isFbn ? 'نون إكسبريس (FBN)' : 'بوسطة',
+          shipFee: isFbn ? 0 : 38,
+          fulfillmentChannel: isFbn ? 'FBN' : 'FBP',
+          status: /deliver/i.test(String(o.status || '')) ? 2 : /ship/i.test(String(o.status || '')) ? 1 : /cancel/i.test(String(o.status || '')) ? 4 : 0,
+          items: `طلب نون #${o.order_nr || o.id || ''}`,
+          orderItems: Array.isArray(o.items) ? o.items.map((it) => ({
+            sku: String(it.partner_sku || it.sku || '').trim(),
+            name: String(it.title || it.name || it.partner_sku || 'منتج نون').trim(),
+            qty: Math.max(1, Number(it.quantity || it.qty || 1)),
+            price: Number(it.price || 0)
+          })) : [],
+          createdAt: o.created_at || nowIso()
+        };
+      }).filter((o) => o.externalRef);
 
       return { products, orders };
+    },
+
+    async pushStock(creds, _env, sku, qty, fetchFn, ctx = {}) {
+      const { base, headers } = await this.getAuthHeaders(creds, fetchFn, ctx);
+      const res = await callWithRetry(() => callJson(fetchFn, `${base}/stock/v1/stock-update`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ items: [{ partner_sku: sku, quantity: Math.max(0, Math.round(Number(qty) || 0)) }] })
+      }), ctx.retryOpts);
+      if (!res.ok) throw connectorHttpError('Noon Partners', res, 'تحديث مخزون');
+      return { ok: true, sku, qty };
     }
   },
 
@@ -734,6 +809,17 @@ const ADAPTERS = {
       })).filter((o) => o.externalRef);
 
       return { products, orders };
+    },
+
+    async pushStock(creds, env, sku, qty, fetchFn, ctx = {}) {
+      const { base, headers } = await this.getAuthHeaders(creds, env, fetchFn, ctx);
+      const res = await callWithRetry(() => callJson(fetchFn, `${base}/catalog/stock`, {
+        method: 'PUT',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ products: [{ sellerSku: sku, stock: Math.max(0, Math.round(Number(qty) || 0)) }] })
+      }), ctx.retryOpts);
+      if (!res.ok) throw connectorHttpError('Jumia Vendor Center', res, 'تحديث مخزون');
+      return { ok: true, sku, qty };
     }
   },
 
@@ -825,6 +911,18 @@ const ADAPTERS = {
       })).filter((o) => o.externalRef);
 
       return { products, orders };
+    },
+
+    async pushStock(creds, env, sku, qty, fetchFn, ctx = {}) {
+      const base = env === 'sandbox' ? PLATFORM_SCHEMAS.t.sandboxBaseUrl : PLATFORM_SCHEMAS.t.defaultBaseUrl;
+      const sid = encodeURIComponent(creds.supplierId);
+      const res = await callWithRetry(() => callJson(fetchFn, `${base}/integration/inventory/sellers/${sid}/products/price-and-inventory`, {
+        method: 'POST',
+        headers: { ...this.headers(creds), 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ barcode: sku, quantity: Math.max(0, Math.round(Number(qty) || 0)) }] })
+      }), ctx.retryOpts);
+      if (!res.ok) throw connectorHttpError('Trendyol', res, 'تحديث مخزون');
+      return { ok: true, sku, qty };
     }
   },
 
@@ -898,6 +996,20 @@ const ADAPTERS = {
       })).filter((o) => o.externalRef);
 
       return { products, orders };
+    },
+
+    async pushStock(creds, env, sku, qty, fetchFn, ctx = {}) {
+      const base = assertSafeExternalUrl(
+        creds.baseUrl || (env === 'sandbox' ? PLATFORM_SCHEMAS.k.sandboxBaseUrl : PLATFORM_SCHEMAS.k.defaultBaseUrl),
+        'رابط كنز API'
+      );
+      const res = await callWithRetry(() => callJson(fetchFn, `${base}/products/${encodeURIComponent(sku)}/stock`, {
+        method: 'PATCH',
+        headers: { ...this.headers(creds), 'content-type': 'application/json' },
+        body: JSON.stringify({ sku, stock: Math.max(0, Math.round(Number(qty) || 0)) })
+      }), ctx.retryOpts);
+      if (!res.ok) throw connectorHttpError('Kenzz', res, 'تحديث مخزون');
+      return { ok: true, sku, qty };
     }
   }
 };
@@ -1146,7 +1258,37 @@ function createConnectors(app) {
           }
           nextSeq += 1;
           const total = Math.max(1, Number(o.total) || 1);
-          const costTotal = Math.round(total * 0.65);
+          const fulfillmentChannel = String(o.fulfillmentChannel || '').trim();
+          const isMarketplaceFulfilled = /^(AFN|FBN|FBJ)$/i.test(fulfillmentChannel);
+          const orderCourier = String(o.courier || (isMarketplaceFulfilled ? `شحن ${MARKETS[platform]?.name || platform}` : 'بوسطة')).slice(0, 60);
+          const orderShipFee = Number.isFinite(Number(o.shipFee)) ? Math.max(0, Number(o.shipFee)) : (isMarketplaceFulfilled ? 0 : 38);
+
+          // مطابقة عناصر الطلب بـ SKU في كتالوج التاجر لحساب التكلفة الفعلية (بدون تخمين 65% صامت)
+          const resolvedItems = [];
+          let matchedCostTotal = 0;
+          let allItemsMatched = Array.isArray(o.orderItems) && o.orderItems.length > 0;
+          if (Array.isArray(o.orderItems) && o.orderItems.length) {
+            for (const it of o.orderItems) {
+              const sku = String(it.sku || '').trim();
+              const qty = Math.max(1, Number(it.qty) || 1);
+              const matchedProd = sku ? q('SELECT id, name, cost, stock FROM products WHERE user_id = ? AND sku = ?').get(userId, sku) : null;
+              if (matchedProd && Number(matchedProd.cost) > 0) {
+                matchedCostTotal += Number(matchedProd.cost) * qty;
+              } else {
+                allItemsMatched = false;
+              }
+              resolvedItems.push({
+                productId: matchedProd ? matchedProd.id : null,
+                name: String(it.name || matchedProd?.name || 'منتج').slice(0, 120),
+                qty,
+                price: Number(it.price) || 0,
+                cost: matchedProd ? Number(matchedProd.cost || 0) : 0
+              });
+            }
+          }
+          const costEstimated = allItemsMatched ? 0 : 1;
+          const costTotal = allItemsMatched ? Math.round(matchedCostTotal * 100) / 100 : (matchedCostTotal > 0 ? Math.round(matchedCostTotal * 100) / 100 : 0);
+
           const custName = String(o.customer || 'عميل المنصة').slice(0, 80);
           const custPhone = String(o.phone || '').slice(0, 30);
           const custGov = String(o.gov || 'القاهرة').slice(0, 40);
@@ -1159,13 +1301,14 @@ function createConnectors(app) {
           const phHash = model?.phoneHash ? model.phoneHash(custPhone) : '';
           const encAddr = model?.enc ? model.enc(custAddr) : custAddr;
           const deliveredAt = nextStatus === 2 ? now : null;
-          const orderId = Number(q(`INSERT INTO orders (user_id, customer_id, no, market, customer, phone, phone_hash, gov, address, pay, courier, total, cost_total, ship_fee, status, items, approval_status, external_ref, source, delivered_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'بوسطة', ?, ?, 38, ?, ?, 'approved', ?, ?, ?, ?)`)
+          const orderId = Number(q(`INSERT INTO orders (user_id, customer_id, no, market, customer, phone, phone_hash, gov, address, pay, courier, total, cost_total, cost_estimated, ship_fee, fulfillment_channel, status, items, approval_status, external_ref, source, delivered_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?)`)
             .run(
               userId, customerId, nextSeq, platform,
               encName, encPhone, phHash, custGov, encAddr,
               String(o.pay || 'عند الاستلام'),
-              total, costTotal,
+              orderCourier,
+              total, costTotal, costEstimated, orderShipFee, fulfillmentChannel,
               nextStatus,
               String(o.items || `طلب ${MARKETS[platform]?.name || platform}`).slice(0, 240),
               extRef,
@@ -1173,10 +1316,13 @@ function createConnectors(app) {
               deliveredAt,
               String(o.createdAt || now)
             ).lastInsertRowid);
-          if (Array.isArray(o.orderItems) && o.orderItems.length) {
-            for (const it of o.orderItems) {
-              q('INSERT INTO order_items (order_id, product_id, name, qty, price, cost) VALUES (?, NULL, ?, ?, ?, ?)')
-                .run(orderId, String(it.name || 'منتج').slice(0, 120), Math.max(1, Number(it.qty) || 1), Number(it.price) || 0, Math.round((Number(it.price) || 0) * 0.65));
+          for (const it of resolvedItems) {
+            q('INSERT INTO order_items (order_id, product_id, name, qty, price, cost) VALUES (?, ?, ?, ?, ?, ?)')
+              .run(orderId, it.productId, it.name, it.qty, it.price, it.cost);
+            // خصم المخزون المحلي مرة واحدة فقط عند الاستيراد الجديد لطلبات التاجر غير الملغاة/المرتجعة
+            if (it.productId && !isMarketplaceFulfilled && nextStatus !== 3 && nextStatus !== 4) {
+              q('UPDATE products SET stock = MAX(0, stock - ?), updated_at = ? WHERE id = ? AND user_id = ?')
+                .run(it.qty, now, it.productId, userId);
             }
           }
           importedOrders++;
@@ -1264,6 +1410,102 @@ function createConnectors(app) {
     }
   }
 
+  /**
+   * جدولة دفع تحديثات المخزون ثنائي الاتجاه إلى جميع الأسواق المتصلة للمنتج عبر طابور SQLite (sync_outbox)
+   */
+  function enqueueStockPush(userId, product) {
+    if (!product || !product.sku) return 0;
+    const marketsStr = String(product.markets || '');
+    const activeConns = q(`SELECT platform FROM marketplace_connections
+      WHERE user_id = ? AND enabled = 1 AND creds_enc <> '' AND status IN ('connected', 'configured')`).all(userId);
+    const now = nowIso();
+    let queued = 0;
+    for (const c of activeConns) {
+      if (marketsStr && !marketsStr.includes(c.platform)) continue;
+      // دمج أي مهمة pending سابقة لنفس الـ SKU على نفس المنصة حتى نُرسل أحدث كمية فقط
+      const existing = q("SELECT id FROM sync_outbox WHERE user_id = ? AND platform = ? AND sku = ? AND status = 'pending'").get(userId, c.platform, product.sku);
+      if (existing) {
+        q('UPDATE sync_outbox SET qty = ?, product_id = ?, next_retry_at = ?, updated_at = ? WHERE id = ?')
+          .run(Math.max(0, Number(product.stock) || 0), product.id || null, now, now, existing.id);
+      } else {
+        q(`INSERT INTO sync_outbox (user_id, platform, product_id, sku, qty, status, attempts, next_retry_at, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, '', ?, ?)`)
+          .run(userId, c.platform, product.id || null, product.sku, Math.max(0, Number(product.stock) || 0), now, now, now);
+      }
+      queued++;
+    }
+    return queued;
+  }
+
+  let outboxRunning = false;
+  async function processSyncOutbox(limit = 20) {
+    if (outboxRunning) return { skipped: true, processed: 0, succeeded: 0, failed: 0 };
+    outboxRunning = true;
+    let processed = 0, succeeded = 0, failed = 0;
+    try {
+      const now = nowIso();
+      const jobs = q(`SELECT * FROM sync_outbox
+        WHERE status = 'pending' AND next_retry_at <= ?
+        ORDER BY id ASC LIMIT ?`).all(now, Math.min(100, Math.max(1, Number(limit) || 20)));
+      for (const job of jobs) {
+        processed++;
+        const row = q('SELECT * FROM marketplace_connections WHERE user_id = ? AND platform = ?').get(job.user_id, job.platform);
+        const adapter = ADAPTERS[job.platform];
+        if (!row || !row.creds_enc || !adapter || typeof adapter.pushStock !== 'function') {
+          q("UPDATE sync_outbox SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+            .run('لا يوجد اتصال نشط بهذه المنصة', nowIso(), job.id);
+          failed++;
+          continue;
+        }
+        try {
+          const creds = decryptRowCreds(row);
+          await adapter.pushStock(creds, row.environment || 'production', job.sku, job.qty, guardedFetch, {
+            userId: job.user_id,
+            tokenCache,
+            retryOpts
+          });
+          q("UPDATE sync_outbox SET status = 'done', last_error = '', updated_at = ? WHERE id = ?").run(nowIso(), job.id);
+          succeeded++;
+        } catch (err) {
+          const attempts = Number(job.attempts || 0) + 1;
+          const errMsg = String(err?.message || 'فشل دفع تحديث المخزون').slice(0, 300);
+          if (attempts >= 5) {
+            q("UPDATE sync_outbox SET status = 'failed', attempts = ?, last_error = ?, updated_at = ? WHERE id = ?")
+              .run(attempts, errMsg, nowIso(), job.id);
+          } else {
+            const backoffSec = (2 ** attempts) * 30;
+            const nextRetry = new Date(Date.now() + backoffSec * 1000).toISOString();
+            q("UPDATE sync_outbox SET attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+              .run(attempts, nextRetry, errMsg, nowIso(), job.id);
+          }
+          failed++;
+        }
+      }
+      return { skipped: false, processed, succeeded, failed };
+    } finally {
+      outboxRunning = false;
+    }
+  }
+
+  function listOutbox(userId, limit = 20) {
+    return q('SELECT * FROM sync_outbox WHERE user_id = ? ORDER BY id DESC LIMIT ?')
+      .all(userId, Math.min(50, Math.max(1, Number(limit) || 20)))
+      .map((j) => ({
+        id: j.id,
+        platform: j.platform,
+        platformName: MARKETS[j.platform]?.name || j.platform,
+        productId: j.product_id,
+        sku: j.sku,
+        qty: j.qty,
+        status: j.status,
+        attempts: j.attempts,
+        nextRetryAt: j.next_retry_at,
+        lastError: j.last_error || '',
+        createdAt: j.created_at,
+        updatedAt: j.updated_at
+      }));
+  }
+
   return {
     PLATFORM_KEYS,
     PLATFORM_SCHEMAS,
@@ -1273,7 +1515,10 @@ function createConnectors(app) {
     deleteConnection,
     testConnection,
     syncPlatform,
-    syncAllActiveConnections
+    syncAllActiveConnections,
+    enqueueStockPush,
+    processSyncOutbox,
+    listOutbox
   };
 }
 

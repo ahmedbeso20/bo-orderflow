@@ -47,7 +47,7 @@ export async function middleware(request: NextRequest) {
     };
 
     const role = data?.me?.role;
-    if (!data?.authenticated || !role) return notFoundResponse();
+    if (data?.authenticated === false || !role) return notFoundResponse();
 
     if (isOwnerPath && role !== 'owner') {
       return notFoundResponse();

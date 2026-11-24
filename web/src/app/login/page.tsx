@@ -1,9 +1,10 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '@/lib/api';
+import { TurnstileWidget } from '@/components/TurnstileWidget';
 
 interface LoginResponse {
   ok?: boolean;
@@ -13,15 +14,33 @@ interface LoginResponse {
   me?: { role?: string; setup2faRequired?: boolean };
 }
 
+interface AuthConfig {
+  turnstileEnabled?: boolean;
+  turnstileSiteKey?: string;
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [id, setId] = useState('');
   const [password, setPassword] = useState('');
   const [challengeToken, setChallengeToken] = useState('');
   const [totpCode, setTotpCode] = useState('');
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState('');
+  const [requiresCaptcha, setRequiresCaptcha] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [demoLoading, setDemoLoading] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    api.get<AuthConfig>('/api/auth/config')
+      .then((cfg) => {
+        if (cfg.turnstileEnabled && cfg.turnstileSiteKey) {
+          setTurnstileSiteKey(cfg.turnstileSiteKey);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   function routeAfterAuth(res: LoginResponse) {
     if (res.setup2faRequired || res.me?.setup2faRequired) {
@@ -34,6 +53,10 @@ export default function LoginPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (requiresCaptcha && turnstileSiteKey && !turnstileToken) {
+      setError('يرجى إكمال التحقق الأمني للمتابعة');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -48,7 +71,8 @@ export default function LoginPage() {
 
       const res = await api.post<LoginResponse>('/api/auth/login', {
         id: id.trim(),
-        password
+        password,
+        ...(turnstileToken ? { turnstileToken } : {})
       });
 
       if (res.requires2fa && res.challengeToken) {
@@ -57,19 +81,37 @@ export default function LoginPage() {
       }
       routeAfterAuth(res);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'تعذر تسجيل الدخول');
+      if (err instanceof ApiError) {
+        if (err.data?.requiresCaptcha) {
+          setRequiresCaptcha(true);
+          setTurnstileToken('');
+        }
+        setError(err.message);
+      } else {
+        setError('تعذر تسجيل الدخول');
+      }
     } finally {
       setLoading(false);
     }
   }
 
   async function handleDemo() {
+    if (turnstileSiteKey && !turnstileToken) {
+      setRequiresCaptcha(true);
+      setError('يرجى إكمال التحقق الأمني قبل تشغيل الحساب التجريبي');
+      return;
+    }
     setDemoLoading(true);
     setError('');
     try {
-      const res = await api.post<LoginResponse>('/api/auth/demo', {});
+      const res = await api.post<LoginResponse>('/api/auth/demo', {
+        ...(turnstileToken ? { turnstileToken } : {})
+      });
       routeAfterAuth(res);
     } catch (err) {
+      if (err instanceof ApiError && err.data?.requiresCaptcha) {
+        setRequiresCaptcha(true);
+      }
       setError(err instanceof ApiError ? err.message : 'تعذر تشغيل الحساب التجريبي');
     } finally {
       setDemoLoading(false);
@@ -110,6 +152,9 @@ export default function LoginPage() {
                   required
                 />
               </div>
+              {requiresCaptcha && turnstileSiteKey && (
+                <TurnstileWidget siteKey={turnstileSiteKey} onToken={setTurnstileToken} />
+              )}
             </>
           ) : (
             <div className="space-y-2">

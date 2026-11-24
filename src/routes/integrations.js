@@ -131,4 +131,109 @@ module.exports = (r, app) => {
       connections: connectors.listForUser(user.id)
     };
   });
+
+  /** عرض حالة طابور دفع المخزون الثنائي (sync_outbox) ومعالجته يدويًا */
+  r.get('/api/integrations/outbox', ({ user, query }) => ({
+    items: connectors.listOutbox ? connectors.listOutbox(user.id, Number(query.limit) || 20) : []
+  }));
+
+  r.post('/api/integrations/outbox/process', async ({ user }) => {
+    noDemo(user);
+    const out = connectors.processSyncOutbox ? await connectors.processSyncOutbox(20) : { processed: 0, succeeded: 0, failed: 0 };
+    return { ok: true, ...out, items: connectors.listOutbox ? connectors.listOutbox(user.id, 20) : [] };
+  });
+
+  /** ربط Amazon SP-API بضغطة واحدة عبر LWA OAuth (يستخدم Cookie موقّعة HttpOnly للتحقق من state) */
+  const crypto = require('node:crypto');
+  const { parseCookies } = require('../http');
+  const signState = (payload) => {
+    const raw = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', app.cfg.secret).update(raw).digest('base64url');
+    return `${raw}.${sig}`;
+  };
+  const verifyState = (cookieVal) => {
+    if (!cookieVal || !cookieVal.includes('.')) return null;
+    const [raw, sig] = cookieVal.split('.');
+    const expected = crypto.createHmac('sha256', app.cfg.secret).update(raw).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    try {
+      const obj = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+      if (!obj || Date.now() > Number(obj.exp || 0)) return null;
+      return obj;
+    } catch { return null; }
+  };
+
+  r.get('/api/integrations/amazon/oauth/start', ({ user, res }) => {
+    noDemo(user);
+    const appId = app.cfg.amazonAppId;
+    if (!appId || !app.cfg.amazonClientId || !app.cfg.amazonClientSecret) {
+      throw new HttpError(503, 'لم يتم تفعيل ربط Amazon OAuth الموحّد على الخادم بعد (أضف AMAZON_SP_APP_ID و AMAZON_LWA_CLIENT_ID/SECRET). يمكنك إدخال المفاتيح يدويًا.');
+    }
+    const nonce = crypto.randomBytes(24).toString('base64url');
+    const signed = signState({ nonce, userId: user.id, exp: Date.now() + 600_000 });
+    const secure = app.cfg.enforcedProd ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `of_amz_state=${signed}; Path=/api/integrations/amazon/oauth; HttpOnly; SameSite=Lax; Max-Age=600${secure}`);
+    const base = (app.cfg.appUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const redirectUri = `${base}/api/integrations/amazon/oauth/callback`;
+    const authUrl = `https://sellercentral.amazon.eg/apps/authorize/consent?application_id=${encodeURIComponent(appId)}&state=${encodeURIComponent(nonce)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    return { ok: true, authUrl };
+  });
+
+  r.get('/api/integrations/amazon/oauth/callback', async ({ req, res, query, ip }) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const stateObj = verifyState(cookies.of_amz_state);
+    const secure = app.cfg.enforcedProd ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `of_amz_state=; Path=/api/integrations/amazon/oauth; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
+
+    const code = String(query.spapi_oauth_code || '').trim();
+    const state = String(query.state || '').trim();
+    const sellerId = String(query.selling_partner_id || '').trim();
+    if (!stateObj || !state || stateObj.nonce !== state) {
+      throw new HttpError(400, 'رمز التحقق (OAuth State) غير صالح أو منتهي الصلاحية');
+    }
+    if (!code || !sellerId) {
+      throw new HttpError(400, 'بيانات التفويض من أمازون غير مكتملة');
+    }
+    const base = (app.cfg.appUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const redirectUri = `${base}/api/integrations/amazon/oauth/callback`;
+    const form = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: app.cfg.amazonClientId,
+      client_secret: app.cfg.amazonClientSecret
+    });
+    const tokRes = await app.cfg.fetch('https://api.amazon.com/auth/o2/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: form.toString()
+    });
+    const tokJson = await tokRes.json().catch(() => ({}));
+    if (!tokRes.ok || !tokJson.refresh_token) {
+      throw new HttpError(502, `تعذّر استبدال رمز تفويض أمازون: ${tokJson.error_description || tokRes.status}`);
+    }
+
+    connectors.saveConnection(stateObj.userId, 'a', {
+      credentials: {
+        sellerId,
+        marketplaceId: 'ARBP9OOSHTCHU',
+        clientId: app.cfg.amazonClientId,
+        clientSecret: app.cfg.amazonClientSecret,
+        refreshToken: tokJson.refresh_token
+      },
+      environment: 'production',
+      enabled: true
+    });
+    const uRow = q('SELECT integrations FROM users WHERE id = ?').get(stateObj.userId);
+    const curInts = sanitizeIntegrations(parseJson(uRow?.integrations, {}));
+    curInts.a = 1;
+    q('UPDATE users SET integrations = ? WHERE id = ?').run(JSON.stringify(curInts), stateObj.userId);
+    logAudit(stateObj.userId, 'integration.amazon_oauth_connected', 'marketplace', null, { sellerId }, ip);
+
+    const targetUrl = `${app.appUrlPath('/dashboard/integrations')}?amazon=connected`;
+    res.writeHead(302, { Location: targetUrl, 'Cache-Control': 'no-store' });
+    res.end();
+  }, { auth: false });
 };

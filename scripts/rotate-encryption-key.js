@@ -7,7 +7,7 @@
  * so rotated ciphertexts and blind indexes match runtime behavior 100%.
  *
  * Usage:
- *   OLD_KEY="..." NEW_KEY="..." DB_PATH="data/orderflow.db" node scripts/rotate-encryption-key.js
+ *   OLD_KEY="..." NEW_KEY="..." DB_PATH="data/omniarab.db" node scripts/rotate-encryption-key.js
  * Programmatic import:
  *   const { rotateEncryptionKey } = require('./scripts/rotate-encryption-key');
  */
@@ -35,20 +35,42 @@ function rotateEncryptionKey({ dbPath, oldKey, newKey }) {
   try {
     db.exec('BEGIN IMMEDIATE');
 
-    // 1. users (tax_id, tax_id_hash, instapay, totp_secret_enc)
-    const users = db.prepare('SELECT id, tax_id, instapay, totp_secret_enc FROM users').all();
-    const updUser = db.prepare('UPDATE users SET tax_id = ?, tax_id_hash = ?, instapay = ?, totp_secret_enc = ? WHERE id = ?');
+    // 1. users (tax_id, tax_id_hash, instapay, totp_secret_enc, totp_pending_secret_enc)
+    const userCols = new Set(db.prepare('PRAGMA table_info(users)').all().map((c) => c.name));
+    const hasPendingTotp = userCols.has('totp_pending_secret_enc');
+    const users = db.prepare(
+      hasPendingTotp
+        ? 'SELECT id, tax_id, instapay, totp_secret_enc, totp_pending_secret_enc FROM users'
+        : 'SELECT id, tax_id, instapay, totp_secret_enc FROM users'
+    ).all();
+    const updUser = db.prepare(
+      hasPendingTotp
+        ? 'UPDATE users SET tax_id = ?, tax_id_hash = ?, instapay = ?, totp_secret_enc = ?, totp_pending_secret_enc = ? WHERE id = ?'
+        : 'UPDATE users SET tax_id = ?, tax_id_hash = ?, instapay = ?, totp_secret_enc = ? WHERE id = ?'
+    );
     for (const u of users) {
       const taxPlain = dec(u.tax_id);
       const ipaPlain = dec(u.instapay);
       const totpPlain = dec(u.totp_secret_enc);
-      updUser.run(
-        enc(taxPlain),
-        taxPlain ? newCipher.blindIndex(taxPlain) : '',
-        enc(ipaPlain),
-        enc(totpPlain),
-        u.id
-      );
+      if (hasPendingTotp) {
+        const pendingTotpPlain = dec(u.totp_pending_secret_enc);
+        updUser.run(
+          enc(taxPlain),
+          taxPlain ? newCipher.blindIndex(taxPlain) : '',
+          enc(ipaPlain),
+          enc(totpPlain),
+          enc(pendingTotpPlain),
+          u.id
+        );
+      } else {
+        updUser.run(
+          enc(taxPlain),
+          taxPlain ? newCipher.blindIndex(taxPlain) : '',
+          enc(ipaPlain),
+          enc(totpPlain),
+          u.id
+        );
+      }
       stats.users++;
     }
 
@@ -130,7 +152,7 @@ function rotateEncryptionKey({ dbPath, oldKey, newKey }) {
 if (require.main === module) {
   const oldKey = process.env.OLD_KEY || '';
   const newKey = process.env.NEW_KEY || '';
-  const dbPath = process.env.DB_FILE || process.env.DB_PATH || path.join(__dirname, '..', 'data', 'orderflow.db');
+  const dbPath = process.env.DB_FILE || process.env.DB_PATH || path.join(__dirname, '..', 'data', 'omniarab.db');
   try {
     const stats = rotateEncryptionKey({ dbPath, oldKey, newKey });
     console.log(JSON.stringify({ ok: true, rotated: stats }));

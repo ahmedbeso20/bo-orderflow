@@ -39,6 +39,12 @@ function buildSignature(data, signatureKeys, apiKey) {
 function verifyKashierWebhookSignature({ payload, signature, apiKey }) {
   if (!apiKey || !signature || !payload || typeof payload !== 'object') return false;
   const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
+  if (!Array.isArray(data.signatureKeys)) return false;
+  const keySet = new Set(data.signatureKeys.map((k) => String(k || '').trim()));
+  const hasOrderKey = keySet.has('merchantOrderId') || keySet.has('orderId');
+  if (!keySet.has('amount') || !keySet.has('currency') || !keySet.has('status') || !hasOrderKey) {
+    return false;
+  }
   const expected = buildSignature(data, data.signatureKeys, apiKey);
   if (!expected) return false;
   const given = String(signature).trim();
@@ -57,7 +63,7 @@ function buildKashierCheckoutUrl({
   amount,
   currency = 'EGP',
   mode = 'test',
-  allowedMethods = 'wallet',
+  allowedMethods = 'card,wallet',
   merchantRedirect,
   serverWebhook
 }) {
@@ -72,7 +78,7 @@ function buildKashierCheckoutUrl({
     hash,
     mode: mode === 'live' ? 'live' : 'test',
     display: 'ar',
-    allowedMethods: String(allowedMethods || 'wallet')
+    allowedMethods: String(allowedMethods || 'card,wallet')
   });
   if (merchantRedirect) params.set('merchantRedirect', merchantRedirect);
   if (serverWebhook) params.set('serverWebhook', serverWebhook);
@@ -87,7 +93,7 @@ module.exports = function createKashier(cfg) {
     name: 'بوابة كاشير (Kashier)',
     mode: c.kashierMode === 'live' ? 'live' : 'test',
     collectsCardData: false,
-    methods: ['kashier', 'wallet'],
+    methods: ['kashier', 'wallet', 'card'],
 
     validate() {
       return { payerInfo: 'بوابة كاشير الخارجية (Kashier)' };
@@ -99,7 +105,11 @@ module.exports = function createKashier(cfg) {
       if (!merchantId || !apiKey) {
         throw new HttpError(503, 'بوابة كاشير غير مُهيّأة بعد (أضف KASHIER_MERCHANT_ID و KASHIER_API_KEY في متغيرات البيئة).');
       }
-      const allowedMethods = method === 'wallet' ? 'wallet' : (c.kashierAllowedMethods || 'wallet');
+      const allowedMethods = method === 'wallet'
+        ? 'wallet'
+        : method === 'card'
+          ? 'card'
+          : (c.kashierAllowedMethods || 'card,wallet');
       const redirectUrl = buildKashierCheckoutUrl({
         merchantId,
         apiKey,

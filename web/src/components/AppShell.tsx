@@ -1,11 +1,18 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { api } from '@/lib/api';
+import {
+  api,
+  clearImpersonationToken,
+  getImpersonationStoreName,
+  getImpersonationToken,
+  subscribeImpersonation
+} from '@/lib/api';
 import { useTheme } from '@/components/ThemeProvider';
-import type { UserProfile } from '@/lib/types';
+import { fmtDate } from '@/lib/format';
+import type { NotificationItem, UserProfile } from '@/lib/types';
 
 export interface NavItem {
   href: string;
@@ -17,8 +24,9 @@ export const MERCHANT_NAV: NavItem[] = [
   { href: '/dashboard', label: 'نظرة عامة', icon: '📊' },
   { href: '/dashboard/products', label: 'المنتجات والمخزون', icon: '📦' },
   { href: '/dashboard/orders', label: 'الطلبات والفواتير', icon: '🧾' },
+  { href: '/dashboard/returns', label: 'المرتجعات وRTO', icon: '↩️' },
   { href: '/dashboard/cod', label: 'التحصيلات والربح', icon: '💰' },
-  { href: '/dashboard/customers', label: 'العملاء والمرتجعات', icon: '👥' },
+  { href: '/dashboard/customers', label: 'العملاء', icon: '👥' },
   { href: '/dashboard/integrations', label: 'الربط والمنصات', icon: '🔌' },
   { href: '/dashboard/ai', label: 'استوديو الذكاء', icon: '✨' },
   { href: '/dashboard/billing', label: 'الباقات والفواتير', icon: '💳' },
@@ -40,7 +48,78 @@ export function AppShell({ title, subtitle, user, nav = MERCHANT_NAV, children }
   const { theme, toggle } = useTheme();
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  // Notifications Center
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifs, setNotifs] = useState<NotificationItem[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  // Read-only impersonation state (in-memory only)
+  const [impersonating, setImpersonating] = useState(false);
+  const [impersonatedStore, setImpersonatedStore] = useState('');
+
+  useEffect(() => {
+    const syncImp = () => {
+      setImpersonating(Boolean(getImpersonationToken()));
+      setImpersonatedStore(getImpersonationStoreName());
+    };
+    syncImp();
+    return subscribeImpersonation(syncImp);
+  }, []);
+
+  const loadNotifications = useCallback(async () => {
+    if (!user) return;
+    try {
+      const res = await api.get<{ notifications?: NotificationItem[]; unread?: number }>('/api/notifications');
+      const items = res.notifications || [];
+      setNotifs(items);
+      setUnreadCount(
+        typeof res.unread === 'number'
+          ? res.unread
+          : items.filter((n) => !n.readAt).length
+      );
+    } catch {
+      // ignore notifications load errors
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (user) void loadNotifications();
+  }, [user, loadNotifications]);
+
+  async function markNotifRead(id: number) {
+    try {
+      await api.post(`/api/notifications/${id}/read`, {});
+      await loadNotifications();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function markAllNotifsRead() {
+    try {
+      await api.post('/api/notifications/read-all', {});
+      await loadNotifications();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function deleteNotif(id: number) {
+    try {
+      await api.del(`/api/notifications/${id}`);
+      await loadNotifications();
+    } catch {
+      // ignore
+    }
+  }
+
+  function exitImpersonation() {
+    clearImpersonationToken();
+    router.push('/owner');
+  }
+
   async function handleLogout() {
+    clearImpersonationToken();
     try {
       await api.post('/api/auth/logout');
     } catch {
@@ -48,6 +127,8 @@ export function AppShell({ title, subtitle, user, nav = MERCHANT_NAV, children }
     }
     router.push('/login');
   }
+
+  const showImpersonationBanner = impersonating || Boolean(user?.readOnly) || Boolean(user?.impersonatedBy);
 
   return (
     <div className="min-h-screen flex bg-[var(--bg)] text-[var(--ink)]">
@@ -118,6 +199,21 @@ export function AppShell({ title, subtitle, user, nav = MERCHANT_NAV, children }
       </aside>
 
       <div className="flex-1 min-w-0 flex flex-col">
+        {showImpersonationBanner && (
+          <div className="bg-amber-500 text-slate-950 px-4 lg:px-8 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-extrabold">
+            <span>
+              وضع المعاينة الإدارية (للقراءة فقط) — المتجر: {impersonatedStore || user?.storeName || 'تاجر'} (لا يمكن تعديل أي بيانات)
+            </span>
+            <button
+              type="button"
+              onClick={exitImpersonation}
+              className="rounded-lg bg-slate-950 text-white px-3 py-1 text-xs font-bold hover:opacity-90"
+            >
+              إنهاء المعاينة والعودة للوحة المالك
+            </button>
+          </div>
+        )}
+
         <header className="sticky top-0 z-20 flex items-center justify-between gap-4 border-b border-[var(--border)] bg-[var(--surface)]/95 backdrop-blur px-4 lg:px-8 py-4">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -134,8 +230,82 @@ export function AppShell({ title, subtitle, user, nav = MERCHANT_NAV, children }
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
-            {user?.role === 'owner' && (
+          <div className="flex items-center gap-2 shrink-0 relative">
+            {user && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !notifOpen;
+                    setNotifOpen(next);
+                    if (next) void loadNotifications();
+                  }}
+                  className="relative rounded-xl border border-[var(--border)] px-3 py-2 text-xs font-bold hover:bg-[var(--surface-alt)]"
+                  aria-label="مركز الإشعارات"
+                >
+                  🔔
+                  {unreadCount > 0 && (
+                    <span className="absolute -top-1.5 -left-1.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-extrabold text-white font-mono-num">
+                      {unreadCount > 99 ? '99+' : unreadCount}
+                    </span>
+                  )}
+                </button>
+                {notifOpen && (
+                  <div className="absolute left-0 mt-2 w-80 max-w-[90vw] rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-xl z-50 overflow-hidden">
+                    <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+                      <strong className="text-xs">الإشعارات ({unreadCount} غير مقروء)</strong>
+                      <button
+                        type="button"
+                        onClick={() => void markAllNotifsRead()}
+                        className="text-[11px] font-bold text-[var(--primary)] hover:underline"
+                      >
+                        تحديد الكل كمقروء
+                      </button>
+                    </div>
+                    <div className="max-h-80 overflow-y-auto divide-y divide-[var(--border)]">
+                      {notifs.length === 0 ? (
+                        <p className="p-4 text-xs text-center text-[var(--muted)]">لا توجد إشعارات جديدة.</p>
+                      ) : (
+                        notifs.slice(0, 20).map((n) => (
+                          <div
+                            key={n.id}
+                            className={`p-3 space-y-1 text-xs ${n.readAt ? 'opacity-70' : 'bg-[#0C5CA4]/5'}`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <strong className="leading-snug">{n.title}</strong>
+                              <div className="flex items-center gap-1 shrink-0">
+                                {!n.readAt && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void markNotifRead(n.id)}
+                                    className="text-[10px] font-bold text-[var(--primary)]"
+                                    title="تحديد كمقروء"
+                                  >
+                                    ✓
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteNotif(n.id)}
+                                  className="text-[10px] font-bold text-rose-600"
+                                  title="حذف"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            </div>
+                            <p className="text-[var(--muted)] leading-relaxed">{n.body}</p>
+                            <div className="text-[10px] text-[var(--muted)]">{fmtDate(n.createdAt)}</div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {user?.role === 'owner' && !showImpersonationBanner && (
               <Link href="/owner" className="rounded-xl bg-[#0C5CA4] px-3 py-2 text-xs font-bold text-white">
                 لوحة المالك
               </Link>

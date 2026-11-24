@@ -3,7 +3,39 @@
  *
  * Uses HttpOnly session cookies exclusively via Next.js /api/* same-origin rewrites.
  * Zero authentication tokens are ever stored in localStorage or sessionStorage.
+ * Temporary read-only owner impersonation tokens are held in JS memory only.
  */
+
+let impersonationToken = '';
+let impersonationStoreName = '';
+const impersonationListeners = new Set<() => void>();
+
+export function setImpersonationToken(token: string, storeName = '') {
+  impersonationToken = token ? String(token).trim() : '';
+  impersonationStoreName = impersonationToken ? storeName : '';
+  impersonationListeners.forEach((fn) => fn());
+}
+
+export function getImpersonationToken() {
+  return impersonationToken;
+}
+
+export function getImpersonationStoreName() {
+  return impersonationStoreName;
+}
+
+export function clearImpersonationToken() {
+  impersonationToken = '';
+  impersonationStoreName = '';
+  impersonationListeners.forEach((fn) => fn());
+}
+
+export function subscribeImpersonation(listener: () => void) {
+  impersonationListeners.add(listener);
+  return () => {
+    impersonationListeners.delete(listener);
+  };
+}
 
 export class ApiError extends Error {
   status: number;
@@ -27,6 +59,9 @@ export async function apiRequest<T = Record<string, unknown>>(
   const headers: Record<string, string> = {
     'X-Requested-With': 'omniarab'
   };
+  if (impersonationToken) {
+    headers['X-Impersonate-Token'] = impersonationToken;
+  }
   const init: RequestInit = {
     method,
     credentials: 'include',

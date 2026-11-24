@@ -26,13 +26,26 @@ module.exports = (r, app) => {
   };
 
   const trackBulkExport = (user, ip, target) => {
-    if (!limiter || !sendSecurityAlert) return;
+    if (!limiter) return;
     if (!limiter.hit(`bulk-exp:${user.id}`, 3, 600_000)) {
-      sendSecurityAlert({
-        severity: 'high',
-        title: 'تصدير بيانات متكرر بشكل غير معتاد',
-        details: { userId: user.id, storeName: user.store_name, target, ip }
-      }).catch(() => {});
+      if (sendSecurityAlert) {
+        sendSecurityAlert({
+          severity: 'high',
+          title: 'تصدير بيانات متكرر بشكل غير معتاد',
+          details: { userId: user.id, storeName: user.store_name, target, ip }
+        }).catch(() => {});
+      }
+      throw new HttpError(429, 'تجاوزت الحد المسموح لتصدير البيانات مؤقتًا، انتظر بضع دقائق ثم حاول مجددًا', { code: 'RATE_LIMITED' });
+    }
+  };
+
+  const enqueueRestocked = (uid, productIds) => {
+    if (!app.connectors || typeof app.connectors.enqueueStockPush !== 'function' || !productIds.length) return;
+    for (const pid of productIds) {
+      const prod = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(pid, uid);
+      if (prod) {
+        try { app.connectors.enqueueStockPush(uid, prod); } catch (_) {}
+      }
     }
   };
 
@@ -53,23 +66,42 @@ module.exports = (r, app) => {
 
     let items, total, pages, page;
     if (search) {
-      // Because buyer names/phones are encrypted at rest with random IVs (AES-256-GCM),
-      // substring search decrypts up to 5000 merchant orders in memory before filtering.
-      const needle = search.toLowerCase();
-      const needleLatin = latin(search).toLowerCase();
-      const noSearch = Number(latin(search));
-      const all = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT 5000`)
-        .all(...args)
-        .map(model.orderOf)
-        .filter((o) => {
-          if (Number.isInteger(noSearch) && o.no === noSearch) return true;
-          const hay = `${o.customer} ${o.phone} ${o.gov} ${o.address} ${o.courier} ${o.items}`.toLowerCase();
-          return hay.includes(needle) || hay.includes(needleLatin);
-        });
-      total = all.length;
+      // Indexed fast path: exact order number or normalized phone blind index (no full-table decryption)
+      const cleanDigits = latin(search).replace(/^#/, '').trim();
+      const noSearch = /^\d{1,12}$/.test(cleanDigits) ? Number(cleanDigits) : NaN;
+      const pHash = model.phoneHash(search);
+      let matched = null;
+
+      if (Number.isInteger(noSearch) && noSearch > 0) {
+        const byNo = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} AND no = ? ORDER BY created_at DESC, id DESC LIMIT 100`)
+          .all(...args, noSearch)
+          .map(model.orderOf);
+        if (byNo.length) matched = byNo;
+      }
+      if (!matched && pHash && /^\+?\d{7,15}$/.test(cleanDigits.replace(/[\s\-()]+/g, ''))) {
+        const byPhone = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} AND phone_hash = ? ORDER BY created_at DESC, id DESC LIMIT 200`)
+          .all(...args, pHash)
+          .map(model.orderOf);
+        if (byPhone.length) matched = byPhone;
+      }
+
+      if (!matched) {
+        // Bounded fallback for partial encrypted fields (capped at 1000 recent orders)
+        const needle = search.toLowerCase();
+        const needleLatin = latin(search).toLowerCase();
+        matched = q(`SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT 1000`)
+          .all(...args)
+          .map(model.orderOf)
+          .filter((o) => {
+            if (Number.isInteger(noSearch) && o.no === noSearch) return true;
+            const hay = `${o.customer} ${o.phone} ${o.gov} ${o.address} ${o.courier} ${o.items} ${o.awbNumber || ''}`.toLowerCase();
+            return hay.includes(needle) || hay.includes(needleLatin);
+          });
+      }
+      total = matched.length;
       pages = Math.max(1, Math.ceil(total / perPage));
       page = Math.min(pages, Math.max(1, Number(query.page) || 1));
-      items = all.slice((page - 1) * perPage, page * perPage);
+      items = matched.slice((page - 1) * perPage, page * perPage);
     } else {
       total = q(`SELECT COUNT(*) n FROM orders WHERE ${where.join(' AND ')}`).get(...args).n;
       pages = Math.max(1, Math.ceil(total / perPage));
@@ -137,6 +169,7 @@ module.exports = (r, app) => {
       return q('SELECT * FROM orders WHERE id = ?').get(id);
     });
     const ids = [...wanted.keys()];
+    enqueueRestocked(user.id, ids);
     return { order: model.orderOf(order), products: productsByIds(user.id, ids), counts: model.counts(user.id) };
   });
 
@@ -161,6 +194,7 @@ module.exports = (r, app) => {
       }
       return { id: o.id, restored };
     });
+    enqueueRestocked(user.id, changed.restored);
     return { order: model.orderOf(find(user.id, changed.id)), products: productsByIds(user.id, changed.restored), counts: model.counts(user.id) };
   });
 
@@ -174,6 +208,7 @@ module.exports = (r, app) => {
       const restored = o.approval_status !== 'rejected' ? restoreOrderStock(o.id, user.id) : [];
       return { id: o.id, restored };
     });
+    enqueueRestocked(user.id, changed.restored);
     return { order: model.orderOf(find(user.id, changed.id)), products: productsByIds(user.id, changed.restored), counts: model.counts(user.id) };
   });
 
@@ -387,8 +422,23 @@ module.exports = (r, app) => {
     res.end(toCsv(rows));
   });
 
-  r.get('/api/orders/awb', ({ user, res, ip }) => {
-    const rawList = q('SELECT * FROM orders WHERE user_id = ? AND status = 0 ORDER BY created_at LIMIT 200').all(user.id);
+  r.get('/api/orders/awb', ({ user, query, res, ip }) => {
+    let rawList;
+    if (query.ids !== undefined && String(query.ids).trim() !== '') {
+      const ids = String(query.ids)
+        .split(',')
+        .map((x) => Number(x.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0)
+        .slice(0, 100);
+      if (!ids.length) {
+        rawList = [];
+      } else {
+        const placeholders = ids.map(() => '?').join(',');
+        rawList = q(`SELECT * FROM orders WHERE user_id = ? AND id IN (${placeholders}) ORDER BY created_at LIMIT 100`).all(user.id, ...ids);
+      }
+    } else {
+      rawList = q('SELECT * FROM orders WHERE user_id = ? AND status = 0 ORDER BY created_at LIMIT 200').all(user.id);
+    }
     const list = rawList.map((o) => ({
       ...o,
       customer: model.dec(o.customer),

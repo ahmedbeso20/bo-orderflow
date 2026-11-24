@@ -392,7 +392,7 @@ module.exports = (r, app) => {
         subject: 'تمت الموافقة على حسابك في OrderFlow ✓',
         type: 'account_approved',
         storeName: u.store_name,
-        url: `${cfg.appUrl || 'http://localhost:3000'}/#/login`,
+        url: app.appUrlPath('/login'),
         text: `مرحبًا ${u.store_name}، تمت الموافقة على حسابك في OrderFlow ويمكنك الآن تسجيل الدخول.`
       });
     }
@@ -720,7 +720,7 @@ module.exports = (r, app) => {
   r.get('/api/owner/payments', ({ query }) => {
     const where = ['u.is_demo = 0'];
     const args = [];
-    if (query.status && ['paid', 'pending', 'failed', 'cancelled', 'review'].includes(query.status)) {
+    if (query.status && ['paid', 'pending', 'failed', 'cancelled', 'review', 'refunded'].includes(query.status)) {
       where.push('p.status = ?');
       args.push(query.status);
     }
@@ -737,7 +737,8 @@ module.exports = (r, app) => {
         COALESCE(SUM(CASE WHEN p.status = 'paid' THEN p.amount ELSE 0 END), 0) totalPaid,
         COALESCE(SUM(p.status = 'paid'), 0) countPaid,
         COALESCE(SUM(p.status = 'pending'), 0) countPending,
-        COALESCE(SUM(p.status IN ('failed', 'cancelled', 'review')), 0) countFailed
+        COALESCE(SUM(p.status IN ('failed', 'cancelled', 'review')), 0) countFailed,
+        COALESCE(SUM(p.status = 'refunded'), 0) countRefunded
       FROM plan_payments p JOIN users u ON u.id = p.user_id WHERE u.is_demo = 0`).get();
     return {
       payments,
@@ -745,9 +746,44 @@ module.exports = (r, app) => {
         paidTotal: round2(summary.totalPaid),
         paidCount: summary.countPaid,
         pendingCount: summary.countPending,
-        failedCount: summary.countFailed
+        failedCount: summary.countFailed,
+        refundedCount: summary.countRefunded
       }
     };
+  }, { owner: true });
+
+  r.post('/api/owner/payments/:id/refund', ({ user, params, body, ip }) => {
+    const id = integer(params.id, 'معرّف العملية', { min: 1 });
+    const reason = text(body?.reason || 'استرداد بناءً على طلب العميل', 'سبب الاسترداد', { max: 300, optional: true });
+    const downgrade = body?.downgrade !== false;
+    const row = q('SELECT * FROM plan_payments WHERE id = ?').get(id);
+    if (!row) throw new HttpError(404, 'عملية الدفع غير موجودة');
+    if (row.status !== 'paid') throw new HttpError(409, 'لا يمكن استرداد إلا العمليات المدفوعة فقط');
+
+    const now = nowIso();
+    tx(() => {
+      q("UPDATE plan_payments SET status = 'refunded', updated_at = ? WHERE id = ?").run(now, row.id);
+      if (downgrade) {
+        q("UPDATE users SET plan = 'free', plan_cycle = 'monthly', plan_expires_at = NULL WHERE id = ? AND plan = ?")
+          .run(row.user_id, row.plan);
+      }
+    });
+    logAudit(user.id, 'payment.refund', 'payment', row.id, {
+      txRef: row.tx_ref,
+      amount: row.amount,
+      userId: row.user_id,
+      reason,
+      downgrade
+    }, ip);
+    notify(
+      row.user_id,
+      'info',
+      `تم تسجيل استرداد عملية الدفع #${row.tx_ref}`,
+      reason || 'تم استرداد قيمة الاشتراك بنجاح.',
+      '#/pay'
+    );
+    const fresh = q('SELECT p.*, u.store_name, u.phone AS user_phone FROM plan_payments p JOIN users u ON u.id = p.user_id WHERE p.id = ?').get(row.id);
+    return { ok: true, payment: model.paymentOf(fresh) };
   }, { owner: true });
 
   r.get('/api/owner/coupons', () => ({

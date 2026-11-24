@@ -143,9 +143,12 @@ function createPayments(app) {
     const payment = q('SELECT * FROM plan_payments WHERE id = ?').get(rowId);
     let result;
     try {
+      const returnUrl = cfg.frontendRouting === 'path'
+        ? `${baseUrl}/dashboard/billing?pay_ref=${encodeURIComponent(txRef)}`
+        : `${baseUrl}/?pay_ref=${encodeURIComponent(txRef)}#/pay`;
       result = await provider.createCharge({
         payment, user, method, checked,
-        returnUrl: `${baseUrl}/?pay_ref=${encodeURIComponent(txRef)}#/pay`,
+        returnUrl,
         webhookUrl: `${baseUrl}/api/billing/webhook/${provider.id}`
       });
     } catch (e) {

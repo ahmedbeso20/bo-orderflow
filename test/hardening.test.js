@@ -463,6 +463,6 @@ describe('Hardening Suite: Security, Database, Backend & Business Logic', () => 
     assert.equal(new Set(custom.map((c) => c.model)).size, custom.length);
 
     const def = resolveModelCandidates('', { search: false });
-    assert.equal(def[0].model, 'gemini-4-hydrogen');
+    assert.equal(def[0].model, 'gemini-2.5-flash');
   });
 });

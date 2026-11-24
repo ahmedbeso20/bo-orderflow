@@ -135,7 +135,9 @@ function createModel(q, cipher = null, opts = {}) {
     returnReason: o.return_reason || '',
     awbNumber: o.awb_number || '',
     trackingUrl: o.tracking_url || '',
-    courierStatus: o.courier_status || ''
+    courierStatus: o.courier_status || '',
+    costEstimated: Boolean(o.cost_estimated),
+    fulfillmentChannel: o.fulfillment_channel || ''
   });
 
   const customerOf = (c) => {

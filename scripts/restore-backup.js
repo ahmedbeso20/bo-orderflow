@@ -7,6 +7,7 @@
  *   BACKUP_ENCRYPTION_KEY="..." node scripts/restore-backup.js <input.db.enc> [output.db]
  */
 
+const fs = require('node:fs');
 const path = require('node:path');
 const { decryptBackupFile } = require('../src/db');
 
@@ -28,7 +29,8 @@ if (require.main === module) {
     const resolvedIn = path.resolve(inputPath);
     const resolvedOut = path.resolve(outputPath);
     const res = decryptBackupFile(resolvedIn, resolvedOut, key);
-    console.log(JSON.stringify({ ok: true, input: resolvedIn, output: res.path, bytes: res.size }));
+    const bytes = fs.statSync(res).size;
+    console.log(JSON.stringify({ ok: true, input: resolvedIn, output: res, bytes }));
   } catch (err) {
     console.error(JSON.stringify({ ok: false, error: err.message }));
     process.exit(1);

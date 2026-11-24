@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
 import { api, ApiError } from '@/lib/api';
 import { useBootstrap } from '@/lib/useBootstrap';
@@ -9,11 +9,12 @@ import type { PlanItem } from '@/lib/types';
 
 interface GatewayInfo {
   provider?: string;
+  providerName?: string;
   label?: string;
   mode?: string;
   sandbox?: boolean;
   collectsCardData?: boolean;
-  methods?: Array<{ id: string; name: string }>;
+  methods?: Array<string | { id: string; name: string }>;
 }
 
 interface PaymentRow {
@@ -35,6 +36,13 @@ interface BillingData {
   payments?: PaymentRow[];
 }
 
+const METHOD_LABELS: Record<string, string> = {
+  kashier: 'بوابة كاشير (بطاقة / محفظة)',
+  card: 'بطاقة بنكية (Visa / Mastercard / Meeza)',
+  wallet: 'محفظة إلكترونية (فودافون / اتصالات / أورنج)',
+  instapay: 'InstaPay'
+};
+
 export default function BillingPage() {
   const { data: boot, reload } = useBootstrap();
   const [billing, setBilling] = useState<BillingData | null>(null);
@@ -44,15 +52,17 @@ export default function BillingPage() {
   const [method, setMethod] = useState('kashier');
   const [walletPhone, setWalletPhone] = useState('');
   const [walletOtp, setWalletOtp] = useState('123456');
+  const [pollingRef, setPollingRef] = useState('');
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
 
-  async function loadBilling() {
+  const loadBilling = useCallback(async () => {
     try {
       const res = await api.get<BillingData>('/api/billing');
       setBilling(res);
       if (res.gateway?.methods && res.gateway.methods.length > 0) {
-        setMethod(res.gateway.methods[0].id);
+        const first = res.gateway.methods[0];
+        setMethod(typeof first === 'string' ? first : first.id);
       } else if (res.gateway?.provider === 'kashier') {
         setMethod('kashier');
       } else {
@@ -61,14 +71,57 @@ export default function BillingPage() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر تحميل بيانات الفوترة');
     }
-  }
+  }, []);
 
   useEffect(() => {
     if (boot?.me) {
       setWalletPhone(boot.me.phone || '');
       void loadBilling();
     }
-  }, [boot?.me]);
+  }, [boot?.me, loadBilling]);
+
+  // Poll payment confirmation when returning from Kashier / hosted gateway (?pay_ref=...)
+  useEffect(() => {
+    if (!boot?.me || typeof window === 'undefined') return;
+    const sp = new URLSearchParams(window.location.search);
+    const ref = (sp.get('pay_ref') || '').trim();
+    if (!ref) return;
+    setPollingRef(ref);
+    let cancelled = false;
+    let attempts = 0;
+
+    const check = async () => {
+      attempts += 1;
+      try {
+        const st = await api.get<{ status?: string; payment?: { status?: string } }>(`/api/billing/status/${encodeURIComponent(ref)}`);
+        if (cancelled) return;
+        const status = st.payment?.status || st.status || 'pending';
+        if (status === 'paid' || status === 'success') {
+          setPollingRef('');
+          setNotice('تم تأكيد الدفع وتفعيل باقتك الجديدة بنجاح ✓');
+          await Promise.all([loadBilling(), reload()]);
+          return;
+        }
+        if (status === 'failed' || status === 'cancelled' || status === 'refunded') {
+          setPollingRef('');
+          setError(`لم تكتمل عملية الدفع (الحالة: ${status})`);
+          await loadBilling();
+          return;
+        }
+      } catch {
+        // retry while pending
+      }
+      if (!cancelled && attempts < 12) {
+        setTimeout(() => void check(), 2500);
+      } else if (!cancelled) {
+        setPollingRef('');
+        setNotice('تم استلام طلب الدفع وجارٍ التحقق النهائي مع بوابة الدفع — يمكنك تحديث الصفحة خلال لحظات.');
+      }
+    };
+
+    void check();
+    return () => { cancelled = true; };
+  }, [boot?.me, loadBilling, reload]);
 
   async function checkCoupon() {
     setCouponMsg('');
@@ -126,14 +179,20 @@ export default function BillingPage() {
     }
   }
 
-  const methods = billing?.gateway?.methods || [
-    { id: 'wallet', name: 'محفظة إلكترونية' },
-    { id: 'instapay', name: 'InstaPay' },
-    { id: 'kashier', name: 'بوابة كاشير (بطاقة / محفظة)' }
-  ];
+  const methods = (billing?.gateway?.methods || ['wallet', 'instapay', 'kashier']).map((m) =>
+    typeof m === 'string' ? { id: m, name: METHOD_LABELS[m] || m } : m
+  );
+
+  const gatewayTitle = billing?.gateway?.providerName || billing?.gateway?.label || billing?.gateway?.provider || '';
 
   return (
     <AppShell title="الباقات والاشتراكات" subtitle="ترقية الباقة، تطبيق الكوبونات، وسجل الإيصالات الضريبية" user={boot?.me}>
+      {pollingRef && (
+        <div className="mb-4 rounded-xl bg-amber-50 dark:bg-amber-950/30 p-3 text-xs font-bold text-amber-800 dark:text-amber-200">
+          جارٍ تأكيد حالة الدفع للمرجع <span className="font-mono-num" dir="ltr">{pollingRef}</span>...
+        </div>
+      )}
+
       <div className="of-card p-5 mb-6 flex flex-wrap items-center justify-between gap-4">
         <div>
           <div className="text-xs text-[var(--muted)]">باقتك الحالية</div>
@@ -141,8 +200,8 @@ export default function BillingPage() {
           {billing?.plan?.expiresAt && (
             <div className="text-xs text-[var(--muted)]">تنتهي في: {fmtDate(billing.plan.expiresAt)}</div>
           )}
-          {billing?.gateway?.label && (
-            <div className="text-[11px] text-[var(--muted)] mt-0.5">بوابة الدفع: {billing.gateway.label}</div>
+          {gatewayTitle && (
+            <div className="text-[11px] text-[var(--muted)] mt-0.5">بوابة الدفع: {gatewayTitle}</div>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -161,7 +220,7 @@ export default function BillingPage() {
             تحقق من الكوبون
           </button>
           <select
-            className="of-input w-44"
+            className="of-input w-52"
             value={method}
             onChange={(e) => setMethod(e.target.value)}
           >
@@ -193,12 +252,14 @@ export default function BillingPage() {
       )}
 
       {couponMsg && <p className="mb-4 text-sm font-bold text-emerald-700 dark:text-emerald-300">{couponMsg}</p>}
-      {notice && <p className="mb-4 text-sm font-bold text-emerald-700 dark:text-emerald-300">{notice}</p>}
-      {error && <p className="mb-4 text-sm font-bold text-[var(--danger)]">{error}</p>}
+      {notice && <p className="mb-4 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 p-3 text-sm font-bold text-emerald-700 dark:text-emerald-300">{notice}</p>}
+      {error && <p className="mb-4 rounded-xl bg-rose-50 dark:bg-rose-950/30 p-3 text-sm font-bold text-[var(--danger)]">{error}</p>}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
         {(billing?.plans || []).map((p) => {
-          const displayPrice = cycle === 'yearly' ? (p.yearly ?? p.price * 10) : p.price;
+          const monthly = Number(p.priceMonthly ?? p.price ?? 0);
+          const yearly = Number(p.priceYearly ?? p.yearly ?? monthly * 10);
+          const displayPrice = cycle === 'yearly' ? yearly : monthly;
           return (
             <div key={p.id} className="of-card p-6 flex flex-col justify-between gap-4">
               <div>

@@ -268,11 +268,11 @@ test('الإعدادات والتكاملات والباقات', async (t) => {
   assert.equal((await a.post('/api/sync')).data.markets.length, 2);
   assert.equal((await a.put('/api/settings/notifications', { key: 'w', on: true })).data.notifications.w, 1);
 
-  const st = await a.put('/api/settings', { storeName: 'متجر جديد', taxId: '٤١٢-٨٩٠-١١٥', storeEmail: 'a@b.co', storePhone: phoneA });
+  const st = await a.put('/api/settings', { storeName: 'متجر جديد', taxId: '٤١٢-٨٩٠-١١٥', storeEmail: 'a@b.co', storePhone: phoneA, currentPassword: 'secret123' });
   assert.equal(st.data.settings.storeName, 'متجر جديد');
   assert.equal(st.data.settings.taxId, '412-890-115');
   assert.equal((await a.put('/api/settings', { taxId: 'abc' })).status, 400);
-  assert.equal((await b.put('/api/settings', { storeEmail: 'a@b.co' })).status, 409);
+  assert.equal((await b.put('/api/settings', { storeEmail: 'a@b.co', currentPassword: 'secret123' })).status, 409);
 
   assert.equal((await a.post('/api/plan', { plan: 'pro' })).data.plan.limit, 1500);
   assert.equal((await a.put('/api/settings/integrations', { key: 'j', on: true })).status, 200);
@@ -328,7 +328,7 @@ test('الذكاء الاصطناعي مع Gemini (محاكاة): المفتاح
   assert.equal(l.data.data.keywords, 'س، ص');
   assert.equal(calls[0].init.headers['x-goog-api-key'], 'TEST-KEY');
   assert.ok(!calls[0].url.includes('TEST-KEY'), 'المفتاح لا يظهر في الرابط');
-  assert.match(calls[0].url, /gemini-4-hydrogen:generateContent$/);
+  assert.match(calls[0].url, /gemini-2\.5-flash:generateContent$/);
   assert.equal(calls[0].body.generationConfig.responseMimeType, 'application/json');
 
   const m = (await a.post('/api/ai/market', { name: 'سماعة' })).data.market;

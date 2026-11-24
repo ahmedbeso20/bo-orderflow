@@ -17,7 +17,7 @@ const { createLogger } = require('./logger');
 const { sendSecurityAlert, trackOwnerLoginIp } = require('./alerts');
 const pkg = require('../package.json');
 
-const SECURITY_LIMIT_PREFIXES = ['login-', '2fa-', 'reg:', 'forgot-', 'reset-', 'contact:', 'otp-', 'export-', 'verify-resend:'];
+const SECURITY_LIMIT_PREFIXES = ['login-', '2fa-', 'reg:', 'forgot-', 'reset-', 'contact:', 'otp-', 'export-', 'verify-resend:', 'demo:', 'bulk-exp:'];
 const isSecurityLimitKey = (key) => SECURITY_LIMIT_PREFIXES.some((p) => String(key || '').startsWith(p));
 
 /** يضمن وجود حساب المالك الوحيد فقط (1 Owner Max — محمي بفهرس فريد في قاعدة البيانات) */
@@ -34,15 +34,19 @@ function ensureSingleOwner(cfg, q) {
   let mail = null;
   try { mail = cfg.ownerEmail ? email(cfg.ownerEmail) : 'owner@orderflow.eg'; } catch { mail = 'owner@orderflow.eg'; }
   const ownerName = clean(cfg.ownerName) || 'مالك منصة OrderFlow';
-  const hash = hashPasswordSync(cfg.ownerPassword);
 
   const existingOwner = q("SELECT * FROM users WHERE role = 'owner'").get();
   if (existingOwner) {
-    // نحدّث بيانات المالك الوحيد دون السماح بإنشاء مالك ثانٍ مطلقًا
-    q("UPDATE users SET phone = ?, email = ?, pass_hash = ?, store_name = ?, full_name = ?, status = 'active' WHERE id = ?")
-      .run(ph, mail, hash, ownerName, ownerName, existingOwner.id);
+    // لا نعيد كتابة كلمة مرور المالك عند كل تشغيل إلا عند تفعيل OWNER_FORCE_RESET=1 صراحةً
+    if (cfg.ownerForceReset) {
+      const hash = hashPasswordSync(cfg.ownerPassword);
+      q("UPDATE users SET phone = ?, email = ?, pass_hash = ?, store_name = ?, full_name = ?, status = 'active' WHERE id = ?")
+        .run(ph, mail, hash, ownerName, ownerName, existingOwner.id);
+    }
     return;
   }
+
+  const hash = hashPasswordSync(cfg.ownerPassword);
 
   const byCred = q('SELECT * FROM users WHERE phone = ? OR (email IS NOT NULL AND email = ?)').get(ph, mail);
   if (byCred) {
@@ -284,6 +288,16 @@ function createApp(overrides = {}) {
     logger.error('pii_startup_migration_error', { error: err?.message || String(err) });
   }
 
+  const appUrlPath = (routePath) => {
+    const base = (cfg.appUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const cleanPath = String(routePath || '/').startsWith('/') ? String(routePath) : `/${String(routePath)}`;
+    if (cfg.frontendRouting === 'path') {
+      const mapped = cleanPath === '/pay' ? '/dashboard/billing' : cleanPath;
+      return `${base}${mapped}`;
+    }
+    return `${base}/#${cleanPath}`;
+  };
+
   const handlePlanExpired = (u, prevPlanArg) => {
     const prevPlan = prevPlanArg || u.prevPlan || 'paid';
     logAudit(null, 'plan.expired_downgrade', 'user', u.id, {
@@ -300,12 +314,13 @@ function createApp(overrides = {}) {
       '#/pay'
     );
     if (u.email) {
+      const payUrl = appUrlPath('/dashboard/billing');
       Promise.resolve(mailer.send({
         to: u.email,
         subject: 'انتهى اشتراكك في OrderFlow — تم التحويل للباقة المجانية',
         type: 'plan_expired',
-        url: `${cfg.appUrl || 'http://localhost:3000'}/#/pay`,
-        text: `مرحبًا ${u.store_name || ''}، انتهت صلاحية اشتراكك في باقة (${prevPlan}) وتم تحويل حسابك تلقائيًا إلى الباقة المجانية. يمكنك التجديد عبر: ${cfg.appUrl || 'http://localhost:3000'}/#/pay`
+        url: payUrl,
+        text: `مرحبًا ${u.store_name || ''}، انتهت صلاحية اشتراكك في باقة (${prevPlan}) وتم تحويل حسابك تلقائيًا إلى الباقة المجانية. يمكنك التجديد عبر: ${payUrl}`
       })).catch(() => {});
     }
   };
@@ -323,6 +338,7 @@ function createApp(overrides = {}) {
     notify,
     logAudit,
     logPiiAccess,
+    appUrlPath,
     sendSecurityAlert: (opts) => sendSecurityAlert(app, opts),
     trackOwnerLoginIp: (ownerUser, ip) => trackOwnerLoginIp(app, ownerUser, ip),
     getPlatformSettings,
@@ -445,12 +461,13 @@ function createApp(overrides = {}) {
           '#/pay'
         );
         if (u.email) {
+          const payUrl = appUrlPath('/dashboard/billing');
           Promise.resolve(mailer.send({
             to: u.email,
             subject: `تذكير تجديد اشتراك OrderFlow — متبقي ${daysLeft} أيام`,
             type: 'plan_expiring_soon',
-            url: `${cfg.appUrl || 'http://localhost:3000'}/#/pay`,
-            text: `مرحبًا ${u.store_name || ''}، يتبقى ${daysLeft} أيام على انتهاء باقتك الحالية (${u.plan}). جدّد اشتراكك من: ${cfg.appUrl || 'http://localhost:3000'}/#/pay`
+            url: payUrl,
+            text: `مرحبًا ${u.store_name || ''}، يتبقى ${daysLeft} أيام على انتهاء باقتك الحالية (${u.plan}). جدّد اشتراكك من: ${payUrl}`
           })).catch(() => {});
         }
       }
@@ -563,6 +580,23 @@ function createApp(overrides = {}) {
       try { app.createBackup(); } catch (e) { logger.error('backup_error', { error: e?.message || String(e) }); }
     }, 24 * 3600_000);
     backupTimer.unref();
+  }
+
+  // معالجة طابور دفع المخزون الثنائي (sync_outbox) وتتبّع شحنات شركات الشحن دوريًا
+  let outboxTimer = null;
+  if (cfg.autoSyncIntervalMin > 0 && typeof app.connectors.processSyncOutbox === 'function') {
+    outboxTimer = setInterval(() => {
+      app.connectors.processSyncOutbox(20).catch((e) => logger.error('outbox_error', { error: e?.message || String(e) }));
+    }, 60_000);
+    outboxTimer.unref();
+  }
+
+  let courierPollTimer = null;
+  if (cfg.courierPollIntervalMin > 0 && typeof app.couriers.pollOpenShipments === 'function') {
+    courierPollTimer = setInterval(() => {
+      app.couriers.pollOpenShipments(50).catch((e) => logger.error('courier_poll_error', { error: e?.message || String(e) }));
+    }, cfg.courierPollIntervalMin * 60_000);
+    courierPollTimer.unref();
   }
 
   const allowedOriginsSet = new Set(
@@ -701,6 +735,9 @@ function createApp(overrides = {}) {
         }
       }
 
+      if (!cfg.serveLegacySpa) {
+        return sendJson(res, 404, { error: 'المسار غير موجود (واجهة Next.js تُقدَّم بشكل مستقل)' });
+      }
       serveStatic(req, res, url.pathname);
     } catch (e) {
       if (res.headersSent) return res.end();
@@ -720,6 +757,8 @@ function createApp(overrides = {}) {
     clearInterval(purgeTimer);
     if (autoSyncTimer) clearInterval(autoSyncTimer);
     if (backupTimer) clearInterval(backupTimer);
+    if (outboxTimer) clearInterval(outboxTimer);
+    if (courierPollTimer) clearInterval(courierPollTimer);
     limiter.stop();
     await new Promise((resolve) => { server.close(resolve); server.closeAllConnections?.(); });
     store.close();

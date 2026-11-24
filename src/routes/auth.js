@@ -7,6 +7,7 @@ const {
 const { checkLoginStatus, getLoginRedirect } = require('../rbac');
 const { HttpError, bad, text, phone, email, password, clean, latin, nowIso } = require('../util');
 const { verifyTurnstileToken } = require('../turnstile');
+const { deriveSubkey } = require('../security');
 const { seedDemo } = require('../seed');
 
 const BAD_LOGIN = 'بيانات الدخول غير صحيحة';
@@ -16,6 +17,7 @@ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex'
 module.exports = (r, app) => {
   const { q, tx, cfg, limiter, cipher, session, mailer, notify, logAudit, model, getPlatformSettings, sms } = app;
   const dummyHash = hashPassword(crypto.randomBytes(12).toString('hex'));
+  const otpKey = deriveSubkey(cfg.secret, 'phone-otp-hmac-v1', 32);
 
   const issueOneTimeToken = (userId, type, ttlMs, target = '') => {
     const rawToken = crypto.randomBytes(24).toString('hex');
@@ -27,13 +29,14 @@ module.exports = (r, app) => {
     return { token: rawToken, expiresAt };
   };
 
-  const consumeOneTimeToken = (rawToken, type) => {
+  const consumeOneTimeToken = (rawToken, type, validateFn = null) => {
     const tokenStr = clean(rawToken);
     if (!tokenStr) throw bad('الرمز غير صالح أو منتهي الصلاحية');
     const row = q('SELECT * FROM auth_tokens WHERE token_hash = ? AND type = ?').get(sha256(tokenStr), type);
     if (!row || row.used_at || row.expires_at <= nowIso()) {
       throw bad('الرمز غير صالح أو منتهي الصلاحية');
     }
+    if (typeof validateFn === 'function') validateFn(row);
     q('UPDATE auth_tokens SET used_at = ? WHERE id = ?').run(nowIso(), row.id);
     return row;
   };
@@ -49,7 +52,9 @@ module.exports = (r, app) => {
       throw new HttpError(429, 'تجاوزت الحد اليومي لرسائل التحقق (٥ رسائل يوميًا).', { code: 'OTP_DAILY_LIMIT' });
     }
     const code = String(crypto.randomInt(100000, 1000000));
-    const tokenHash = sha256(`${cfg.secret}:${code}`);
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const hmacHex = crypto.createHmac('sha256', otpKey).update(`${userId}:${phoneNum}:${nonce}:${code}`, 'utf8').digest('hex');
+    const tokenHash = `${nonce}:${hmacHex}`;
     const now = Date.now();
     const expiresAt = new Date(now + 10 * 60_000).toISOString();
     // إبطال الرموز السابقة غير المستخدمة لنفس الرقم
@@ -84,9 +89,22 @@ module.exports = (r, app) => {
     if ((row.attempts || 0) >= 5) {
       throw new HttpError(429, 'تم إيقاف الرمز بعد ٥ محاولات خاطئة؛ اطلب رمزًا جديدًا.', { code: 'OTP_LOCKED' });
     }
-    const expectedHash = Buffer.from(row.token_hash, 'hex');
-    const actualHash = Buffer.from(sha256(`${cfg.secret}:${codeStr}`), 'hex');
-    if (expectedHash.length !== actualHash.length || !crypto.timingSafeEqual(expectedHash, actualHash)) {
+    const stored = String(row.token_hash || '');
+    const parts = stored.split(':');
+    let matched = false;
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      const [nonce, expectedHex] = parts;
+      const actualHex = crypto.createHmac('sha256', otpKey).update(`${row.user_id}:${phoneNum}:${nonce}:${codeStr}`, 'utf8').digest('hex');
+      const expectedBuf = Buffer.from(expectedHex, 'hex');
+      const actualBuf = Buffer.from(actualHex, 'hex');
+      matched = expectedBuf.length === actualBuf.length && expectedBuf.length > 0 && crypto.timingSafeEqual(expectedBuf, actualBuf);
+    } else {
+      // توافق مؤقت مع أي رموز صادرة قبل الترقية
+      const expectedBuf = Buffer.from(stored, 'hex');
+      const actualBuf = Buffer.from(sha256(`${cfg.secret}:${codeStr}`), 'hex');
+      matched = expectedBuf.length === actualBuf.length && expectedBuf.length > 0 && crypto.timingSafeEqual(expectedBuf, actualBuf);
+    }
+    if (!matched) {
       const nextAttempts = (row.attempts || 0) + 1;
       q('UPDATE auth_tokens SET attempts = ? WHERE id = ?').run(nextAttempts, row.id);
       if (nextAttempts >= 5) {
@@ -214,7 +232,7 @@ module.exports = (r, app) => {
         subject: 'تأكيد البريد الإلكتروني — OrderFlow',
         type: 'verify_email',
         token,
-        url: `${cfg.appUrl || 'http://localhost:3000'}/#/verify-email?token=${token}`,
+        url: app.appUrlPath(`/verify-email?token=${token}`),
         text: `رمز تأكيد بريدك الإلكتروني في OrderFlow هو: ${token}`
       });
     }
@@ -246,15 +264,38 @@ module.exports = (r, app) => {
     let ident;
     try { ident = byMail ? raw.toLowerCase() : phone(raw); } catch { throw new HttpError(401, BAD_LOGIN); }
 
-    // تفعيل حد أقصى صارم لمحاولات تسجيل الدخول الفاشلة (Rate Limiting) لحماية حسابات الإدارة والعملاء
-    if (!limiter.hit(`login-ip:${ip}`, 25, 600_000) || !limiter.hit(`login-id:${ident}`, 5, 900_000)) {
+    // حماية مزدوجة: حد صارم لكل (IP + حساب) لمنع قفل الحساب بهجوم DoS + سقف أوسع للحساب
+    if (
+      !limiter.hit(`login-ip:${ip}`, 25, 600_000) ||
+      !limiter.hit(`login-ip-id:${ip}:${ident}`, 5, 900_000) ||
+      !limiter.hit(`login-id:${ident}`, 20, 900_000)
+    ) {
       try { logAudit(null, 'security.login_rate_limited', 'auth', null, { ident: String(ident).slice(0, 60) }, ip); } catch (_) {}
       throw new HttpError(429, 'تم تجاوز الحد الأقصى لمحاولات تسجيل الدخول الفاشلة. انتظر ١٥ دقيقة ثم حاول مجددًا.', { code: 'RATE_LIMITED' });
+    }
+
+    // التحقق عبر Cloudflare Turnstile عند تمرير التوكن أو بعد فشل محاولتين لنفس (IP + حساب)
+    const loginCaptchaTok = body.turnstileToken || body.captchaToken || body['cf-turnstile-response'];
+    const failRow = q('SELECT n, reset_at FROM rate_limits WHERE key = ?').get(`login-fail:${ip}:${ident}`);
+    const priorFails = (failRow && Number(failRow.reset_at) > Date.now()) ? Number(failRow.n || 0) : 0;
+    if (cfg.turnstileSecretKey && (loginCaptchaTok || priorFails >= 2)) {
+      if (!loginCaptchaTok) {
+        throw new HttpError(400, 'يرجى إكمال التحقق الأمني (CAPTCHA) للمتابعة.', { code: 'CAPTCHA_REQUIRED', requiresCaptcha: true });
+      }
+      try {
+        await verifyTurnstileToken(loginCaptchaTok, ip, cfg);
+      } catch (err) {
+        if (err instanceof HttpError) {
+          throw new HttpError(err.status, err.message, { ...err.extra, requiresCaptcha: true });
+        }
+        throw err;
+      }
     }
 
     const u = q(`SELECT * FROM users WHERE ${byMail ? 'email' : 'phone'} = ? AND is_demo = 0`).get(ident);
     const ok = await verifyPassword(pw, u ? u.pass_hash : await dummyHash);
     if (!u || !ok) {
+      limiter.hit(`login-fail:${ip}:${ident}`, 100, 900_000);
       // تنبيه أمني عند تجاوز ٢٠ محاولة فاشلة لحساب أو ١٠٠ من نفس الـ IP خلال ساعة
       if (!limiter.hit(`alert-fail-id:${ident}`, 20, 3600_000) && limiter.hit(`alert-sent-id:${ident}`, 1, 3600_000)) {
         if (app.sendSecurityAlert) {
@@ -274,7 +315,8 @@ module.exports = (r, app) => {
           });
         }
       }
-      throw new HttpError(401, BAD_LOGIN);
+      const nextFails = priorFails + 1;
+      throw new HttpError(401, BAD_LOGIN, (cfg.turnstileSecretKey && nextFails >= 2) ? { requiresCaptcha: true } : {});
     }
 
     const statusCheck = checkLoginStatus(u);
@@ -287,6 +329,8 @@ module.exports = (r, app) => {
 
     // المصادقة الثنائية إلزامية للمالك والمشرفين: إذا لم تكن مفعّلة نُصدر جلسة إعداد مقيدة
     if ((u.role === 'owner' || u.role === 'moderator') && u.totp_enabled !== 1) {
+      limiter.reset(`login-ip-id:${ip}:${ident}`);
+      limiter.reset(`login-fail:${ip}:${ident}`);
       limiter.reset(`login-id:${ident}`);
       session.issue(res, u, { setup2fa: true });
       return {
@@ -314,6 +358,8 @@ module.exports = (r, app) => {
       await verify2faOrRecovery(u, otpInput, ip);
     }
 
+    limiter.reset(`login-ip-id:${ip}:${ident}`);
+    limiter.reset(`login-fail:${ip}:${ident}`);
     limiter.reset(`login-id:${ident}`);
     session.issue(res, u);
     if (u.role === 'owner' && app.trackOwnerLoginIp) {
@@ -391,7 +437,7 @@ module.exports = (r, app) => {
             subject: 'إعادة تعيين كلمة المرور — OrderFlow',
             type: 'reset_password',
             token,
-            url: `${cfg.appUrl || 'http://localhost:3000'}/#/reset-password?token=${token}`,
+            url: app.appUrlPath(`/reset-password?token=${token}`),
             text: `رمز إعادة تعيين كلمة المرور لحسابك في OrderFlow (صالح لمدة ٣٠ دقيقة): ${token}`
           });
           method = 'email';
@@ -472,7 +518,12 @@ module.exports = (r, app) => {
   }, { auth: false });
 
   r.post('/api/auth/verify-email', ({ body }) => {
-    const tokenRow = consumeOneTimeToken(body.token, 'verify_email');
+    const tokenRow = consumeOneTimeToken(body.token, 'verify_email', (row) => {
+      const u = q('SELECT id, email FROM users WHERE id = ?').get(row.user_id);
+      if (!row.target || !u || !u.email || u.email.toLowerCase() !== row.target.toLowerCase()) {
+        throw bad('الرمز لم يعد مطابقًا لبريدك الإلكتروني الحالي');
+      }
+    });
     const now = nowIso();
     q('UPDATE users SET email_verified_at = ? WHERE id = ?').run(now, tokenRow.user_id);
     notify(tokenRow.user_id, 'ok', 'تم توثيق بريدك الإلكتروني بنجاح ✓', 'شكراً لتأكيد بريدك الإلكتروني الرسمي على منصة OrderFlow.', '#/set');
@@ -493,7 +544,7 @@ module.exports = (r, app) => {
       subject: 'تأكيد البريد الإلكتروني — OrderFlow',
       type: 'verify_email',
       token,
-      url: `${cfg.appUrl || 'http://localhost:3000'}/#/verify-email?token=${token}`,
+      url: app.appUrlPath(`/verify-email?token=${token}`),
       text: `رمز تأكيد بريدك الإلكتروني في OrderFlow هو: ${token}`
     });
     return { ok: true, email: user.email, ...(!cfg.enforcedProd ? { devToken: token } : {}) };
@@ -518,8 +569,9 @@ module.exports = (r, app) => {
   }, { auth: false });
 
   // حساب تجريبي مؤقت ببيانات جاهزة (يُحذف بعد ٢٤ ساعة)
-  r.post('/api/auth/demo', async ({ res, ip }) => {
-    if (!limiter.hit(`demo:${ip}`, 120, 3600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول لاحقًا');
+  r.post('/api/auth/demo', async ({ body, res, ip }) => {
+    if (!limiter.hit(`demo:${ip}`, 15, 3600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول لاحقًا', { code: 'RATE_LIMITED' });
+    await verifyTurnstileToken(body.turnstileToken || body.captchaToken || body['cf-turnstile-response'], ip, cfg);
     const demoCount = q('SELECT COUNT(*) n FROM users WHERE is_demo = 1').get().n;
     if (demoCount >= cfg.maxDemos) {
       try {
@@ -558,6 +610,9 @@ module.exports = (r, app) => {
   });
 
   r.get('/api/auth/me', ({ user }) => ({
+    ok: true,
+    authenticated: true,
+    setup2faRequired: Boolean(user._setup2fa),
     me: model.meOf(user),
     redirectTo: user._setup2fa ? '#/setup-2fa' : getLoginRedirect(user)
   }));

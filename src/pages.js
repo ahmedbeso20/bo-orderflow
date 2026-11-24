@@ -28,19 +28,19 @@ function invoicePage(o, items, store) {
   const qrData = `${store.store_name}|${store.tax_id || 'N/A'}|${o.created_at}|${o.total}|${vat}`;
   const qrSvg = generateQrSvg(qrData);
 
-  return page(`فاتورة ضريبية مبسطة #${o.no}`, `
+  return page(`فاتورة تجارية مبسطة #${o.no}`, `
 <div class="sheet">
   <div class="row" style="align-items:flex-start">
     <div>
       <h1>${esc(store.store_name)}</h1>
-      <div class="mu">${store.tax_id ? `الرقم الضريبي: <span dir="ltr"><b>${esc(store.tax_id)}</b></span>` : '<span class="stamp">فاتورة مبسطة</span>'}</div>
+      <div class="mu">${store.tax_id ? `الرقم الضريبي: <span dir="ltr"><b>${esc(store.tax_id)}</b></span>` : '<span class="stamp">فاتورة تجارية مبسطة</span>'}</div>
       ${store.phone ? `<div class="mu">الهاتف: <span dir="ltr">${esc(store.phone)}</span></div>` : ''}
     </div>
     <div style="text-align:end">
-      <h2>فاتورة ضريبية مبسطة (E-Invoice)</h2>
+      <h2>فاتورة تجارية مبسطة</h2>
       <div class="mu">رقم الفاتورة: #${fmt(o.no, 0).replace(/[٬,]/g, '')}</div>
       <div class="mu">التاريخ: ${date(o.created_at)}</div>
-      <div style="margin-top:6px"><span class="stamp">معتمدة للإرسال والأرشفة</span></div>
+      <div style="margin-top:6px"><span class="stamp">جاهزة للطباعة والأرشفة</span></div>
     </div>
   </div>
 
@@ -54,7 +54,7 @@ function invoicePage(o, items, store) {
     </div>
     <div class="qr-box">
       ${qrSvg}
-      <div style="font-size:10px;font-weight:700;color:#0b5fd6;margin-top:4px">رمز التحقق الضريبي QR</div>
+      <div style="font-size:10px;font-weight:700;color:#0b5fd6;margin-top:4px">رمز التحقق QR</div>
     </div>
   </div>
 
@@ -70,7 +70,7 @@ function invoicePage(o, items, store) {
 
   <div class="row" style="margin-top:16px;align-items:center">
     <p class="mu" style="font-size:12px;margin:0;max-width:500px">
-      الأسعار شاملة ضريبة القيمة المضافة (14%). تتوافق مع متطلبات الفاتورة الإلكترونية المبسطة للمتاجر والتجارة الإلكترونية في جمهورية مصر العربية.
+      فاتورة تجارية مبسطة لأغراض التوصيل والأرشفة الداخلية، والأسعار شاملة ضريبة القيمة المضافة (14%). إصدار الإيصالات الإلكترونية الرسمية على منظومة مصلحة الضرائب (ETA) يتم عبر بوابة التاجر الضريبية.
     </p>
     <button class="btn no-print" data-print>🖨️ طباعة / حفظ PDF</button>
   </div>

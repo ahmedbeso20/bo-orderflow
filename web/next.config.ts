@@ -15,7 +15,9 @@ const cspDirectives = [
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
-  ALLOW_IFRAME ? 'frame-ancestors *' : "frame-ancestors 'none'"
+  ALLOW_IFRAME
+    ? "frame-ancestors 'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com"
+    : "frame-ancestors 'none'"
 ].join('; ');
 
 const securityHeaders = [

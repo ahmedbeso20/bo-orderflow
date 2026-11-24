@@ -27,8 +27,10 @@ export interface UserProfile {
 
 export interface SettingsData {
   storeName: string;
-  phone: string;
-  email: string;
+  phone?: string;
+  email?: string;
+  storePhone?: string;
+  storeEmail?: string;
   emailVerified?: boolean;
   phoneVerified?: boolean;
   taxId: string;
@@ -67,6 +69,9 @@ export interface Order {
   courier: string;
   items?: string;
   total: number;
+  cost?: number;
+  costEstimated?: boolean;
+  fulfillmentChannel?: string;
   status: number;
   source?: string;
   approvalStatus?: 'pending' | 'approved' | 'rejected';
@@ -74,7 +79,39 @@ export interface Order {
   awb?: string;
   awbNumber?: string;
   courierStatus?: string;
+  trackingUrl?: string;
   courierTrackingUrl?: string;
+  returnReason?: string;
+  cancelReason?: string;
+  createdAt: string;
+}
+
+export interface CustomerItem {
+  id: number;
+  name: string;
+  phone: string;
+  email?: string;
+  gov: string;
+  address?: string;
+  notes?: string;
+  tags?: string;
+  ordersCount: number;
+  deliveredCount?: number;
+  returnedCount?: number;
+  cancelledCount?: number;
+  rtoCount?: number;
+  totalSpent: number;
+  lastOrderAt?: string | null;
+  segment?: string;
+}
+
+export interface NotificationItem {
+  id: number;
+  title: string;
+  body: string;
+  type: string;
+  link?: string;
+  readAt?: string | null;
   createdAt: string;
 }
 
@@ -116,8 +153,10 @@ export interface ServiceRequest {
 export interface PlanItem {
   id: string;
   name: string;
-  price: number;
+  price?: number;
   yearly?: number;
+  priceMonthly?: number;
+  priceYearly?: number;
   products: number | null;
   markets: number;
   ai: number;

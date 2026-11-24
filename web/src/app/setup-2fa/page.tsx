@@ -33,7 +33,7 @@ export default function Setup2faPage() {
       try {
         const meRes = await api.get<MeResponse>('/api/auth/me');
         if (!active) return;
-        if (!meRes.authenticated || !meRes.me) {
+        if (meRes.authenticated === false || !meRes.me) {
           router.replace('/login');
           return;
         }
