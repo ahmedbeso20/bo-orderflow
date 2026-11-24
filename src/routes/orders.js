@@ -63,7 +63,7 @@ module.exports = (r, app) => {
         .map(model.orderOf)
         .filter((o) => {
           if (Number.isInteger(noSearch) && o.no === noSearch) return true;
-          const hay = `${o.customer} ${o.phone} ${o.gov} ${o.courier} ${o.items}`.toLowerCase();
+          const hay = `${o.customer} ${o.phone} ${o.gov} ${o.address} ${o.courier} ${o.items}`.toLowerCase();
           return hay.includes(needle) || hay.includes(needleLatin);
         });
       total = all.length;
@@ -305,7 +305,7 @@ module.exports = (r, app) => {
     try {
       id = Number(q(`INSERT INTO customers (user_id, name, phone, phone_hash, email, gov, address, notes, tags, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(user.id, model.enc(name), model.enc(ph), model.phoneHash(ph), mail, gov, model.enc(address), notes, tags, now, now).lastInsertRowid);
+        .run(user.id, model.enc(name), model.enc(ph), model.phoneHash(ph), model.enc(mail), gov, model.enc(address), notes, tags, now, now).lastInsertRowid);
     } catch (e) {
       if (/UNIQUE/i.test(e.message)) throw new HttpError(409, 'يوجد عميل مسجّل بنفس رقم الموبايل بالفعل');
       throw e;
@@ -322,7 +322,7 @@ module.exports = (r, app) => {
       patch.phone = model.enc(ph);
       patch.phone_hash = model.phoneHash(ph);
     }
-    if (body.email !== undefined) patch.email = email(body.email) || '';
+    if (body.email !== undefined) patch.email = model.enc(email(body.email) || '');
     if (body.gov !== undefined) patch.gov = text(body.gov, 'المحافظة', { max: 40, optional: true });
     if (body.address !== undefined) patch.address = model.enc(text(body.address, 'العنوان', { max: 240, optional: true }));
     if (body.notes !== undefined) patch.notes = text(body.notes, 'الملاحظات', { max: 1000, optional: true });

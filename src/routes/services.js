@@ -1,18 +1,20 @@
 'use strict';
 const crypto = require('node:crypto');
 const { HttpError, text, phone, oneOf, nowIso } = require('../util');
+const { verifyTurnstileToken } = require('../turnstile');
 const { EXPERT_SERVICES } = require('../domain');
 
 const genRef = (prefix) => `${prefix}-${new Date().getFullYear()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
 module.exports = (r, app) => {
-  const { q, limiter, notify } = app;
+  const { q, cfg, limiter, notify } = app;
 
   // حجز استشارة نمو أو طلب تفعيل خدمة من الصفحة العامة (بدون تسجيل دخول)
-  r.post('/api/consultations', ({ body, ip }) => {
+  r.post('/api/consultations', async ({ body, ip }) => {
     if (!limiter.hit(`consult:${ip}`, 10, 600_000)) {
       throw new HttpError(429, 'تم استلام عدة طلبات مؤخرًا، انتظر قليلًا قبل المحاولة مجددًا');
     }
+    await verifyTurnstileToken(body.turnstileToken || body.captchaToken || body['cf-turnstile-response'], ip, cfg);
     const name = text(body.name, 'الاسم الكامل', { min: 2, max: 80 });
     const contactPhone = phone(body.phone);
     const storeName = text(body.storeName, 'اسم المتجر أو العلامة', { max: 80, optional: true });

@@ -198,6 +198,8 @@ function load(o = {}) {
     piiRetentionDays: Math.max(1, Number(o.piiRetentionDays ?? e.PII_RETENTION_DAYS ?? 30) || 30),
     alertWebhookUrl: String(o.alertWebhookUrl ?? e.ALERT_WEBHOOK_URL ?? '').trim(),
     errorWebhookUrl: String(o.errorWebhookUrl ?? e.ERROR_WEBHOOK_URL ?? '').trim(),
+    turnstileSiteKey: String(o.turnstileSiteKey ?? e.TURNSTILE_SITE_KEY ?? '').trim(),
+    turnstileSecretKey: String(o.turnstileSecretKey ?? e.TURNSTILE_SECRET_KEY ?? '').trim(),
     amazonPiiEnabled: flag(o.amazonPiiEnabled ?? e.AMAZON_PII_ENABLED, false),
     // تغيير الباقة دون دفع مسموح في بيئة التطوير غير المنشورة فقط
     allowPlanSelfService: flag(o.allowPlanSelfService ?? e.ALLOW_PLAN_SELF_SERVICE, !enforcedProd),

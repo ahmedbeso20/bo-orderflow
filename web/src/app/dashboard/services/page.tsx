@@ -4,27 +4,43 @@ import React, { useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
 import { api, ApiError } from '@/lib/api';
 import { useBootstrap } from '@/lib/useBootstrap';
-import { fmtDate, fmtEGP } from '@/lib/format';
+import { fmtDate } from '@/lib/format';
 import type { ServiceRequest, SupportTicket } from '@/lib/types';
+
+interface ExpertServiceMeta {
+  key: string;
+  title: string;
+  short?: string;
+  sla?: string;
+}
 
 export default function ServicesAndSupportPage() {
   const { data: boot } = useBootstrap();
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [requests, setRequests] = useState<ServiceRequest[]>([]);
+  const [serviceOptions, setServiceOptions] = useState<ExpertServiceMeta[]>([]);
   const [subject, setSubject] = useState('');
   const [message, setMessage] = useState('');
-  const [serviceKey, setServiceKey] = useState('account_setup');
+  const [serviceKey, setServiceKey] = useState('');
   const [serviceNotes, setServiceNotes] = useState('');
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
 
   async function loadAll() {
-    const [tRes, sRes] = await Promise.all([
-      api.get<{ tickets?: SupportTicket[] }>('/api/support/tickets'),
-      api.get<{ requests?: ServiceRequest[] }>('/api/services/requests')
-    ]);
-    setTickets(tRes.tickets || []);
-    setRequests(sRes.requests || []);
+    try {
+      const [tRes, sRes] = await Promise.all([
+        api.get<{ tickets?: SupportTicket[] }>('/api/support/tickets'),
+        api.get<{ services?: ExpertServiceMeta[]; requests?: ServiceRequest[] }>('/api/services/requests')
+      ]);
+      setTickets(tRes.tickets || []);
+      setRequests(sRes.requests || []);
+      if (sRes.services && sRes.services.length > 0) {
+        setServiceOptions(sRes.services);
+        setServiceKey((prev) => prev || sRes.services![0].key);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'تعذر تحميل البيانات');
+    }
   }
 
   useEffect(() => {
@@ -39,7 +55,7 @@ export default function ServicesAndSupportPage() {
       await api.post('/api/support/tickets', { subject: subject.trim(), message: message.trim() });
       setSubject('');
       setMessage('');
-      setNotice('تم فتح تذكرة الدعم بنجاح');
+      setNotice('تم فتح تذكرة الدعم بنجاح ✓');
       await loadAll();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر فتح التذكرة');
@@ -56,7 +72,7 @@ export default function ServicesAndSupportPage() {
         notes: serviceNotes.trim()
       });
       setServiceNotes('');
-      setNotice('تم إرسال طلب خدمة الخبراء بنجاح');
+      setNotice('تم إرسال طلب خدمة الخبراء بنجاح ✓');
       await loadAll();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر إرسال الطلب');
@@ -65,7 +81,7 @@ export default function ServicesAndSupportPage() {
 
   return (
     <AppShell title="خدمات الخبراء والدعم الفني" subtitle="افتح تذكرة دعم أو اطلب خدمة خبراء وتابع الردود" user={boot?.me}>
-      {notice && <p className="mb-4 text-sm font-bold text-emerald-700">{notice}</p>}
+      {notice && <p className="mb-4 text-sm font-bold text-emerald-700 dark:text-emerald-300">{notice}</p>}
       {error && <p className="mb-4 text-sm font-bold text-[var(--danger)]">{error}</p>}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -97,12 +113,10 @@ export default function ServicesAndSupportPage() {
         <section className="of-card p-6 space-y-4">
           <h2 className="font-extrabold text-base">طلبات خدمات الخبراء</h2>
           <form onSubmit={submitService} className="space-y-3">
-            <select className="of-input" value={serviceKey} onChange={(e) => setServiceKey(e.target.value)}>
-              <option value="account_setup">فتح وتوثيق حسابات البائعين (أمازون · نون · جوميا · ترينديول)</option>
-              <option value="ppc_ads">إدارة وتحسين الحملات الإعلانية الممولة (PPC)</option>
-              <option value="aplus_content">تصميم صفحات المنتجات ومحتوى A+ وصور الاستوديو</option>
-              <option value="full_management">الإدارة التشغيلية الكاملة لحسابات المتجر</option>
-              <option value="team_training">تدريب واعتماد فريق المتجر</option>
+            <select className="of-input" value={serviceKey} onChange={(e) => setServiceKey(e.target.value)} required>
+              {serviceOptions.map((s) => (
+                <option key={s.key} value={s.key}>{s.title}</option>
+              ))}
             </select>
             <textarea rows={3} className="of-input" placeholder="ملاحظات إضافية لفريق الخبراء..." value={serviceNotes} onChange={(e) => setServiceNotes(e.target.value)} />
             <button type="submit" className="rounded-xl bg-[#0C5CA4] px-5 py-2.5 text-xs font-bold text-white">طلب الخدمة</button>
@@ -111,11 +125,13 @@ export default function ServicesAndSupportPage() {
             {requests.map((r) => (
               <div key={r.id} className="rounded-xl border border-[var(--border)] p-3 text-sm space-y-1">
                 <div className="flex justify-between font-bold">
-                  <span>{r.serviceTitle}</span>
-                  <span className="text-xs font-mono-num">{fmtEGP(r.price)}</span>
+                  <span>{r.serviceTitle || r.service_title}</span>
+                  <span className="text-xs font-mono-num" dir="ltr">{r.refCode || r.ref_code || `#${r.id}`}</span>
                 </div>
-                <div className="text-xs text-[var(--muted)]">الحالة: {r.status}</div>
-                {r.adminNotes && <div className="text-xs text-emerald-700 dark:text-emerald-300">ملاحظة الإدارة: {r.adminNotes}</div>}
+                <div className="text-xs text-[var(--muted)]">الحالة: {r.status} · {fmtDate(r.createdAt || r.created_at)}</div>
+                {(r.adminNotes || r.admin_notes) && (
+                  <div className="text-xs text-emerald-700 dark:text-emerald-300">ملاحظة الإدارة: {r.adminNotes || r.admin_notes}</div>
+                )}
               </div>
             ))}
           </div>

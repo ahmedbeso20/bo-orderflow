@@ -12,11 +12,12 @@ const {
 } = require('../rbac');
 const { HttpError, bad, text, phone, email, password, money, integer, oneOf, latin, round2, toCsv, nowIso } = require('../util');
 const { PLANS } = require('../domain');
+const { gemini } = require('../ai');
 
 const DAY_MS = 86400_000;
 
 module.exports = (r, app) => {
-  const { q, tx, cfg, cipher, session, mailer, notify, logAudit, model, getPlatformSettings, setPlatformSetting } = app;
+  const { q, tx, cfg, cipher, session, mailer, notify, logAudit, logPiiAccess, model, getPlatformSettings, setPlatformSetting } = app;
   const dec = (v) => (cipher ? cipher.decrypt(v) : String(v || ''));
 
   const systemStatusOf = () => {
@@ -24,19 +25,26 @@ module.exports = (r, app) => {
     const lastBackup = backups[0] || null;
     const plat = getPlatformSettings();
     const unackSecurityEvents = q('SELECT COUNT(*) n FROM security_events WHERE acknowledged_at IS NULL').get().n;
+    const s3Configured = Boolean(cfg.backupS3Endpoint && cfg.backupS3Bucket && cfg.backupS3AccessKey && cfg.backupS3Secret);
     return {
       production: Boolean(cfg.enforcedProd),
       mailConfigured: Boolean(mailer && mailer.configured),
       mailProvider: mailer ? mailer.activeProvider : 'memory',
       smsConfigured: Boolean(app.sms && app.sms.configured),
+      smsProvider: app.sms ? app.sms.provider : 'none',
       paymentProvider: cfg.payments.provider || null,
       paymentMode: cfg.payments.provider === 'kashier' ? (cfg.payments.kashierMode || 'test') : (cfg.payments.provider || 'none'),
       piiRetentionDays: Math.max(1, Number(plat.pii_retention_days || cfg.piiRetentionDays || 30)),
       requireEmailVerification: plat.require_email_verification === '1',
-      lastBackupAt: lastBackup ? lastBackup.createdAt : null,
-      lastBackupFile: lastBackup ? lastBackup.file : null,
-      lastBackupEncrypted: lastBackup ? Boolean(lastBackup.encrypted) : false,
-      lastBackupUploadStatus: app.lastBackupUpload ? app.lastBackupUpload.status : (cfg.backupS3Bucket ? 'pending' : 'local_only'),
+      turnstileEnabled: Boolean(cfg.turnstileSecretKey),
+      s3Configured,
+      backupEncryptionConfigured: Boolean(cfg.backupEncryptionKey && cfg.backupEncryptionKey.length >= 32),
+      lastBackupAt: lastBackup ? lastBackup.createdAt : (plat.last_backup_at || null),
+      lastBackupFile: lastBackup ? (lastBackup.filename || lastBackup.file) : (plat.last_backup_file || null),
+      lastBackupEncrypted: lastBackup ? Boolean(lastBackup.encrypted) : (plat.last_backup_encrypted === '1'),
+      lastBackupUploadStatus: plat.last_backup_upload_status || (app.lastBackupUpload ? app.lastBackupUpload.status : (s3Configured ? 'pending' : 'local_only')),
+      lastBackupUploadedAt: plat.last_backup_uploaded_at || (app.lastBackupUpload ? app.lastBackupUpload.uploadedAt : null) || null,
+      lastBackupS3Key: plat.last_backup_s3_key || (app.lastBackupUpload ? app.lastBackupUpload.key : '') || '',
       unackSecurityEvents
     };
   };
@@ -346,10 +354,13 @@ module.exports = (r, app) => {
     return { clients: rows.map(clientRowOf), counts, total: rows.length };
   }, { owner: true });
 
-  r.get('/api/owner/clients/:id', ({ params }) => {
+  r.get('/api/owner/clients/:id', ({ user, params, ip }) => {
     const u = findClientStrict(params.id);
     const products = q('SELECT * FROM products WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id).map(model.productOf);
     const orders = q('SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id).map(model.orderOf);
+    if (orders.length > 0 && logPiiAccess) {
+      logPiiAccess({ actorId: user.id, ownerUserId: u.id, action: 'owner_view_client_orders', targetType: 'order', count: orders.length, ip });
+    }
     const payments = model.paymentsOf(u.id);
     const auditLogs = q(`SELECT a.*, adm.store_name AS admin_name, adm.phone AS admin_phone, adm.email AS admin_email, adm.role AS user_role
       FROM audit_log a LEFT JOIN users adm ON adm.id = a.admin_id
@@ -509,11 +520,21 @@ module.exports = (r, app) => {
   }, { owner: true });
 
   // النسخ الاحتياطي لقاعدة البيانات (VACUUM INTO مشفّر بـ AES-256-GCM عند توفر المفتاح + رفع اختياري إلى S3)
-  r.get('/api/owner/backups', () => ({
-    backups: app.listBackups ? app.listBackups() : [],
-    keepCount: app.cfg.backupKeepCount || 7,
-    lastBackupUpload: app.lastBackupUpload || null
-  }), { owner: true });
+  r.get('/api/owner/backups', () => {
+    const plat = getPlatformSettings();
+    const s3Configured = Boolean(cfg.backupS3Endpoint && cfg.backupS3Bucket && cfg.backupS3AccessKey && cfg.backupS3Secret);
+    return {
+      backups: app.listBackups ? app.listBackups() : [],
+      keepCount: app.cfg.backupKeepCount || 7,
+      s3Configured,
+      backupEncryptionConfigured: Boolean(cfg.backupEncryptionKey && cfg.backupEncryptionKey.length >= 32),
+      lastBackupUpload: {
+        status: plat.last_backup_upload_status || (app.lastBackupUpload ? app.lastBackupUpload.status : (s3Configured ? 'pending' : 'local_only')),
+        uploadedAt: plat.last_backup_uploaded_at || (app.lastBackupUpload ? app.lastBackupUpload.uploadedAt : null) || null,
+        key: plat.last_backup_s3_key || (app.lastBackupUpload ? app.lastBackupUpload.key : '') || ''
+      }
+    };
+  }, { owner: true });
 
   r.post('/api/owner/backup', ({ user, ip }) => {
     const backup = app.createBackup();
@@ -674,7 +695,7 @@ module.exports = (r, app) => {
   }, { owner: true });
 
   // 6. مسارات الاعتماد والمدفوعات والكوبونات تحت /api/owner/*
-  r.get('/api/owner/approvals', ({ query }) => {
+  r.get('/api/owner/approvals', ({ user, query, ip }) => {
     const statusFilter = ['pending', 'approved', 'rejected', 'all'].includes(query.status) ? query.status : 'pending';
     const typeFilter = ['all', 'product', 'order'].includes(query.type) ? query.type : 'all';
     const whereSql = statusFilter === 'all' ? 'u.is_demo = 0' : 'u.is_demo = 0 AND x.approval_status = ?';
@@ -690,6 +711,9 @@ module.exports = (r, app) => {
         ...model.orderOf(o), userId: o.user_id, storeName: o.store_name, storePhone: o.user_phone
       }))
       : [];
+    if (orders.length > 0 && logPiiAccess) {
+      logPiiAccess({ actorId: user.id, ownerUserId: null, action: 'owner_view_approvals_orders', targetType: 'order', count: orders.length, ip });
+    }
     return { products, orders };
   }, { owner: true });
 
@@ -934,5 +958,125 @@ module.exports = (r, app) => {
     }
     const fresh = q('SELECT s.*, u.store_name AS user_store_name FROM service_requests s LEFT JOIN users u ON u.id = s.user_id WHERE s.id = ?').get(reqRow.id);
     return { ok: true, request: serviceRowOf(fresh) };
+  }, { owner: true });
+
+  // 9. فحص جاهزية الإنتاج والتشخيص (Readiness & Diagnostics — بدون كشف أي أسرار)
+  r.get('/api/owner/readiness', () => {
+    const status = systemStatusOf();
+    const baseUrl = String(cfg.appUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const kashierConfigured = Boolean(
+      cfg.payments.provider === 'kashier' &&
+      cfg.payments.kashierMerchantId &&
+      cfg.payments.kashierApiKey
+    );
+    return {
+      ok: true,
+      production: status.production,
+      email: {
+        configured: status.mailConfigured,
+        provider: status.mailProvider,
+        fromConfigured: Boolean(cfg.mailFrom)
+      },
+      sms: {
+        configured: status.smsConfigured,
+        provider: status.smsProvider
+      },
+      kashier: {
+        active: cfg.payments.provider === 'kashier',
+        configured: kashierConfigured,
+        mode: cfg.payments.kashierMode || 'test',
+        webhookUrl: `${baseUrl}/api/billing/webhook/kashier`,
+        provider: cfg.payments.provider || 'none'
+      },
+      gemini: {
+        configured: Boolean(cfg.geminiKey),
+        model: cfg.geminiModel
+      },
+      backup: {
+        encryptionConfigured: status.backupEncryptionConfigured,
+        s3Configured: status.s3Configured,
+        lastBackupAt: status.lastBackupAt,
+        lastBackupFile: status.lastBackupFile,
+        lastBackupEncrypted: status.lastBackupEncrypted,
+        lastUploadStatus: status.lastBackupUploadStatus,
+        lastUploadedAt: status.lastBackupUploadedAt,
+        lastS3Key: status.lastBackupS3Key
+      },
+      turnstile: {
+        enabled: status.turnstileEnabled,
+        siteKeyConfigured: Boolean(cfg.turnstileSiteKey),
+        secretKeyConfigured: Boolean(cfg.turnstileSecretKey)
+      },
+      alerts: {
+        webhookConfigured: Boolean(cfg.alertWebhookUrl),
+        errorWebhookConfigured: Boolean(cfg.errorWebhookUrl),
+        unackSecurityEvents: status.unackSecurityEvents
+      },
+      systemStatus: status
+    };
+  }, { owner: true });
+
+  r.post('/api/owner/sms/test', async ({ user, body, ip }) => {
+    const targetRaw = body?.to || user.phone;
+    if (!targetRaw) throw bad('أدخل رقم هاتف صالحًا لاختبار الرسائل القصيرة');
+    const to = phone(targetRaw);
+    const result = await app.sms.send({
+      to,
+      message: 'OrderFlow: رسالة اختبار للتأكد من جاهزية مزوّد الرسائل القصيرة SMS.'
+    });
+    logAudit(user.id, 'platform.sms_test', 'sms', null, { to, provider: result.provider, delivered: Boolean(result.delivered) }, ip);
+    return {
+      ok: Boolean(result.delivered),
+      configured: Boolean(app.sms.configured),
+      provider: result.provider || app.sms.provider,
+      delivered: Boolean(result.delivered),
+      error: result.error || null
+    };
+  }, { owner: true });
+
+  r.post('/api/owner/payments/reconcile', async ({ user, ip }) => {
+    const result = typeof app.payments.reconcilePendingPayments === 'function'
+      ? await app.payments.reconcilePendingPayments()
+      : { checked: 0, reconciled: 0 };
+    logAudit(user.id, 'platform.payments_reconcile', 'payments', null, result || {}, ip);
+    return { ok: true, ...(result || {}) };
+  }, { owner: true });
+
+  r.post('/api/owner/ai/test', async ({ user, ip }) => {
+    if (!cfg.geminiKey) {
+      return { ok: false, configured: false, model: cfg.geminiModel, error: 'مفتاح GEMINI_API_KEY غير مضبوط في بيئة الخادم' };
+    }
+    try {
+      const reply = await gemini(cfg, {
+        prompt: 'أجب بكلمة واحدة فقط بالعربية: جاهز',
+        system: 'أجب بإيجاز شديد.'
+      });
+      logAudit(user.id, 'platform.ai_test', 'ai', null, { ok: true, model: cfg.geminiModel }, ip);
+      return { ok: true, configured: true, model: cfg.geminiModel, reply: String(reply || '').slice(0, 120) };
+    } catch (e) {
+      logAudit(user.id, 'platform.ai_test', 'ai', null, { ok: false, model: cfg.geminiModel, error: e.message }, ip);
+      return { ok: false, configured: true, model: cfg.geminiModel, error: e.message || 'تعذر الاتصال بنموذج الذكاء الاصطناعي' };
+    }
+  }, { owner: true });
+
+  r.post('/api/owner/backups/test-s3', async ({ user, ip }) => {
+    const result = await app.testS3Connection();
+    logAudit(user.id, 'platform.backup_s3_test', 'backup', null, { ok: Boolean(result.ok), configured: Boolean(result.configured), status: result.status || null }, ip);
+    return result;
+  }, { owner: true });
+
+  r.post('/api/owner/alerts/test', async ({ user, ip }) => {
+    const event = await app.sendSecurityAlert({
+      severity: 'low',
+      title: 'اختبار نظام التنبيهات الأمنية من لوحة المالك',
+      details: { initiatedBy: user.email || user.phone, test: true }
+    });
+    logAudit(user.id, 'platform.alert_test', 'security', event?.id || null, { webhookConfigured: Boolean(cfg.alertWebhookUrl) }, ip);
+    return {
+      ok: true,
+      eventId: event?.id || null,
+      webhookConfigured: Boolean(cfg.alertWebhookUrl),
+      mailConfigured: Boolean(mailer && mailer.configured)
+    };
   }, { owner: true });
 };

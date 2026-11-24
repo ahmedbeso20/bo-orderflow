@@ -577,9 +577,46 @@ module.exports = (r, app) => {
     if (!user.is_demo) {
       if (!limiter.hit(`pw:${user.id}`, 5, 600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول بعد قليل');
       if (!(await verifyPassword(String(body.password ?? ''), user.pass_hash))) throw new HttpError(403, 'كلمة المرور غير صحيحة');
-      logAudit(user.id, 'security.account_delete', 'user', user.id, { storeName: user.store_name, email: user.email || '' }, ip);
+      if (user.totp_enabled && user.totp_secret_enc) {
+        const code = String(body.code || body.totpCode || body.otp || '').trim();
+        let valid2fa = Boolean(code && verifyTotpCode(cipher.decrypt(user.totp_secret_enc), code));
+        if (!valid2fa && code) {
+          const normRec = normalizeRecoveryCode(code);
+          if (normRec.length >= 8) {
+            const recs = q('SELECT id, code_hash FROM totp_recovery_codes WHERE user_id = ? AND used_at IS NULL').all(user.id);
+            for (const rec of recs) {
+              if (await verifyPassword(normRec, rec.code_hash)) {
+                q('UPDATE totp_recovery_codes SET used_at = ? WHERE id = ?').run(nowIso(), rec.id);
+                valid2fa = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!valid2fa) {
+          throw new HttpError(401, 'أدخل رمز المصادقة الثنائية الصحيح لتأكيد حذف الحساب', { code: '2FA_REQUIRED' });
+        }
+      }
+      const now = nowIso();
+      const archivedCount = tx(() => {
+        const pays = q('SELECT * FROM plan_payments WHERE user_id = ?').all(user.id);
+        for (const p of pays) {
+          q(`INSERT INTO anonymized_payments (receipt_no, tx_ref, plan, cycle, amount, discount, currency, method, status, paid_at, created_at, anonymized_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(p.receipt_no || null, p.tx_ref, p.plan, p.cycle, p.amount, p.discount || 0, p.currency || 'EGP', p.method, p.status, p.updated_at || p.created_at, p.created_at, now);
+        }
+        logAudit(user.id, 'security.account_delete', 'user', user.id, {
+          storeName: user.store_name,
+          email: user.email || '',
+          anonymizedPayments: pays.length
+        }, ip);
+        q('DELETE FROM users WHERE id = ?').run(user.id);
+        return pays.length;
+      });
+      session.clear(res);
+      return { ok: true, anonymizedPayments: archivedCount };
     }
-    q('DELETE FROM users WHERE id = ?').run(user.id); // تُحذف كل بياناته تلقائيًا
+    q('DELETE FROM users WHERE id = ?').run(user.id); // تُحذف بيانات الحساب التجريبي تلقائيًا
     session.clear(res);
     return { ok: true };
   });

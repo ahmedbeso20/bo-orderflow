@@ -20,9 +20,9 @@ function createSms(cfg = {}) {
     (provider === 'twilio' && cfg.twilioAccountSid && cfg.twilioAuthToken && cfg.twilioFrom)
   );
 
-  async function send({ to, message }) {
+  async function send({ to, message, text } = {}) {
     const dest = formatEgyptE164(to);
-    const bodyText = String(message || '').trim();
+    const bodyText = String(message ?? text ?? '').trim();
     if (!dest || !bodyText) {
       return { delivered: false, provider: provider || 'none', error: 'رقم الهاتف أو نص الرسالة فارغ' };
     }

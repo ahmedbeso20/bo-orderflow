@@ -6,6 +6,7 @@ const {
 } = require('../auth');
 const { checkLoginStatus, getLoginRedirect } = require('../rbac');
 const { HttpError, bad, text, phone, email, password, clean, latin, nowIso } = require('../util');
+const { verifyTurnstileToken } = require('../turnstile');
 const { seedDemo } = require('../seed');
 
 const BAD_LOGIN = 'بيانات الدخول غير صحيحة';
@@ -54,14 +55,20 @@ module.exports = (r, app) => {
     // إبطال الرموز السابقة غير المستخدمة لنفس الرقم
     q("UPDATE auth_tokens SET used_at = ? WHERE user_id = ? AND type = 'phone_otp' AND target = ? AND used_at IS NULL")
       .run(new Date(now).toISOString(), userId, phoneNum);
-    q("INSERT INTO auth_tokens (user_id, type, token_hash, target, attempts, expires_at, created_at) VALUES (?, 'phone_otp', ?, ?, 0, ?, ?)")
+    const ins = q("INSERT INTO auth_tokens (user_id, type, token_hash, target, attempts, expires_at, created_at) VALUES (?, 'phone_otp', ?, ?, 0, ?, ?)")
       .run(userId, tokenHash, phoneNum, expiresAt, new Date(now).toISOString());
 
-    await sms.send({
+    const msgText = `${purposeText}: ${code} (صالح لمدة ١٠ دقائق)`;
+    const sent = await sms.send({
       to: phoneNum,
       code,
-      text: `${purposeText}: ${code} (صالح لمدة ١٠ دقائق)`
+      message: msgText
     });
+    if (!sent || !sent.delivered) {
+      q('UPDATE auth_tokens SET used_at = ? WHERE id = ?').run(nowIso(), Number(ins.lastInsertRowid));
+      limiter.reset(`otp-cool:${phoneNum}`);
+      throw new HttpError(502, sent?.error || 'تعذر إرسال رسالة التحقق SMS حاليًا');
+    }
     return { code, expiresAt };
   };
 
@@ -149,7 +156,9 @@ module.exports = (r, app) => {
       smsEnabled: Boolean(sms && sms.configured),
       requireEmailVerification: plat.require_email_verification === '1',
       piiRetentionDays: Math.max(1, Number(plat.pii_retention_days || cfg.piiRetentionDays || 30)),
-      termsVersion: TERMS_VERSION
+      termsVersion: TERMS_VERSION,
+      turnstileEnabled: Boolean(cfg.turnstileSecretKey && cfg.turnstileSiteKey),
+      turnstileSiteKey: cfg.turnstileSiteKey || ''
     };
   }, { auth: false });
 
@@ -162,6 +171,7 @@ module.exports = (r, app) => {
   // تسجيل حساب عميل جديد — يُحفظ تلقائيًا بحالة قيد المراجعة (pending) ولا يُمنح جلسة دخول حتى تتم الموافقة
   r.post('/api/auth/register', async ({ body, res, ip }) => {
     if (!limiter.hit(`reg:${ip}`, 15, 3600_000)) throw new HttpError(429, 'محاولات كثيرة، حاول لاحقًا');
+    await verifyTurnstileToken(body.turnstileToken || body.captchaToken || body['cf-turnstile-response'], ip, cfg);
     const platSettings = getPlatformSettings();
     if (platSettings.registration_open === '0') {
       throw new HttpError(403, 'التسجيل الجديد متوقف مؤقتًا من قِبل إدارة المنصة.');
@@ -351,6 +361,7 @@ module.exports = (r, app) => {
   // طلب رمز استعادة كلمة المرور (عبر البريد الإلكتروني أو SMS OTP للحسابات بدون بريد)
   r.post('/api/auth/forgot-password', async ({ body, ip }) => {
     if (!limiter.hit(`forgot-ip:${ip}`, 15, 600_000)) throw new HttpError(429, 'طلبات كثيرة، حاول بعد قليل');
+    await verifyTurnstileToken(body.turnstileToken || body.captchaToken || body['cf-turnstile-response'], ip, cfg);
     const raw = clean(body.id || body.email || body.phone);
     if (!raw) throw bad('أدخل رقم الموبايل أو البريد الإلكتروني المسجّل');
     const byMail = raw.includes('@');
@@ -413,6 +424,19 @@ module.exports = (r, app) => {
     const hash = await hashPassword(nextPw);
     q('UPDATE users SET pass_hash = ?, token_ver = token_ver + 1 WHERE id = ?').run(hash, u.id);
     const fresh = q('SELECT * FROM users WHERE id = ?').get(u.id);
+    logAudit(u.id, 'security.password_reset', 'user', u.id, { method: 'email', totpEnabled: Boolean(fresh.totp_enabled) }, ip);
+    if (fresh.totp_enabled === 1) {
+      session.clear(res);
+      const challengeToken = session.issue2faChallenge(fresh);
+      return {
+        ok: true,
+        passwordReset: true,
+        requiresLogin: true,
+        requires2fa: true,
+        challengeToken,
+        message: 'تم تحديث كلمة المرور بنجاح. سجّل الدخول الآن بكلمة المرور الجديدة ورمز المصادقة الثنائية.'
+      };
+    }
     session.issue(res, fresh);
     return { ok: true, me: model.meOf(fresh), redirectTo: getLoginRedirect(fresh) };
   }, { auth: false });
@@ -430,6 +454,19 @@ module.exports = (r, app) => {
     q('UPDATE users SET pass_hash = ?, token_ver = token_ver + 1, phone_verified_at = COALESCE(phone_verified_at, ?) WHERE id = ?')
       .run(hash, now, u.id);
     const fresh = q('SELECT * FROM users WHERE id = ?').get(u.id);
+    logAudit(u.id, 'security.password_reset', 'user', u.id, { method: 'sms_otp', totpEnabled: Boolean(fresh.totp_enabled) }, ip);
+    if (fresh.totp_enabled === 1) {
+      session.clear(res);
+      const challengeToken = session.issue2faChallenge(fresh);
+      return {
+        ok: true,
+        passwordReset: true,
+        requiresLogin: true,
+        requires2fa: true,
+        challengeToken,
+        message: 'تم تحديث كلمة المرور بنجاح. سجّل الدخول الآن بكلمة المرور الجديدة ورمز المصادقة الثنائية.'
+      };
+    }
     session.issue(res, fresh);
     return { ok: true, me: model.meOf(fresh), redirectTo: getLoginRedirect(fresh) };
   }, { auth: false });
@@ -464,6 +501,7 @@ module.exports = (r, app) => {
 
   r.post('/api/contact', async ({ body, user, ip }) => {
     if (!limiter.hit(`contact:${ip}`, 10, 600_000)) throw new HttpError(429, 'طلبات كثيرة، حاول بعد قليل');
+    await verifyTurnstileToken(body.turnstileToken || body.captchaToken || body['cf-turnstile-response'], ip, cfg);
     const name = text(body.name, 'الاسم', { min: 2, max: 80 });
     const contact = text(body.contact || body.email || body.phone, 'وسيلة التواصل', { min: 4, max: 120 });
     const subject = text(body.subject || 'استفسار عام', 'الموضوع', { min: 2, max: 140 });

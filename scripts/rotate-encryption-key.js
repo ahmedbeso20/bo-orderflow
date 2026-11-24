@@ -16,10 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createFieldCipher, deriveSubkey } = require('../src/security');
-
-function normalizePhone(v) {
-  return String(v || '').replace(/[^\d+]/g, '').trim();
-}
+const { normalizePhoneForIndex } = require('../src/model');
 
 function rotateEncryptionKey({ dbPath, oldKey, newKey }) {
   if (!oldKey || !newKey) throw new Error('OLD_KEY and NEW_KEY are required');
@@ -62,7 +59,7 @@ function rotateEncryptionKey({ dbPath, oldKey, newKey }) {
       const custPlain = dec(o.customer);
       const phonePlain = dec(o.phone);
       const addrPlain = dec(o.address);
-      const normPhone = normalizePhone(phonePlain);
+      const normPhone = normalizePhoneForIndex(phonePlain);
       updOrder.run(
         enc(custPlain),
         enc(phonePlain),
@@ -81,12 +78,12 @@ function rotateEncryptionKey({ dbPath, oldKey, newKey }) {
       const phonePlain = dec(c.phone);
       const emailPlain = dec(c.email);
       const addrPlain = dec(c.address);
-      const normPhone = normalizePhone(phonePlain);
+      const normPhone = normalizePhoneForIndex(phonePlain);
       updCust.run(
         enc(namePlain),
         enc(phonePlain),
         normPhone ? newCipher.blindIndex(normPhone) : '',
-        emailPlain && oldCipher.isEncrypted(c.email) ? enc(emailPlain) : (c.email || ''),
+        emailPlain ? enc(emailPlain) : '',
         enc(addrPlain),
         c.id
       );

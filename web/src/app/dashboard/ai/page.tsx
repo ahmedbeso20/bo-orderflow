@@ -11,6 +11,7 @@ export default function AiStudioPage() {
   const { data: boot } = useBootstrap();
   const [tab, setTab] = useState<AiTab>('listing');
   const [productName, setProductName] = useState('');
+  const [features, setFeatures] = useState('');
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -23,21 +24,61 @@ export default function AiStudioPage() {
     setOutput('');
     try {
       if (tab === 'listing') {
-        const res = await api.post<{ title?: string; description?: string; bullets?: string[] }>('/api/ai/listing', {
+        const res = await api.post<{
+          data?: { title?: string; desc?: string; description?: string; bullets?: string[]; keywords?: string[] };
+        }>('/api/ai/listing', {
           name: productName.trim(),
-          market: 'amazon'
+          features: features.trim()
         });
-        setOutput([res.title, '', res.description, '', ...(res.bullets || []).map((b) => `• ${b}`)].filter(Boolean).join('\n'));
+        const d = res.data || {};
+        const lines = [
+          d.title ? `العنوان المقترح: ${d.title}` : '',
+          d.desc || d.description || '',
+          ...(d.bullets || []).map((b) => `• ${b}`),
+          d.keywords && d.keywords.length > 0 ? `\nالكلمات المفتاحية: ${d.keywords.join(' ، ')}` : ''
+        ];
+        setOutput(lines.filter(Boolean).join('\n'));
       } else if (tab === 'advisor') {
-        const res = await api.post<{ summary?: string; actions?: string[] }>('/api/ai/advisor', {});
-        setOutput([res.summary, '', ...(res.actions || []).map((a) => `• ${a}`)].filter(Boolean).join('\n'));
+        const res = await api.post<{
+          advisor?: {
+            data?: {
+              summary?: string;
+              headline?: string;
+              tips?: Array<string | { title?: string; detail?: string; text?: string }>;
+              actions?: string[];
+            };
+          };
+        }>('/api/ai/advisor', {});
+        const d = res.advisor?.data || {};
+        const tips = (d.tips || []).map((t) =>
+          typeof t === 'string' ? `• ${t}` : `• ${t.title ? `${t.title}: ` : ''}${t.detail || t.text || ''}`
+        );
+        const acts = (d.actions || []).map((a) => `✓ ${a}`);
+        setOutput([d.headline, d.summary, '', ...tips, ...acts].filter(Boolean).join('\n'));
       } else if (tab === 'pricing') {
-        const res = await api.post<{ summary?: string; recommendations?: Array<{ name: string; suggestedPrice: number; reason: string }> }>('/api/ai/pricing', {});
-        const lines = (res.recommendations || []).map((r) => `• ${r.name}: سعر مقترح ${r.suggestedPrice} ج.م — ${r.reason}`);
-        setOutput([res.summary, '', ...lines].filter(Boolean).join('\n'));
+        const res = await api.post<{
+          market?: {
+            name?: string;
+            text?: string;
+            minPrice?: number;
+            avgPrice?: number;
+            maxPrice?: number;
+            recommendedPrice?: number;
+            advice?: string;
+          };
+        }>('/api/ai/price-radar', { name: productName.trim() });
+        const m = res.market || {};
+        const lines = [
+          m.name ? `تحليل أسعار السوق المصري لـ: ${m.name}` : '',
+          m.minPrice && m.maxPrice ? `النطاق السعري: ${m.minPrice} - ${m.maxPrice} ج.م (المتوسط: ${m.avgPrice || '—'} ج.م)` : '',
+          m.recommendedPrice ? `السعر التنافسي المقترح: ${m.recommendedPrice} ج.م` : '',
+          m.advice || '',
+          m.text || ''
+        ];
+        setOutput(lines.filter(Boolean).join('\n'));
       } else {
-        const res = await api.post<{ reply?: string }>('/api/ai/chat', { message: prompt.trim() });
-        setOutput(res.reply || '');
+        const res = await api.post<{ answer?: string }>('/api/ai/chat', { question: prompt.trim() });
+        setOutput(res.answer || '');
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر تشغيل الأداة');
@@ -47,7 +88,7 @@ export default function AiStudioPage() {
   }
 
   return (
-    <AppShell title="استوديو الذكاء الاصطناعي" subtitle="توليد وصف A+، مستشار النمو، رادار التسعير، ومحادثة البائع" user={boot?.me}>
+    <AppShell title="استوديو الذكاء الاصطناعي" subtitle="توليد وصف A+، مستشار النمو، رادار التسعير، ومساعد البائع" user={boot?.me}>
       <div className="flex flex-wrap gap-2 mb-6">
         {[
           ['listing', '✍️ كاتب وصف A+'],
@@ -69,16 +110,31 @@ export default function AiStudioPage() {
       </div>
 
       <form onSubmit={runTool} className="of-card p-6 space-y-4 mb-6">
-        {tab === 'listing' && (
-          <div className="space-y-1">
-            <label className="text-xs font-bold block">اسم المنتج لتوليد وصف A+ وكلمات SEO</label>
-            <input
-              className="of-input"
-              placeholder="مثال: سماعة بلوتوث لاسلكية بعزل ضوضاء"
-              value={productName}
-              onChange={(e) => setProductName(e.target.value)}
-              required
-            />
+        {(tab === 'listing' || tab === 'pricing') && (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="text-xs font-bold block">
+                {tab === 'listing' ? 'اسم المنتج لتوليد وصف A+ وكلمات SEO' : 'اسم المنتج لفحص أسعاره في السوق المصري'}
+              </label>
+              <input
+                className="of-input"
+                placeholder="مثال: سماعة بلوتوث لاسلكية بعزل ضوضاء"
+                value={productName}
+                onChange={(e) => setProductName(e.target.value)}
+                required
+              />
+            </div>
+            {tab === 'listing' && (
+              <div className="space-y-1">
+                <label className="text-xs font-bold block">أبرز المميزات (اختياري)</label>
+                <input
+                  className="of-input"
+                  placeholder="مثال: بطارية 30 ساعة، شحن سريع Type-C، ضمان سنة"
+                  value={features}
+                  onChange={(e) => setFeatures(e.target.value)}
+                />
+              </div>
+            )}
           </div>
         )}
         {tab === 'chat' && (

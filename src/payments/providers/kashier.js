@@ -21,19 +21,26 @@ function buildKashierOrderHash({ merchantId, orderId, amount, currency, apiKey }
 }
 
 /**
+ * توليد توقيع HMAC-SHA256 لبيانات Webhook الخاصة بكاشير وفق مفاتيح signatureKeys
+ */
+function buildSignature(data, signatureKeys, apiKey) {
+  if (!apiKey || !data || typeof data !== 'object') return '';
+  const keys = Array.isArray(signatureKeys) ? [...signatureKeys].sort() : [];
+  if (!keys.length) return '';
+  const queryString = keys
+    .map((k) => `${k}=${data[k] === undefined || data[k] === null ? '' : data[k]}`)
+    .join('&');
+  return crypto.createHmac('sha256', String(apiKey)).update(queryString).digest('hex');
+}
+
+/**
  * التحقق من توقيع Webhook القادم من Kashier بزمن ثابت (timingSafeEqual)
  */
 function verifyKashierWebhookSignature({ payload, signature, apiKey }) {
   if (!apiKey || !signature || !payload || typeof payload !== 'object') return false;
   const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
-  const keys = Array.isArray(data.signatureKeys) ? [...data.signatureKeys].sort() : [];
-  if (!keys.length) return false;
-
-  const queryString = keys
-    .map((k) => `${k}=${data[k] === undefined || data[k] === null ? '' : data[k]}`)
-    .join('&');
-
-  const expected = crypto.createHmac('sha256', String(apiKey)).update(queryString).digest('hex');
+  const expected = buildSignature(data, data.signatureKeys, apiKey);
+  if (!expected) return false;
   const given = String(signature).trim();
   const a = Buffer.from(given, 'utf8');
   const b = Buffer.from(expected, 'utf8');
@@ -181,5 +188,6 @@ module.exports = function createKashier(cfg) {
 };
 
 module.exports.buildKashierOrderHash = buildKashierOrderHash;
+module.exports.buildSignature = buildSignature;
 module.exports.verifyKashierWebhookSignature = verifyKashierWebhookSignature;
 module.exports.buildKashierCheckoutUrl = buildKashierCheckoutUrl;

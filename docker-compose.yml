@@ -19,6 +19,9 @@ services:
       DB_FILE: /app/data/omniarab.db
       DB_PATH: /app/data/omniarab.db
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001}
+      APP_URL: ${APP_URL:-http://localhost:3001}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      ALLOW_IFRAME: ${ALLOW_IFRAME:-0}
     volumes:
       - orderflow_data:/app/data
     healthcheck:
@@ -28,9 +31,10 @@ services:
       retries: 3
 
   web:
-    image: node:22-alpine
+    build:
+      context: ./web
+      dockerfile: Dockerfile
     container_name: orderflow-web
-    working_dir: /web
     restart: unless-stopped
     depends_on:
       api:
@@ -40,9 +44,12 @@ services:
     environment:
       NODE_ENV: production
       API_ORIGIN: http://api:3000
-    volumes:
-      - ./web:/web
-    command: sh -c "npm ci && npm run build && npm run start"
+      ALLOW_IFRAME: ${ALLOW_IFRAME:-0}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   orderflow_data:

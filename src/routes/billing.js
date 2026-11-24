@@ -43,6 +43,7 @@ module.exports = (r, app) => {
     const activeCoupons = q('SELECT * FROM coupons WHERE active = 1 ORDER BY id ASC').all().map(model.couponOf);
     return {
       plan: model.planOf(user),
+      plans: Object.values(PLANS),
       payments: model.paymentsOf(user.id),
       gateway,
       methods: gateway.methods,

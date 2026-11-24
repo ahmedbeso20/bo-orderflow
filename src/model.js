@@ -145,7 +145,7 @@ function createModel(q, cipher = null, opts = {}) {
       name: plainName,
       customer: plainName,
       phone: dec(c.phone),
-      email: c.email || '',
+      email: dec(c.email),
       gov: c.gov || '',
       address: dec(c.address),
       notes: c.notes || '',

@@ -805,6 +805,63 @@ async function uploadBackupToS3(filePath, cfg) {
   return { uploaded: true, key: objectKey, status: res.status };
 }
 
+/** اختبار اتصال S3 / Cloudflare R2 / B2 عبر طلب HEAD موقّع بـ AWS SigV4 */
+async function testS3Connection(cfg = {}) {
+  if (!cfg.backupS3Endpoint || !cfg.backupS3Bucket || !cfg.backupS3AccessKey || !cfg.backupS3Secret) {
+    return { ok: false, configured: false, error: 'إعدادات تخزين S3/R2 غير مكتملة (BACKUP_S3_ENDPOINT / BUCKET / ACCESS_KEY / SECRET).' };
+  }
+  const fetchFn = cfg.fetch || globalThis.fetch;
+  const endpoint = String(cfg.backupS3Endpoint).replace(/\/+$/, '');
+  const bucket = encodeURIComponent(cfg.backupS3Bucket);
+  const urlStr = `${endpoint}/${bucket}`;
+  const u = new URL(urlStr);
+  const payloadHash = crypto.createHash('sha256').update('').digest('hex');
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const region = cfg.backupS3Region || 'auto';
+  const service = 's3';
+
+  const canonicalHeaders = `host:${u.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['HEAD', u.pathname, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    crypto.createHash('sha256').update(canonicalRequest).digest('hex')
+  ].join('\n');
+
+  const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+  const kDate = hmac(`AWS4${cfg.backupS3Secret}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  const kSigning = hmac(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+  const authorization = `AWS4-HMAC-SHA256 Credential=${cfg.backupS3AccessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  try {
+    const res = await fetchFn(urlStr, {
+      method: 'HEAD',
+      headers: {
+        Host: u.host,
+        'x-amz-date': amzDate,
+        'x-amz-content-sha256': payloadHash,
+        Authorization: authorization
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (res && (res.ok || res.status === 200)) {
+      return { ok: true, configured: true, status: res.status, bucket: cfg.backupS3Bucket, endpoint };
+    }
+    return { ok: false, configured: true, status: res?.status || 0, error: `رفض خادم S3 الاتصال (HTTP ${res?.status || 'ERR'})` };
+  } catch (err) {
+    return { ok: false, configured: true, error: `تعذر الوصول إلى خادم S3: ${err?.message || 'خطأ شبكة'}` };
+  }
+}
+
 /**
  * إنشاء نسخة احتياطية آمنة ومتسقة باستخدام SQLite VACUUM INTO
  * مع التشفير التلقائي AES-256-GCM عند ضبط encryptionKey وحذف النسخة غير المشفرة والاحتفاظ بآخر keepCount نسخ فقط
@@ -902,5 +959,5 @@ function openDb(file) {
   return { db, q, tx, close: () => db.close() };
 }
 
-module.exports = { openDb, backupDatabase, listBackups, encryptBackupFile, decryptBackupFile, uploadBackupToS3 };
+module.exports = { openDb, backupDatabase, listBackups, encryptBackupFile, decryptBackupFile, uploadBackupToS3, testS3Connection };
 

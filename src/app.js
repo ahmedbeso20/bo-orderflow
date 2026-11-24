@@ -1,7 +1,7 @@
 'use strict';
 const http = require('node:http');
 const { load } = require('./config');
-const { openDb, backupDatabase, listBackups, uploadBackupToS3 } = require('./db');
+const { openDb, backupDatabase, listBackups, uploadBackupToS3, testS3Connection } = require('./db');
 const { createSession, hashPasswordSync, requireOwner, requireModerator, requirePermission, requireAdmin } = require('./auth');
 const { ROLES, requiredRoleForPath, canAccessPanel } = require('./rbac');
 const { createModel, normalizePhoneForIndex } = require('./model');
@@ -138,6 +138,9 @@ function createApp(overrides = {}) {
   if (cfg.enforcedProd && !mailer.configured) {
     console.warn('[mailer] تحذير إنتاج: لم يُضبط أي مزود بريد إلكتروني (Resend أو SMTP أو Mail Webhook) — لن تصل رسائل التأكيد والتنبيهات.');
   }
+  if (cfg.enforcedProd && (!cfg.backupEncryptionKey || cfg.backupEncryptionKey.length < 32)) {
+    console.warn('[backup] تحذير إنتاج: لم يُضبط BACKUP_ENCRYPTION_KEY (32 حرفًا على الأقل) — النسخ الاحتياطية ستُحفظ بدون تشفير.');
+  }
 
   const notify = (userId, type, title, body = '', link = '') => {
     try {
@@ -192,6 +195,8 @@ function createApp(overrides = {}) {
       last_backup_at: '',
       last_backup_file: '',
       last_backup_upload_status: '',
+      last_backup_uploaded_at: '',
+      last_backup_s3_key: '',
       last_backup_encrypted: '0'
     };
     for (const row of rows) {
@@ -247,25 +252,28 @@ function createApp(overrides = {}) {
       }
 
       const plainCustomers = store.q(
-        `SELECT id, user_id, name, phone, address, phone_hash FROM customers
+        `SELECT id, user_id, name, phone, email, address, phone_hash FROM customers
          WHERE (name <> '' AND name NOT LIKE 'enc:v1:%')
             OR (phone <> '' AND phone NOT LIKE 'enc:v1:%')
+            OR (email <> '' AND email NOT LIKE 'enc:v1:%')
             OR (address <> '' AND address NOT LIKE 'enc:v1:%')
             OR (phone <> '' AND (phone_hash IS NULL OR phone_hash = ''))`
       ).all();
       for (const c of plainCustomers) {
         const plainName = cipher.isEncrypted(c.name) ? cipher.decrypt(c.name) : String(c.name || '');
         const plainPhone = cipher.isEncrypted(c.phone) ? cipher.decrypt(c.phone) : String(c.phone || '');
+        const plainEmail = cipher.isEncrypted(c.email) ? cipher.decrypt(c.email) : String(c.email || '');
         const plainAddr = cipher.isEncrypted(c.address) ? cipher.decrypt(c.address) : String(c.address || '');
         let pHash = plainPhone ? cipher.blindIndex(normalizePhoneForIndex(plainPhone)) : '';
         if (pHash) {
           const dup = store.q('SELECT id FROM customers WHERE user_id = ? AND phone_hash = ? AND id <> ?').get(c.user_id, pHash, c.id);
           if (dup) pHash = '';
         }
-        store.q('UPDATE customers SET name = ?, phone = ?, address = ?, phone_hash = ? WHERE id = ?')
+        store.q('UPDATE customers SET name = ?, phone = ?, email = ?, address = ?, phone_hash = ? WHERE id = ?')
           .run(
             plainName ? cipher.encrypt(plainName) : '',
             plainPhone ? cipher.encrypt(plainPhone) : '',
+            plainEmail ? cipher.encrypt(plainEmail) : '',
             plainAddr ? cipher.encrypt(plainAddr) : '',
             pHash,
             c.id
@@ -330,6 +338,7 @@ function createApp(overrides = {}) {
   app.connectors = createConnectors(app);
   app.couriers = createCouriers(app);
 
+  app.testS3Connection = () => testS3Connection(cfg);
   app.createBackup = () => {
     const res = backupDatabase(store.db, cfg.backupDir, cfg.backupKeepCount, {
       encryptionKey: cfg.backupEncryptionKey || ''
@@ -340,20 +349,38 @@ function createApp(overrides = {}) {
     const s3Configured = Boolean(cfg.backupS3Endpoint && cfg.backupS3Bucket && cfg.backupS3AccessKey && cfg.backupS3Secret);
     if (s3Configured) {
       setPlatformSetting('last_backup_upload_status', 'uploading');
-      uploadBackupToS3(res.file, cfg)
+      app.lastBackupUpload = { status: 'uploading', uploadedAt: null, key: '' };
+      res.uploadPromise = uploadBackupToS3(res.file, cfg)
         .then((u) => {
-          setPlatformSetting('last_backup_upload_status', u.uploaded ? `uploaded:${u.key}` : 'skipped');
+          const status = u.uploaded ? `uploaded:${u.key}` : 'skipped';
+          const uploadedAt = u.uploaded ? nowIso() : '';
+          app.lastBackupUpload = { status, uploadedAt: uploadedAt || null, key: u.key || '' };
+          try {
+            setPlatformSetting('last_backup_upload_status', status);
+            if (u.uploaded) {
+              setPlatformSetting('last_backup_uploaded_at', uploadedAt);
+              setPlatformSetting('last_backup_s3_key', u.key || '');
+            }
+          } catch (_) {}
+          return u;
         })
         .catch((err) => {
-          setPlatformSetting('last_backup_upload_status', `failed:${String(err?.message || 'error').slice(0, 120)}`);
-          app.sendSecurityAlert({
-            severity: 'high',
-            title: 'فشل رفع النسخة الاحتياطية إلى التخزين الخارجي S3',
-            details: { file: res.filename, error: String(err?.message || '').slice(0, 180) }
-          }).catch(() => {});
+          const errMsg = String(err?.message || 'error').slice(0, 120);
+          const status = `failed:${errMsg}`;
+          app.lastBackupUpload = { status, uploadedAt: null, key: '', error: errMsg };
+          try {
+            setPlatformSetting('last_backup_upload_status', status);
+            app.sendSecurityAlert({
+              severity: 'high',
+              title: 'فشل رفع النسخة الاحتياطية إلى التخزين الخارجي S3',
+              details: { file: res.filename, error: String(err?.message || '').slice(0, 180) }
+            }).catch(() => {});
+          } catch (_) {}
+          return { uploaded: false, error: errMsg };
         });
     } else {
       setPlatformSetting('last_backup_upload_status', 'local_only');
+      app.lastBackupUpload = { status: 'local_only', uploadedAt: null, key: '' };
     }
     return res;
   };
@@ -698,7 +725,19 @@ function createApp(overrides = {}) {
     store.close();
   };
 
-  return { server, cfg, close, app, mailer, sms, logger, db: store.db };
+  return {
+    server,
+    cfg,
+    close,
+    app,
+    mailer,
+    sms,
+    logger,
+    db: store.db,
+    runPurge: app.runPurge,
+    sendSecurityAlert: app.sendSecurityAlert,
+    createBackup: app.createBackup
+  };
 }
 
 module.exports = { createApp };

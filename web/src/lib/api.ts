@@ -7,12 +7,14 @@
 
 export class ApiError extends Error {
   status: number;
+  code?: string;
   data: Record<string, unknown>;
 
   constructor(status: number, message: string, data: Record<string, unknown> = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = typeof data.code === 'string' ? data.code : undefined;
     this.data = data;
   }
 }
@@ -55,5 +57,5 @@ export const api = {
   get: <T = Record<string, unknown>>(path: string) => apiRequest<T>('GET', path),
   post: <T = Record<string, unknown>>(path: string, body?: unknown) => apiRequest<T>('POST', path, body),
   put: <T = Record<string, unknown>>(path: string, body?: unknown) => apiRequest<T>('PUT', path, body),
-  del: <T = Record<string, unknown>>(path: string) => apiRequest<T>('DELETE', path)
+  del: <T = Record<string, unknown>>(path: string, body?: unknown) => apiRequest<T>('DELETE', path, body)
 };

@@ -3345,6 +3345,7 @@ const PUBLIC_PAGES = {
           <input id="ct-subj" maxlength="140" placeholder="استفسار عن الباقات / طلب دعم فني">
           <label for="ct-msg">الرسالة</label>
           <textarea id="ct-msg" rows="4" maxlength="2000" placeholder="اكتب رسالتك هنا..."></textarea>
+          <div id="ts-contact" style="margin:8px 0"></div>
           <p id="ct-err" class="er-tx" style="min-height:20px;font-size:13px;font-weight:700"></p>
           <button class="btn" type="submit" style="width:100%">إرسال الرسالة</button>
         </form>
@@ -3353,13 +3354,16 @@ const PUBLIC_PAGES = {
   `
 };
 
-const renderPublicPage = (slug) => `
+const renderPublicPage = (slug) => {
+  if (slug === 'contact') setTimeout(() => mountTurnstile('ts-contact'), 50);
+  return `
   ${renderPublicHeader()}
   <main class="container public-page-wrap">
     ${PUBLIC_PAGES[slug]()}
   </main>
   ${renderSiteFooter()}
 `;
+};
 
 const renderResetPasswordPage = (query) => {
   const token = query.get('token') || '';
@@ -4127,6 +4131,48 @@ act('confirm-proceed', async () => {
 });
 
 // نافذة تسجيل الدخول / إنشاء حساب
+const turnstileTokens = {};
+function loadTurnstileSdk() {
+  if (typeof window === 'undefined') return Promise.resolve(null);
+  if (window.turnstile) return Promise.resolve(window.turnstile);
+  return new Promise((resolve) => {
+    const existing = document.querySelector('script[data-cf-turnstile="1"]');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(window.turnstile || null), { once: true });
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    s.async = true;
+    s.defer = true;
+    s.dataset.cfTurnstile = '1';
+    s.onload = () => resolve(window.turnstile || null);
+    s.onerror = () => resolve(null);
+    document.head.appendChild(s);
+  });
+}
+function mountTurnstile(slotId) {
+  const cfg = state.authConfig || {};
+  turnstileTokens[slotId] = '';
+  if (!cfg.turnstileEnabled || !cfg.turnstileSiteKey) return;
+  loadTurnstileSdk().then((ts) => {
+    const el = document.getElementById(slotId);
+    if (!ts || !el) return;
+    el.innerHTML = '';
+    ts.render(el, {
+      sitekey: cfg.turnstileSiteKey,
+      theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
+      language: 'ar',
+      callback: (tok) => { turnstileTokens[slotId] = tok || ''; },
+      'expired-callback': () => { turnstileTokens[slotId] = ''; },
+      'error-callback': () => { turnstileTokens[slotId] = ''; }
+    });
+  });
+}
+function getTurnstileToken(slotId) {
+  return turnstileTokens[slotId] || '';
+}
+
 actions.auth = (el) => {
   state.authMode = +el.dataset.m;
   const up = state.authMode === 1;
@@ -4154,6 +4200,7 @@ actions.auth = (el) => {
           <input type="checkbox" id="auth-terms" style="width:auto;min-height:auto;margin-top:3px">
           <span>أوافق على <a href="#/terms" class="pr-tx" data-a="close-dlg">الشروط والأحكام</a> و<a href="#/privacy" class="pr-tx" data-a="close-dlg">سياسة الخصوصية</a></span>
         </label>
+        <div id="ts-register" style="margin:8px 0"></div>
       ` : ''}
       <p id="auth-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
       <button class="btn" style="width:100%" type="submit">${up ? 'إرسال طلب إنشاء الحساب' : 'تسجيل الدخول'}</button>
@@ -4165,6 +4212,7 @@ actions.auth = (el) => {
     <hr style="border:0;border-top:1px solid var(--bd);margin:14px 0">
     <button class="btn btn-gh" style="width:100%" data-a="demo">أو جرّب لوحة تحكم تجريبية بدون تسجيل</button>
   `);
+  if (up) setTimeout(() => mountTurnstile('ts-register'), 40);
 };
 
 act('auth-submit', async () => {
@@ -4186,7 +4234,8 @@ act('auth-submit', async () => {
         email: $('#auth-email')?.value.trim() || '',
         phone: id,
         password,
-        termsAccepted: true
+        termsAccepted: true,
+        turnstileToken: getTurnstileToken('ts-register')
       });
     } else {
       r = await api('POST', '/api/auth/login', { id, password });
@@ -4275,10 +4324,12 @@ actions['forgot-password'] = () => {
         : 'أدخل البريد الإلكتروني المسجل بحسابك لإرسال رابط استعادة كلمة المرور (صالح لمدة ٣٠ دقيقة لمرة واحدة).'}</p>
       <label for="fp-id">${smsOn ? 'البريد الإلكتروني أو رقم الموبايل' : 'البريد الإلكتروني'}</label>
       <input id="fp-id" dir="ltr" placeholder="${smsOn ? '010xxxxxxxx أو sales@store.com' : 'sales@store.com'}">
+      <div id="ts-forgot" style="margin:8px 0"></div>
       <p id="fp-err" class="er-tx" role="alert" style="min-height:20px;font-size:13px;font-weight:700"></p>
       <button class="btn" style="width:100%" type="submit">إرسال رمز الاستعادة</button>
     </form>
   `);
+  setTimeout(() => mountTurnstile('ts-forgot'), 40);
 };
 
 let otpCooldownTimer = null;
@@ -4308,7 +4359,7 @@ act('forgot-password-submit', async () => {
   const id = $('#fp-id')?.value.trim();
   if (!id) { if (err) err.textContent = 'أدخل رقم الموبايل أو البريد الإلكتروني'; return; }
   try {
-    const r = await api('POST', '/api/auth/forgot-password', { id });
+    const r = await api('POST', '/api/auth/forgot-password', { id, turnstileToken: getTurnstileToken('ts-forgot') });
     closeDlg();
     showToast(r.message || 'تم إرسال رمز الاستعادة ✓');
     if (r.method === 'sms') {
@@ -4330,6 +4381,25 @@ act('resend-reset-otp', async () => {
   startOtpCooldown('#btn-resend-otp', 60);
 });
 
+function handlePostResetResponse(r) {
+  showToast(r.message || 'تم تعيين كلمة المرور الجديدة بنجاح ✓');
+  if (r && r.requires2fa && r.challengeToken) {
+    openDialog('🛡️ التحقق بالمصادقة الثنائية (2FA)', `
+      <form data-submit="login-2fa-submit" novalidate>
+        <input type="hidden" id="l2fa-token" value="${esc(r.challengeToken)}">
+        <p class="mu" style="margin-bottom:14px;font-size:13.5px;line-height:1.7">${esc(r.message || 'تم تحديث كلمة المرور. أدخل رمز المصادقة الثنائية لإكمال الدخول.')}</p>
+        <label for="l2fa-code">رمز التحقق (٦ أرقام) أو كود استرداد</label>
+        <input id="l2fa-code" dir="ltr" autocomplete="one-time-code" maxlength="12" placeholder="123456 أو XXXX-XXXX" style="font-size:18px;letter-spacing:3px;text-align:center">
+        <p id="l2fa-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
+        <button class="btn" style="width:100%" type="submit">تأكيد الدخول</button>
+      </form>
+    `);
+    return;
+  }
+  go('#/');
+  actions.auth({ dataset: { m: 0 } });
+}
+
 act('reset-password-otp-submit', async () => {
   const err = $('#rp-otp-err');
   if (err) err.textContent = '';
@@ -4338,9 +4408,7 @@ act('reset-password-otp-submit', async () => {
   const password = $('#rp-otp-pass')?.value || '';
   try {
     const r = await api('POST', '/api/auth/reset-password/otp', { phone, code, password });
-    showToast(r.message || 'تم تعيين كلمة المرور الجديدة بنجاح ✓');
-    go('#/');
-    actions.auth({ dataset: { m: 0 } });
+    handlePostResetResponse(r);
   } catch (e) {
     if (err) err.textContent = e.message;
   }
@@ -4353,9 +4421,7 @@ act('reset-password-submit', async () => {
   const password = $('#rp-pass')?.value || '';
   try {
     const r = await api('POST', '/api/auth/reset-password', { token, password });
-    showToast(r.message || 'تم تعيين كلمة المرور الجديدة بنجاح ✓');
-    go('#/');
-    actions.auth({ dataset: { m: 0 } });
+    handlePostResetResponse(r);
   } catch (e) {
     if (err) err.textContent = e.message;
   }
@@ -4402,7 +4468,8 @@ act('contact-submit', async () => {
     name: $('#ct-name')?.value.trim(),
     contact: ($('#ct-contact')?.value || $('#ct-email')?.value || $('#ct-phone')?.value || '').trim(),
     subject: ($('#ct-subj')?.value || $('#ct-subject')?.value || '').trim(),
-    message: ($('#ct-msg')?.value || $('#ct-body')?.value || '').trim()
+    message: ($('#ct-msg')?.value || $('#ct-body')?.value || '').trim(),
+    turnstileToken: getTurnstileToken('ts-contact')
   };
   try {
     const r = await api('POST', '/api/contact', body);
@@ -5217,9 +5284,11 @@ actions['open-consult'] = () => {
       </div>
       <label for="con-notes">ملاحظات إضافية (اختياري)</label>
       <textarea id="con-notes" name="notes" rows="2" placeholder="أخبرنا عن فئة منتجاتك أو التحدي الذي تريد حله..."></textarea>
+      <div id="ts-consult" style="margin:8px 0"></div>
       <button type="submit" class="btn btn-ac" style="width:100%" id="btn-con-submit">${ico('send', 15)} تأكيد حجز الاستشارة المجانية</button>
     </form>
   `);
+  setTimeout(() => mountTurnstile('ts-consult'), 40);
 };
 
 actions['select-service-card'] = (el) => {
@@ -5244,7 +5313,7 @@ act('submit-consult', async () => {
   const btn = $('#btn-con-submit');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> جاري تسجيل طلب الاستشارة...'; }
   try {
-    const r = await api('POST', '/api/consultations', { name, phone, storeName, serviceKey, platforms, monthlyOrders, notes });
+    const r = await api('POST', '/api/consultations', { name, phone, storeName, serviceKey, platforms, monthlyOrders, notes, turnstileToken: getTurnstileToken('ts-consult') });
     const req = r.request || {};
     openDialog('تم حجز استشارتك المجانية بنجاح', `
       <div class="consult-success-box">

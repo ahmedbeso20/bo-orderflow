@@ -10,7 +10,7 @@ try {
 const str = (v, max) => String(v ?? '').slice(0, max);
 const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } };
 
-const OFFICIAL_FALLBACK_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+const OFFICIAL_FALLBACK_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 
 function supportsThinking(model) {
   return /^(gemini-4-(hydrogen|neon|argon|carbon)|gemini-3)/.test(String(model || '').trim());
@@ -43,7 +43,7 @@ async function gemini(cfg, { prompt, system, schema, search, thinking }) {
   const isMockTest = cfg.fetch && cfg.fetch !== globalThis.fetch;
 
   if (isMockTest) {
-    const model = cfg.geminiModel || 'gemini-3-flash-preview';
+    const model = cfg.geminiModel || 'gemini-4-hydrogen';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }] };
     if (system) body.systemInstruction = { parts: [{ text: system }] };

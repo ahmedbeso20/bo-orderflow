@@ -5,14 +5,32 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '@/lib/api';
 
+interface LoginResponse {
+  ok?: boolean;
+  requires2fa?: boolean;
+  challengeToken?: string;
+  setup2faRequired?: boolean;
+  me?: { role?: string; setup2faRequired?: boolean };
+}
+
 export default function LoginPage() {
   const router = useRouter();
-  const [identifier, setIdentifier] = useState('');
+  const [id, setId] = useState('');
   const [password, setPassword] = useState('');
   const [challengeToken, setChallengeToken] = useState('');
   const [totpCode, setTotpCode] = useState('');
   const [loading, setLoading] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
   const [error, setError] = useState('');
+
+  function routeAfterAuth(res: LoginResponse) {
+    if (res.setup2faRequired || res.me?.setup2faRequired) {
+      router.push('/setup-2fa');
+      return;
+    }
+    const role = res.me?.role;
+    router.push(role === 'owner' ? '/owner' : role === 'moderator' ? '/moderator' : '/dashboard');
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -20,30 +38,41 @@ export default function LoginPage() {
     setError('');
     try {
       if (challengeToken) {
-        const res = await api.post<{ user?: { role?: string } }>('/api/auth/2fa/verify-login', {
+        const res = await api.post<LoginResponse>('/api/auth/login/2fa', {
           challengeToken,
           code: totpCode.trim()
         });
-        const role = res.user?.role;
-        router.push(role === 'owner' ? '/owner' : role === 'moderator' ? '/moderator' : '/dashboard');
+        routeAfterAuth(res);
         return;
       }
 
-      const res = await api.post<{ requires2fa?: boolean; challengeToken?: string; user?: { role?: string } }>(
-        '/api/auth/login',
-        { identifier: identifier.trim(), password }
-      );
+      const res = await api.post<LoginResponse>('/api/auth/login', {
+        id: id.trim(),
+        password
+      });
 
       if (res.requires2fa && res.challengeToken) {
         setChallengeToken(res.challengeToken);
         return;
       }
-      const role = res.user?.role;
-      router.push(role === 'owner' ? '/owner' : role === 'moderator' ? '/moderator' : '/dashboard');
+      routeAfterAuth(res);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'تعذر تسجيل الدخول');
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleDemo() {
+    setDemoLoading(true);
+    setError('');
+    try {
+      const res = await api.post<LoginResponse>('/api/auth/demo', {});
+      routeAfterAuth(res);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'تعذر تشغيل الحساب التجريبي');
+    } finally {
+      setDemoLoading(false);
     }
   }
 
@@ -64,8 +93,8 @@ export default function LoginPage() {
                 <input
                   className="of-input"
                   dir="ltr"
-                  value={identifier}
-                  onChange={(e) => setIdentifier(e.target.value)}
+                  value={id}
+                  onChange={(e) => setId(e.target.value)}
                   placeholder="merchant@store.eg أو 010xxxxxxxx"
                   required
                 />
@@ -83,17 +112,24 @@ export default function LoginPage() {
               </div>
             </>
           ) : (
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold block">رمز المصادقة الثنائية (2FA — 6 أرقام)</label>
+            <div className="space-y-2">
+              <label className="text-xs font-bold block">رمز المصادقة الثنائية (6 أرقام أو كود استرداد)</label>
               <input
                 className="of-input text-center tracking-widest font-mono-num"
                 dir="ltr"
-                maxLength={6}
+                maxLength={12}
                 value={totpCode}
                 onChange={(e) => setTotpCode(e.target.value)}
-                placeholder="123456"
+                placeholder="123456 أو XXXX-XXXX"
                 required
               />
+              <button
+                type="button"
+                onClick={() => { setChallengeToken(''); setTotpCode(''); setError(''); }}
+                className="text-xs text-[var(--muted)] hover:text-[var(--primary)]"
+              >
+                العودة لتغيير الحساب
+              </button>
             </div>
           )}
 
@@ -107,6 +143,17 @@ export default function LoginPage() {
             {loading ? 'جارٍ التحقق...' : challengeToken ? 'تأكيد رمز 2FA والدخول' : 'دخول إلى لوحة التحكم'}
           </button>
         </form>
+
+        {!challengeToken && (
+          <button
+            type="button"
+            onClick={() => void handleDemo()}
+            disabled={demoLoading}
+            className="w-full rounded-xl border border-[var(--border)] py-2.5 text-xs font-bold hover:bg-[var(--surface-alt)] disabled:opacity-60"
+          >
+            {demoLoading ? 'جارٍ تجهيز المتجر التجريبي...' : 'تجربة المنصة فورًا بحساب تجريبي'}
+          </button>
+        )}
 
         <div className="flex items-center justify-between text-xs text-[var(--muted)] pt-2 border-t border-[var(--border)]">
           <Link href="/forgot-password" className="hover:text-[var(--primary)] font-semibold">نسيت كلمة المرور؟</Link>

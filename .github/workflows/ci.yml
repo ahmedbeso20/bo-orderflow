@@ -26,5 +26,17 @@ jobs:
       - name: Run unit & integration test suite
         run: npm test
 
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci || npm install
+
+      - name: Web TypeScript check
+        working-directory: web
+        run: npm run typecheck
+
+      - name: Web production build
+        working-directory: web
+        run: npm run build
+
       - name: Audit production dependencies (non-blocking)
         run: npm audit --omit=dev --audit-level=high || true

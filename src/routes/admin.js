@@ -6,7 +6,7 @@ const { PLANS } = require('../domain');
 const DAY_MS = 86400_000;
 
 module.exports = (r, app) => {
-  const { q, tx, cipher, session, notify, logAudit, model } = app;
+  const { q, tx, cipher, session, notify, logAudit, logPiiAccess, model } = app;
   const dec = (v) => (cipher ? cipher.decrypt(v) : String(v || ''));
 
   const clientRowOf = (u) => ({
@@ -155,10 +155,13 @@ module.exports = (r, app) => {
   }, { owner: true });
 
   // 3. تفاصيل عميل محدد
-  r.get('/api/admin/clients/:id', ({ params }) => {
+  r.get('/api/admin/clients/:id', ({ user, params, ip }) => {
     const u = findClient(params.id);
     const products = q('SELECT * FROM products WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id).map(model.productOf);
     const orders = q('SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(u.id).map(model.orderOf);
+    if (orders.length > 0 && logPiiAccess) {
+      logPiiAccess({ actorId: user.id, ownerUserId: u.id, action: 'owner_view_client_orders', targetType: 'order', count: orders.length, ip });
+    }
     const payments = model.paymentsOf(u.id);
     const auditLogs = q(`SELECT a.*, adm.store_name AS admin_name, adm.phone AS admin_phone
       FROM audit_log a LEFT JOIN users adm ON adm.id = a.admin_id
@@ -249,7 +252,7 @@ module.exports = (r, app) => {
   }, { admin: true });
 
   // 7. طابور الاعتمادات (المنتجات والطلبات)
-  r.get('/api/admin/approvals', ({ query }) => {
+  r.get('/api/admin/approvals', ({ user, query, ip }) => {
     const statusFilter = ['pending', 'approved', 'rejected', 'all'].includes(query.status) ? query.status : 'pending';
     const typeFilter = ['all', 'product', 'order'].includes(query.type) ? query.type : 'all';
     const search = String(query.q ?? '').trim().slice(0, 60);
@@ -290,6 +293,9 @@ module.exports = (r, app) => {
         storeName: o.store_name,
         userPhone: o.user_phone
       }));
+    }
+    if (orders.length > 0 && logPiiAccess) {
+      logPiiAccess({ actorId: user.id, ownerUserId: null, action: 'owner_view_approvals_orders', targetType: 'order', count: orders.length, ip });
     }
 
     const pendingProducts = q("SELECT COUNT(*) n FROM products p JOIN users u ON u.id = p.user_id WHERE u.is_demo = 0 AND p.approval_status = 'pending'").get().n;

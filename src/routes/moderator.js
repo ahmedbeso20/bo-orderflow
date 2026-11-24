@@ -6,7 +6,7 @@ const { HttpError, bad, text, integer, nowIso } = require('../util');
 const { PLANS } = require('../domain');
 
 module.exports = (r, app) => {
-  const { q, tx, cfg, mailer, notify, logAudit, model } = app;
+  const { q, tx, cfg, mailer, notify, logAudit, logPiiAccess, model } = app;
 
   const pendingClientRowOf = (u) => ({
     id: u.id,
@@ -173,7 +173,7 @@ module.exports = (r, app) => {
   }, { moderator: true, permission: 'reject_clients' });
 
   // 5. مراجعة المنتجات والطلبات (متاحة فقط إذا فعّل المالك صلاحية review_products_orders للمشرف)
-  r.get('/api/moderator/approvals', ({ query }) => {
+  r.get('/api/moderator/approvals', ({ user, query, ip }) => {
     const statusFilter = ['pending', 'approved', 'rejected', 'all'].includes(query.status) ? query.status : 'pending';
     const whereSql = statusFilter === 'all'
       ? "u.role = 'client' AND u.is_demo = 0"
@@ -189,6 +189,9 @@ module.exports = (r, app) => {
       WHERE ${whereSql} ORDER BY x.id DESC LIMIT 60`).all(...args).map((o) => ({
       ...model.orderOf(o), userId: o.user_id, storeName: o.store_name, storePhone: o.user_phone
     }));
+    if (orders.length > 0 && logPiiAccess) {
+      logPiiAccess({ actorId: user.id, ownerUserId: null, action: 'moderator_view_approvals_orders', targetType: 'order', count: orders.length, ip });
+    }
     return { products, orders };
   }, { moderator: true, permission: 'review_products_orders' });
 
