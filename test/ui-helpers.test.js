@@ -78,6 +78,41 @@ test('renderBentoVisual returns clean HTML micro-visuals for marquee bento slots
   }
 });
 
+test('OrderFlowUI auth icons, password strength evaluator, and auth form validation work deterministically', () => {
+  for (const name of ['eyeOff', 'user', 'userPlus', 'logIn', 'arrowRight']) {
+    const svg = ui.svgIcon(name, 17);
+    assert.ok(svg.startsWith('<svg '), `missing svg wrapper for ${name}`);
+    assert.ok(ui.ICONS[name], `missing icon definition for ${name}`);
+  }
+
+  assert.equal(ui.evaluatePasswordStrength('').level, 'empty');
+  assert.equal(ui.evaluatePasswordStrength('abc').level, 'weak');
+  assert.equal(ui.evaluatePasswordStrength('abcdefgh').level, 'fair');
+  assert.equal(ui.evaluatePasswordStrength('store1234').level, 'good');
+  assert.equal(ui.evaluatePasswordStrength('Store@2026!').level, 'strong');
+
+  assert.equal(ui.validateAuthForm(0, { id: '', password: '' }).valid, false);
+  assert.equal(ui.validateAuthForm(0, { id: 'owner@store.eg', password: '' }).field, 'auth-pass');
+  assert.equal(ui.validateAuthForm(0, { id: 'owner@store.eg', password: 'secret' }).valid, true);
+
+  assert.equal(ui.validateAuthForm(1, { store: 'أ', email: 'a@b.eg', id: '01012345678', password: 'Store1234', termsAccepted: true }).field, 'auth-store');
+  assert.equal(ui.validateAuthForm(1, { store: 'متجر النور', email: 'bad-email', id: '01012345678', password: 'Store1234', termsAccepted: true }).field, 'auth-email');
+  assert.equal(ui.validateAuthForm(1, { store: 'متجر النور', email: 'a@b.eg', id: '12345', password: 'Store1234', termsAccepted: true }).field, 'auth-id');
+  assert.equal(ui.validateAuthForm(1, { store: 'متجر النور', email: 'a@b.eg', id: '01012345678', password: 'weak', termsAccepted: true }).field, 'auth-pass');
+  assert.equal(ui.validateAuthForm(1, { store: 'متجر النور', email: 'a@b.eg', id: '01012345678', password: 'Store1234', termsAccepted: false }).field, 'auth-terms');
+  assert.equal(ui.validateAuthForm(1, { store: 'متجر النور', email: 'a@b.eg', id: '01012345678', password: 'Store1234', termsAccepted: true }).valid, true);
+
+  const authMod = require('../public/js/auth-pages.js');
+  const loginHtml = authMod.renderAuthPage(0, { ico: ui.svgIcon, esc: (s) => String(s), ORDERFLOW_LOGO_SVG: '<svg></svg>' });
+  assert.ok(loginHtml.includes('auth-card is-login'));
+  assert.ok(loginHtml.includes('auth-circle-cta'));
+  assert.ok(loginHtml.includes('إنشاء حساب'));
+  const regHtml = authMod.renderAuthPage(1, { ico: ui.svgIcon, esc: (s) => String(s), ORDERFLOW_LOGO_SVG: '<svg></svg>' });
+  assert.ok(regHtml.includes('auth-card is-register'));
+  assert.ok(regHtml.includes('auth-pw-meter'));
+  assert.ok(regHtml.includes('تسجيل الدخول'));
+});
+
 test('OrderFlowGrowth exposes partner certifications, 3-tab solutions, expert services, guides, and onboarding calculator', () => {
   const growth = require('../public/js/growth-suite.js');
   assert.equal(growth.PARTNER_CERTIFICATIONS.length, 5);

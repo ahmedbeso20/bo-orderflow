@@ -173,6 +173,7 @@ const DEFAULT_UI = {
   orderStatusFilter: -1,
   orderPage: 1,
   authMode: 0,
+  authView: { step: 'form', showPass: false, pendingMessage: '', pendingStore: '', challengeToken: '', challengeMessage: '', requiresLoginCaptcha: false },
   customerQuery: '',
   authConfig: { smsEnabled: false, requireEmailVerification: false, piiRetentionDays: 30 },
   helpQuery: '',
@@ -3546,6 +3547,8 @@ function parseRoute(rawHash) {
   const path = pathPart.replace(/\/+$/, '');
 
   if (!path) return { type: 'landing', viewKey: '', params: {}, query };
+  if (path === 'login') return { type: 'auth', viewKey: 'login', params: { mode: 0 }, query };
+  if (path === 'register') return { type: 'auth', viewKey: 'register', params: { mode: 1 }, query };
   if (path === 'guides') return { type: 'guides', viewKey: 'guides', params: {}, query };
   if (PUBLIC_PAGES[path]) return { type: 'public', viewKey: path, params: {}, query };
   if (path === 'reset-password') return { type: 'reset-password', viewKey: path, params: {}, query };
@@ -3591,6 +3594,30 @@ async function renderApp(keepScroll = false) {
     root.removeAttribute('aria-busy');
     root.innerHTML = renderLanding();
     enhanceA11y(root);
+    if (!keepScroll) window.scrollTo(0, 0);
+    return;
+  }
+
+  if (parsed.type === 'auth') {
+    if (me && !me.setup2faRequired) {
+      go(roleHomeHash(me));
+      return;
+    }
+    const mode = parsed.viewKey === 'register' ? 1 : 0;
+    if (state.authMode !== mode) {
+      state.authMode = mode;
+      state.authView = { step: 'form', showPass: false, pendingMessage: '', pendingStore: '', challengeToken: '', challengeMessage: '', requiresLoginCaptcha: false };
+    }
+    root.removeAttribute('aria-busy');
+    const renderer = window.OrderFlowAuth && window.OrderFlowAuth.renderAuthPage;
+    root.innerHTML = renderer
+      ? renderer(mode, { ico, esc, ORDERFLOW_LOGO_SVG, authViewState: state.authView })
+      : renderLanding();
+    enhanceA11y(root);
+    if (state.authView.step === 'form') {
+      if (mode === 1) setTimeout(() => mountTurnstile('ts-register'), 40);
+      else if (state.authView.requiresLoginCaptcha) setTimeout(() => mountTurnstile('ts-login'), 40);
+    }
     if (!keepScroll) window.scrollTo(0, 0);
     return;
   }
@@ -3702,9 +3729,8 @@ async function renderApp(keepScroll = false) {
   }
 
   if (!me) {
-    go('#/');
+    go('#/login');
     showToast('سجّل الدخول للوصول إلى لوحة التحكم');
-    actions.auth({ dataset: { m: 0 } });
     return;
   }
 
@@ -3746,9 +3772,13 @@ const boot = async () => {
   } else if ((sess && sess.authenticated) || getImpersonateToken()) {
     await loadSession();
   }
-  // توجيه المسار المباشر /owner أو /moderator للمخوّلين فقط
+  // توجيه المسارات المباشرة (/login, /register, /owner, /moderator)
   if (!location.hash) {
-    if ((location.pathname === '/owner' || location.pathname.startsWith('/owner/')) && me && me.role === 'owner') {
+    if (location.pathname === '/login' || location.pathname === '/login/') {
+      history.replaceState(null, '', '/#/login');
+    } else if (location.pathname === '/register' || location.pathname === '/register/') {
+      history.replaceState(null, '', '/#/register');
+    } else if ((location.pathname === '/owner' || location.pathname.startsWith('/owner/')) && me && me.role === 'owner') {
       history.replaceState(null, '', '/#/owner');
     } else if ((location.pathname === '/moderator' || location.pathname.startsWith('/moderator/')) && me && me.role === 'moderator') {
       history.replaceState(null, '', '/#/moderator');
@@ -4206,93 +4236,143 @@ function getTurnstileToken(slotId) {
   return turnstileTokens[slotId] || '';
 }
 
+function navigateToAuth(mode) {
+  const up = Number(mode) === 1;
+  closeDlg();
+  state.mobileNavOpen = false;
+  state.authMode = up ? 1 : 0;
+  state.authView = {
+    step: 'form',
+    showPass: false,
+    pendingMessage: '',
+    pendingStore: '',
+    challengeToken: '',
+    challengeMessage: '',
+    requiresLoginCaptcha: false
+  };
+  const targetHash = up ? '#/register' : '#/login';
+  if (location.hash === targetHash) {
+    renderApp(false);
+  } else {
+    go(targetHash);
+  }
+}
+
 actions.auth = (el) => {
-  state.authMode = +el.dataset.m;
-  const up = state.authMode === 1;
-  openDialog(up ? 'إنشاء حساب جديد على OrderFlow' : 'تسجيل الدخول إلى OrderFlow', `
-    <form data-submit="auth-submit" novalidate>
-      <p class="mu" style="margin-bottom:14px;font-size:13.5px">${up
-        ? 'أنشئ حساب متجرك الآن؛ سيُراجع فريق الإدارة طلبك ويُفعّل حسابك خلال وقت قصير.'
-        : 'أدخل بريدك الإلكتروني أو رقم الموبايل وكلمة المرور للدخول إلى حسابك.'}</p>
-      ${up ? `
-        <label for="auth-store">اسم المتجر أو العلامة التجارية</label>
-        <input id="auth-store" maxlength="60" autocomplete="organization" placeholder="مثال: متجر النور للإلكترونيات">
-        <label for="auth-fullname">الاسم الكامل (اختياري)</label>
-        <input id="auth-fullname" maxlength="80" autocomplete="name" placeholder="مثال: أحمد محمود">
-        <label for="auth-email">البريد الإلكتروني</label>
-        <input id="auth-email" type="email" dir="ltr" autocomplete="email" placeholder="owner@yourstore.com">` : ''}
-      <label for="auth-id">${up ? 'رقم الموبايل (واتساب)' : 'البريد الإلكتروني أو رقم الموبايل'}</label>
-      <input id="auth-id" dir="ltr" autocomplete="username" ${up ? 'inputmode="tel"' : ''} placeholder="${up ? '010xxxxxxxx' : 'name@store.com أو 010xxxxxxxx'}">
-      <div class="row" style="justify-content:space-between">
-        <label for="auth-pass" style="margin-bottom:5px">كلمة المرور</label>
-        ${!up ? `<a class="pr-tx" style="font-size:12px;font-weight:700;cursor:pointer" data-a="forgot-password">نسيت كلمة المرور؟</a>` : ''}
-      </div>
-      <input id="auth-pass" type="password" autocomplete="${up ? 'new-password' : 'current-password'}" placeholder="${up ? '٨ أحرف على الأقل' : '••••••••'}">
-      ${up ? `
-        <label class="row" style="gap:8px;align-items:flex-start;margin:10px 0 6px;font-size:13px;cursor:pointer">
-          <input type="checkbox" id="auth-terms" style="width:auto;min-height:auto;margin-top:3px">
-          <span>أوافق على <a href="#/terms" class="pr-tx" data-a="close-dlg">الشروط والأحكام</a> و<a href="#/privacy" class="pr-tx" data-a="close-dlg">سياسة الخصوصية</a></span>
-        </label>
-        <div id="ts-register" style="margin:8px 0"></div>
-      ` : ''}
-      <p id="auth-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
-      <button class="btn" style="width:100%" type="submit">${up ? 'إرسال طلب إنشاء الحساب' : 'تسجيل الدخول'}</button>
-      <p class="mu ctr" style="margin-top:14px;font-size:13px">
-        ${up ? 'لديك حساب بالفعل؟' : 'ليس لديك حساب؟'}
-        <a class="pr-tx" style="font-weight:700;cursor:pointer" data-a="auth" data-m="${up ? 0 : 1}">${up ? 'سجّل الدخول' : 'أنشئ حسابًا جديدًا'}</a>
-      </p>
-    </form>
-    <hr style="border:0;border-top:1px solid var(--bd);margin:14px 0">
-    <button class="btn btn-gh" style="width:100%" data-a="demo">أو جرّب لوحة تحكم تجريبية بدون تسجيل</button>
-  `);
-  if (up) setTimeout(() => mountTurnstile('ts-register'), 40);
+  navigateToAuth(el?.dataset?.m);
+};
+
+actions['auth-switch'] = (el) => {
+  navigateToAuth(el?.dataset?.m);
+};
+
+actions['auth-back-login'] = () => {
+  navigateToAuth(0);
+};
+
+actions['toggle-auth-pass'] = (el) => {
+  const inp = $('#auth-pass');
+  if (!inp) return;
+  const nextVisible = inp.type === 'password';
+  inp.type = nextVisible ? 'text' : 'password';
+  state.authView.showPass = nextVisible;
+  el.innerHTML = ico(nextVisible ? 'eyeOff' : 'eye', 17);
+  el.setAttribute('aria-label', nextVisible ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور');
+  el.setAttribute('aria-pressed', nextVisible ? 'true' : 'false');
+};
+
+inputs['auth-pass-strength'] = (el) => {
+  const meter = $('#auth-pw-meter');
+  const label = $('#auth-pw-label');
+  const checks = $('#auth-pw-checks');
+  if (!meter || typeof UI.evaluatePasswordStrength !== 'function') return;
+  const res = UI.evaluatePasswordStrength(el.value);
+  meter.dataset.level = res.level;
+  if (label) label.textContent = res.label;
+  if (checks) {
+    checks.innerHTML = [
+      `<span class="${res.hasMinLen ? 'is-met' : ''}">${res.hasMinLen ? '✓ ' : ''}٨+ أحرف</span>`,
+      `<span class="${res.hasLetter ? 'is-met' : ''}">${res.hasLetter ? '✓ ' : ''}حرف</span>`,
+      `<span class="${res.hasNumber ? 'is-met' : ''}">${res.hasNumber ? '✓ ' : ''}رقم</span>`
+    ].join('<span aria-hidden="true"> · </span>');
+  }
 };
 
 act('auth-submit', async () => {
   const up = state.authMode === 1;
   const err = $('#auth-err');
-  err.textContent = '';
-  const id = $('#auth-id').value.trim();
-  const password = $('#auth-pass').value;
-  if (up && !$('#auth-terms')?.checked) {
-    err.textContent = 'يجب الموافقة على الشروط وسياسة الخصوصية للمتابعة';
+  const submitBtn = $('#auth-submit-btn');
+  if (err) err.textContent = '';
+
+  const store = $('#auth-store')?.value.trim() || '';
+  const fullName = $('#auth-fullname')?.value.trim() || '';
+  const emailVal = $('#auth-email')?.value.trim() || '';
+  const id = $('#auth-id')?.value.trim() || '';
+  const password = $('#auth-pass')?.value || '';
+  const termsAccepted = Boolean($('#auth-terms')?.checked);
+
+  if (typeof UI.validateAuthForm === 'function') {
+    const check = UI.validateAuthForm(up ? 1 : 0, { store, email: emailVal, id, password, termsAccepted });
+    if (!check.valid) {
+      if (err) err.textContent = check.message;
+      const focusEl = check.field ? document.getElementById(check.field) : null;
+      if (focusEl && typeof focusEl.focus === 'function') focusEl.focus();
+      return;
+    }
+  } else if (up && !termsAccepted) {
+    if (err) err.textContent = 'يجب الموافقة على الشروط وسياسة الخصوصية للمتابعة';
     return;
   }
+
+  const prevBtnHtml = submitBtn ? submitBtn.innerHTML : '';
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = `<span>${up ? 'جارٍ إنشاء الحساب...' : 'جارٍ التحقق...'}</span>`;
+  }
+
   let r;
   try {
     if (up) {
       r = await api('POST', '/api/auth/register', {
-        store: $('#auth-store').value.trim(),
-        fullName: $('#auth-fullname')?.value.trim() || '',
-        email: $('#auth-email')?.value.trim() || '',
+        store,
+        fullName,
+        email: emailVal,
         phone: id,
         password,
         termsAccepted: true,
         turnstileToken: getTurnstileToken('ts-register')
       });
     } else {
-      r = await api('POST', '/api/auth/login', { id, password });
+      const loginPayload = { id, password };
+      const tsTok = getTurnstileToken('ts-login');
+      if (tsTok) loginPayload.turnstileToken = tsTok;
+      r = await api('POST', '/api/auth/login', loginPayload);
     }
   } catch (e) {
-    err.textContent = e.message;
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = prevBtnHtml;
+    }
+    if (!up && e && e.data && e.data.requiresCaptcha && !state.authView.requiresLoginCaptcha) {
+      state.authView.requiresLoginCaptcha = true;
+      renderApp(true);
+      const errAfter = $('#auth-err');
+      if (errAfter) errAfter.textContent = e.message;
+      return;
+    }
+    if (err) err.textContent = e.message;
     return;
   }
 
   // دورة حياة حساب العميل: الحساب الجديد قيد المراجعة ولا يُسمح له بالدخول قبل التفعيل
   if (up && r && r.pending) {
-    openDialog('تم استلام طلب التسجيل بنجاح', `
-      <div class="rbac-pending-box">
-        <div class="rbac-pending-icon" aria-hidden="true">${ico('clock', 26)}</div>
-        <h3 style="margin:0 0 8px">حسابك الآن قيد المراجعة من قِبل الإدارة</h3>
-        <p class="mu" style="font-size:14px;line-height:1.75;margin-bottom:18px">
-          ${esc(r.message || 'تم حفظ بيانات حسابك بحالة «قيد المراجعة». فور موافقة الإدارة وتفعيل الحساب ستتمكن من تسجيل الدخول واستخدام المنصة بشكل طبيعي.')}
-        </p>
-        <div class="row-wrap" style="justify-content:center;gap:10px">
-          <button type="button" class="btn btn-ac" data-a="close-dlg">حسنًا، فهمت</button>
-          <button type="button" class="btn btn-gh" data-a="auth" data-m="0">الذهاب لتسجيل الدخول</button>
-        </div>
-      </div>
-    `);
+    state.authView = {
+      ...state.authView,
+      step: 'pending',
+      pendingStore: store,
+      pendingMessage: r.message || ''
+    };
+    renderApp(false);
     return;
   }
 
@@ -4305,18 +4385,16 @@ act('auth-submit', async () => {
     return;
   }
 
-  // طلب رمز المصادقة الثنائية (2FA - TOTP) عند تفعيله على الحساب
+  // طلب رمز المصادقة الثنائية (2FA - TOTP) داخل البطاقة بانسيابية
   if (!up && r && r.requires2fa && r.challengeToken) {
-    openDialog('🛡️ التحقق بالمصادقة الثنائية (2FA)', `
-      <form data-submit="login-2fa-submit" novalidate>
-        <input type="hidden" id="l2fa-token" value="${esc(r.challengeToken)}">
-        <p class="mu" style="margin-bottom:14px;font-size:13.5px;line-height:1.7">${esc(r.message || 'أدخل الرمز المكوّن من ٦ أرقام من تطبيق المصادقة أو أحد أكواد الاسترداد الطارئة (XXXX-XXXX).')}</p>
-        <label for="l2fa-code">رمز التحقق (٦ أرقام) أو كود استرداد</label>
-        <input id="l2fa-code" dir="ltr" autocomplete="one-time-code" maxlength="12" placeholder="123456 أو XXXX-XXXX" style="font-size:18px;letter-spacing:3px;text-align:center">
-        <p id="l2fa-err" class="er-tx" role="alert" style="min-height:22px;margin:2px 0 8px;font-size:13px;font-weight:700"></p>
-        <button class="btn" style="width:100%" type="submit">تأكيد الدخول</button>
-      </form>
-    `);
+    state.authView = {
+      ...state.authView,
+      step: '2fa',
+      challengeToken: r.challengeToken,
+      challengeMessage: r.message || ''
+    };
+    renderApp(false);
+    setTimeout(() => $('#l2fa-code')?.focus(), 40);
     return;
   }
 
@@ -4334,6 +4412,10 @@ act('login-2fa-submit', async () => {
   if (err) err.textContent = '';
   const challengeToken = $('#l2fa-token')?.value || '';
   const code = $('#l2fa-code')?.value.trim() || '';
+  if (!code) {
+    if (err) err.textContent = 'أدخل رمز المصادقة الثنائية أو كود الاسترداد';
+    return;
+  }
   let r;
   try {
     r = await api('POST', '/api/auth/login/2fa', { challengeToken, code });
@@ -4342,6 +4424,7 @@ act('login-2fa-submit', async () => {
     return;
   }
   closeDlg();
+  state.authView.step = 'form';
   await loadSession();
   const target = (r && r.redirectTo) || roleHomeHash(me);
   go(target);

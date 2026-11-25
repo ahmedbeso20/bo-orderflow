@@ -65,7 +65,12 @@
     briefcase: '<rect width="20" height="14" x="2" y="7" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
     send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
     award: '<circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/>',
-    layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'
+    layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+    eyeOff: '<path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/>',
+    user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    userPlus: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>',
+    logIn: '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+    arrowRight: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>'
   };
 
   function svgIcon(name, size = 18, cls = '') {
@@ -202,11 +207,98 @@
     return '';
   }
 
+  /**
+   * Evaluates password strength for real-time merchant registration feedback.
+   */
+  function evaluatePasswordStrength(raw) {
+    const pw = String(raw || '');
+    const hasMinLen = pw.length >= 8;
+    const hasLetter = /[a-zA-Z\u0600-\u06FF]/.test(pw);
+    const hasNumber = /\d/.test(pw);
+    const hasSymbol = /[^a-zA-Z0-9\u0600-\u06FF\s]/.test(pw);
+    const hasUpper = /[A-Z]/.test(pw);
+
+    if (!pw.length) {
+      return {
+        score: 0,
+        level: 'empty',
+        label: 'اختر كلمة مرور من ٨ أحرف بحروف وأرقام',
+        hasMinLen: false,
+        hasLetter: false,
+        hasNumber: false,
+        hasSymbol: false
+      };
+    }
+
+    let score = 1;
+    if (hasMinLen && (hasLetter || hasNumber)) score = 2;
+    if (hasMinLen && hasLetter && hasNumber) score = 3;
+    if (pw.length >= 10 && hasLetter && hasNumber && (hasSymbol || hasUpper)) score = 4;
+
+    const map = {
+      1: { level: 'weak', label: 'كلمة مرور ضعيفة' },
+      2: { level: 'fair', label: 'كلمة مرور متوسطة' },
+      3: { level: 'good', label: 'كلمة مرور جيدة ✓' },
+      4: { level: 'strong', label: 'كلمة مرور قوية جدًا ✓' }
+    };
+    return {
+      score,
+      level: map[score].level,
+      label: map[score].label,
+      hasMinLen,
+      hasLetter,
+      hasNumber,
+      hasSymbol
+    };
+  }
+
+  /**
+   * Client-side validation for login (mode=0) and registration (mode=1) forms.
+   */
+  function validateAuthForm(mode, values = {}) {
+    const up = Number(mode) === 1;
+    const id = String(values.id || '').trim();
+    const password = String(values.password || '');
+
+    if (up) {
+      const store = String(values.store || '').trim();
+      const email = String(values.email || '').trim();
+      if (store.length < 2) {
+        return { valid: false, field: 'auth-store', message: 'أدخل اسم المتجر أو العلامة التجارية (حرفان على الأقل)' };
+      }
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+        return { valid: false, field: 'auth-email', message: 'أدخل بريدًا إلكترونيًا صحيحًا' };
+      }
+      const digits = id.replace(/[\s\-()+]/g, '');
+      if (!/^(?:20)?0?1[0125]\d{8}$/.test(digits)) {
+        return { valid: false, field: 'auth-id', message: 'أدخل رقم موبايل مصري صحيح (مثال: 010xxxxxxxx)' };
+      }
+      const strength = evaluatePasswordStrength(password);
+      if (!strength.hasMinLen || !strength.hasLetter || !strength.hasNumber) {
+        return { valid: false, field: 'auth-pass', message: 'كلمة المرور يجب أن تكون ٨ أحرف على الأقل وتحتوي على حروف وأرقام' };
+      }
+      if (!values.termsAccepted) {
+        return { valid: false, field: 'auth-terms', message: 'يجب الموافقة على الشروط والأحكام وسياسة الخصوصية للمتابعة' };
+      }
+      return { valid: true, field: '', message: '' };
+    }
+
+    if (!id) {
+      return { valid: false, field: 'auth-id', message: 'أدخل البريد الإلكتروني أو رقم الموبايل' };
+    }
+    if (!password) {
+      return { valid: false, field: 'auth-pass', message: 'أدخل كلمة المرور للمتابعة' };
+    }
+    return { valid: true, field: '', message: '' };
+  }
+
   return {
     ICONS,
     svgIcon,
     computeProfitBreakdown,
     computePlanQuote,
-    renderBentoVisual
+    renderBentoVisual,
+    evaluatePasswordStrength,
+    validateAuthForm
   };
 });
