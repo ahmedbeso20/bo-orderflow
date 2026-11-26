@@ -517,7 +517,7 @@ async function generateProductStudioImage(cfg, { imageBuffer, mimeType, productN
       if (!res.ok) {
         throw new HttpError(502, `تعذر توليد الصورة عبر Gemini (HTTP ${res.status}).`, { code: 'AI_IMAGE_FAIL' });
       }
-      const json = await res.json();
+      const json = typeof res.json === 'function' ? await res.json() : JSON.parse(await res.text());
       rawOut = extractImagePart(json);
     } else {
       const ai = new genAiSdk.GoogleGenAI({

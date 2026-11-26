@@ -2008,15 +2008,18 @@ const renderComplianceCard = (title, report) => {
         </span>
       </div>
       <div style="display:flex;flex-direction:column;gap:5px">
-        ${(report.checks || []).map((c) => `
-          <div class="compliance-check-row compliance-check-row--${c.status}">
-            <span>${c.status === 'pass' ? '✓' : c.status === 'warn' ? '!' : '✕'}</span>
-            <div class="sp">
-              <b>${esc(c.titleAr)}</b> <small class="mu">(${esc(c.measured)} / ${esc(c.target)})</small>
-              ${c.status !== 'pass' && c.fixHintAr ? `<div class="mu" style="font-size:11.5px">${esc(c.fixHintAr)}</div>` : ''}
+        ${(report.checks || []).map((c) => {
+          const st = c.passed ? 'pass' : (c.severity === 'warning' ? 'warn' : 'fail');
+          return `
+            <div class="compliance-check-row compliance-check-row--${st}">
+              <span>${st === 'pass' ? '✓' : st === 'warn' ? '!' : '✕'}</span>
+              <div class="sp">
+                <b>${esc(c.titleAr)}</b>
+                ${!c.passed && c.fixHintAr ? `<div class="mu" style="font-size:11.5px">${esc(c.fixHintAr)}</div>` : ''}
+              </div>
             </div>
-          </div>
-        `).join('')}
+          `;
+        }).join('')}
       </div>
     </div>
   `;
@@ -2131,7 +2134,7 @@ const renderPhotoStudioTab = () => {
             ${ps.afterCompliance ? `
               <div class="row" style="width:100%;margin-top:8px;gap:8px">
                 ${renderBadge(`نتيجة المطابقة بعد الإصلاح: ${fmtNum(ps.afterCompliance.score)}٪`, ps.afterCompliance.passed ? 'ok' : 'wn')}
-                <span class="mu" style="font-size:12px">${fmtNum(ps.afterCompliance.metrics.width)}×${fmtNum(ps.afterCompliance.metrics.height)}px · إشغال ${fmtNum(ps.afterCompliance.metrics.fillRatio)}٪</span>
+                <span class="mu" style="font-size:12px">${fmtNum(ps.afterCompliance.metrics.width)}×${fmtNum(ps.afterCompliance.metrics.height)}px · إشغال ${fmtNum(Math.round((ps.afterCompliance.metrics.fillRatio || 0) * 100))}٪</span>
               </div>
             ` : ''}
           ` : `
@@ -2588,7 +2591,7 @@ views.int = (d) => {
               `<b>${esc(j.productName || 'منتج')}</b><br><code dir="ltr" style="font-size:11px">${esc(j.channelSku || j.productSku || '')}</code>`,
               renderMarketChip(j.platform),
               `<b>${fmtNum(j.desiredStock)}</b>`,
-              j.status === 'synced'
+              j.status === 'done' || j.status === 'synced'
                 ? renderBadge('متزامن ✓', 'ok')
                 : j.status === 'failed'
                   ? `<div>${renderBadge('فشل التحديث', 'er')}${j.lastError ? `<br><small class="er-tx" style="font-size:11px">${esc(j.lastError)}</small>` : ''}</div>`
@@ -6773,7 +6776,7 @@ act('sync-finances-conn', async (el) => {
 
 act('inv-push-all', async () => {
   const r = await api('POST', '/api/integrations/inventory-sync/push-all');
-  showToast(`⚡ تم جدولة ودفع مخزون ${fmtNum(r.enqueued || 0)} قناة (نجح: ${fmtNum(r.processed?.synced || 0)}) ✓`, 4500);
+  showToast(`⚡ تم جدولة ودفع مخزون ${fmtNum(r.queued || 0)} قناة (${fmtNum(r.productsScanned || 0)} منتج معتمد) ✓`, 4500);
   renderApp(true);
 });
 

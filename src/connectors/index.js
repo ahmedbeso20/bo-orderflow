@@ -2560,7 +2560,17 @@ function createConnectors(app) {
     }));
 
     const links = getProductChannelLinks(userId);
-    return { summary: { pending, synced24h, failed }, jobs, links };
+    const byProduct = {};
+    for (const l of links) {
+      if (!byProduct[l.productId]) byProduct[l.productId] = {};
+      byProduct[l.productId][l.platform] = {
+        status: l.syncStatus === 'error' ? 'failed' : l.syncStatus,
+        lastStock: l.lastPushedStock,
+        lastPushedAt: l.lastPushedAt,
+        lastError: l.lastError
+      };
+    }
+    return { summary: { pending, synced24h, failed }, counts: { pending, synced24h, failed }, byProduct, jobs, links };
   }
 
   function retryInventorySyncJob(userId, jobId) {

@@ -325,7 +325,8 @@ module.exports = (r, app) => {
       productId: p.id,
       safetyStock: Number(p.safety_stock || 0),
       autoPushStock: p.auto_push_stock === undefined || p.auto_push_stock === null ? true : Boolean(p.auto_push_stock),
-      links
+      links,
+      channels: links
     };
   });
 

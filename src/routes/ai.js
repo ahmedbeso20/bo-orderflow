@@ -122,7 +122,7 @@ module.exports = (r, app) => {
 
   /** استوديو الصور الذكي للمنتجات (Gemini Image + التحقق من Magic Bytes + حفظ مباشر في معرض المنتج) */
   r.post('/api/ai/photo-studio', async ({ user, body }) => {
-    const rawInput = String(body.dataUrl || body.imageBase64 || body.image || '').trim();
+    const rawInput = String(body.dataUrl || body.imageDataUrl || body.imageBase64 || body.image || '').trim();
     if (!rawInput) throw bad('أرسل صورة المنتج بصيغة Base64 (PNG أو JPEG أو WEBP).');
     if (/^data:image\/svg/i.test(rawInput) || /<svg[\s>]/i.test(rawInput)) {
       throw bad('ملفات SVG غير مسموحة لأسباب أمنية. ارفع صورة PNG أو JPEG أو WEBP فقط.');
@@ -238,6 +238,7 @@ module.exports = (r, app) => {
       model: gen.model,
       preset: gen.preset,
       imageUrl,
+      image: imageRecord || { url: imageUrl },
       imageRecord,
       product: updatedProduct
     };

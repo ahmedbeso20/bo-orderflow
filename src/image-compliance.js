@@ -15,14 +15,16 @@ function rgbToHex(r, g, b) {
  * @param {Uint8Array|Uint8ClampedArray|number[]} params.rgbaPixels مصفوفة RGBA بطول width * height * 4
  * @param {'amazon'|'noon'|'trendyol'|'jumia'} [params.marketplace='amazon'] المنصة المستهدفة
  */
-function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'amazon' }) {
+function evaluateImageCompliance({ width, height, sampleWidth, sampleHeight, rgbaPixels, marketplace = 'amazon' }) {
   const w = Math.max(0, Math.floor(Number(width) || 0));
   const h = Math.max(0, Math.floor(Number(height) || 0));
+  const sw = Math.max(0, Math.floor(Number(sampleWidth || width) || 0));
+  const sh = Math.max(0, Math.floor(Number(sampleHeight || height) || 0));
   const mkt = ['amazon', 'noon', 'trendyol', 'jumia'].includes(String(marketplace || '').toLowerCase())
     ? String(marketplace).toLowerCase()
     : 'amazon';
 
-  if (!w || !h || !rgbaPixels || rgbaPixels.length < w * h * 4) {
+  if (!w || !h || !sw || !sh || !rgbaPixels || rgbaPixels.length < sw * sh * 4) {
     return {
       score: 0,
       passed: false,
@@ -45,7 +47,7 @@ function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'ama
   const minSide = Math.min(w, h);
   const maxSide = Math.max(w, h);
   let resPassed = minSide >= 1000;
-  let resSeverity = minSide >= 1600 ? 'ok' : (minSide >= 1000 ? 'ok' : (minSide < 500 ? 'error' : 'error'));
+  let resSeverity = minSide >= 1600 ? 'ok' : (minSide >= 1000 ? 'ok' : 'error');
   let resTitle = minSide >= 1600
     ? `دقة ممتازة (${w}×${h} بكسل — تدعم التكبير Zoom)`
     : (minSide >= 1000
@@ -103,10 +105,10 @@ function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'ama
   });
 
   // 3) فحص نقاء الخلفية البيضاء (#FFFFFF) في الحلقة الخارجية (4% من كل جانب والزوايا)
-  const marginX = Math.max(1, Math.round(w * 0.04));
-  const marginY = Math.max(1, Math.round(h * 0.04));
-  const stepX = Math.max(1, Math.floor(w / 240));
-  const stepY = Math.max(1, Math.floor(h / 240));
+  const marginX = Math.max(1, Math.round(sw * 0.04));
+  const marginY = Math.max(1, Math.round(sh * 0.04));
+  const stepX = Math.max(1, Math.floor(sw / 240));
+  const stepY = Math.max(1, Math.floor(sh / 240));
 
   let borderTotal = 0;
   let borderPureWhite = 0;
@@ -114,14 +116,13 @@ function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'ama
   let sumG = 0;
   let sumB = 0;
 
-  for (let y = 0; y < h; y += stepY) {
-    const inYBorder = y < marginY || y >= h - marginY;
-    for (let x = 0; x < w; x += stepX) {
-      const inXBorder = x < marginX || x >= w - marginX;
+  for (let y = 0; y < sh; y += stepY) {
+    const inYBorder = y < marginY || y >= sh - marginY;
+    for (let x = 0; x < sw; x += stepX) {
+      const inXBorder = x < marginX || x >= sw - marginX;
       if (!inYBorder && !inXBorder) continue;
-      const idx = (y * w + x) * 4;
+      const idx = (y * sw + x) * 4;
       const a = rgbaPixels[idx + 3];
-      // البكسل الشفاف يُعتبر خلفية غير مملوءة بالأبيض النقي إذا لم يُدمج على #FFFFFF
       const r = a < 250 ? Math.round((rgbaPixels[idx] * a + 255 * (255 - a)) / 255) : rgbaPixels[idx];
       const g = a < 250 ? Math.round((rgbaPixels[idx + 1] * a + 255 * (255 - a)) / 255) : rgbaPixels[idx + 1];
       const b = a < 250 ? Math.round((rgbaPixels[idx + 2] * a + 255 * (255 - a)) / 255) : rgbaPixels[idx + 2];
@@ -158,22 +159,21 @@ function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'ama
   });
 
   // 4) فحص نسبة امتلاء المنتج داخل الإطار (قاعدة 85% في أمازون ونون)
-  const scanStepX = Math.max(1, Math.floor(w / 320));
-  const scanStepY = Math.max(1, Math.floor(h / 320));
-  let minX = w, maxX = -1, minY = h, maxY = -1;
+  const scanStepX = Math.max(1, Math.floor(sw / 320));
+  const scanStepY = Math.max(1, Math.floor(sh / 320));
+  let minX = sw, maxX = -1, minY = sh, maxY = -1;
   let fgSamples = 0;
   let totalSamples = 0;
 
-  // نحدد لون الخلفية المرجعي لحساب حدود المنتج حتى لو كانت الخلفية رمادية فاتحة مثل #EFEFEF
   const bgRefR = borderTotal > 0 ? avgR : 255;
   const bgRefG = borderTotal > 0 ? avgG : 255;
   const bgRefB = borderTotal > 0 ? avgB : 255;
   const isBgBright = bgRefR >= 220 && bgRefG >= 220 && bgRefB >= 220;
 
-  for (let y = 0; y < h; y += scanStepY) {
-    for (let x = 0; x < w; x += scanStepX) {
+  for (let y = 0; y < sh; y += scanStepY) {
+    for (let x = 0; x < sw; x += scanStepX) {
       totalSamples++;
-      const idx = (y * w + x) * 4;
+      const idx = (y * sw + x) * 4;
       const r = rgbaPixels[idx];
       const g = rgbaPixels[idx + 1];
       const b = rgbaPixels[idx + 2];
@@ -197,10 +197,10 @@ function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'ama
   let bboxW = 0;
   let bboxH = 0;
   if (maxX >= minX && maxY >= minY) {
-    bboxW = Math.min(w, maxX - minX + scanStepX);
-    bboxH = Math.min(h, maxY - minY + scanStepY);
+    bboxW = Math.min(sw, maxX - minX + scanStepX);
+    bboxH = Math.min(sh, maxY - minY + scanStepY);
   }
-  const fillRatio = Number(Math.max(bboxW / w, bboxH / h).toFixed(3));
+  const fillRatio = Number(Math.max(bboxW / sw, bboxH / sh).toFixed(3));
   const areaCoverage = totalSamples > 0 ? Number((fgSamples / totalSamples).toFixed(3)) : 0;
   const fillPct = Math.round(fillRatio * 100);
 
