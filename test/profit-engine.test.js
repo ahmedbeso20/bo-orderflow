@@ -263,9 +263,54 @@ test('Amazon Finances sync, CSV settlement import, monthly pro-rated expenses, a
   assert.equal(csvExport.status, 200);
   assert.ok(String(csvExport.data).includes('إجمالي المبيعات'));
 
-  // Verify GET /api/dashboard stays backward-compatible and includes missingCogsCount
+  // Verify GET /api/dashboard stays backward-compatible and includes missingCogsCount at top-level and kpis
   const dashRes = await c.get('/api/dashboard?range=30&market=all');
   assert.equal(dashRes.status, 200);
-  assert.equal(typeof dashRes.data.kpis.missingCogsCount, 'number');
+  assert.equal(typeof dashRes.data.missingCogsCount, 'number');
+  assert.equal(dashRes.data.missingCogsCount, dashRes.data.kpis.missingCogsCount);
   assert.ok(dashRes.data.kpis && typeof dashRes.data.kpis.net === 'number');
+
+  // Verify PUT /api/finance/fee-rules defaults cat to 'all' and applies to estimated orders
+  const rulePut = await c.put('/api/finance/fee-rules', {
+    market: 'j',
+    commissionPct: 18,
+    fulfillmentFee: 10,
+    closingFee: 5,
+    rtoShipMultiplier: 2
+  });
+  assert.equal(rulePut.status, 200);
+  const jRule = rulePut.data.rules.find((r) => r.market === 'j');
+  assert.ok(jRule);
+  assert.equal(jRule.cat, 'all');
+  assert.equal(jRule.commissionPct, 18);
+
+  // Verify manual order with cost_is_estimated=1 product marks order.cost_estimated = 1
+  const estProd = await c.post('/api/products', {
+    name: 'منتج بتكلفة تقديرية',
+    sku: 'EST-001',
+    cat: 'عام',
+    price: 400,
+    cost: 0,
+    costIsEstimated: true,
+    stock: 10,
+    markets: 'j'
+  });
+  assert.equal(estProd.status, 200);
+  const estOrd = await c.post('/api/orders', {
+    market: 'j',
+    customer: 'عميل جوميا',
+    phone: '01099112233',
+    gov: 'القاهرة',
+    pay: 'عند الاستلام',
+    courier: 'بوسطة',
+    items: [{ productId: estProd.data.product.id, qty: 1 }]
+  });
+  assert.equal(estOrd.status, 200);
+  assert.equal(estOrd.data.order.costEstimated, true);
+
+  const estFees = await c.get(`/api/orders/${estOrd.data.order.id}/fees`);
+  assert.equal(estFees.status, 200);
+  // 18% of 400 = 72 commission, fulfillmentFee 10 + closingFee 5 = 15 extra, VAT = (72 + 15) * 0.14 = 12.18
+  assert.equal(estFees.data.financials.marketplaceCommissions, 72);
+  assert.equal(estFees.data.financials.vat, 12.18);
 });

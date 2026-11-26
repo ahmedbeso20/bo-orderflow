@@ -260,7 +260,7 @@ function resolveFeeRule(feeRulesMap, market, cat = 'all') {
   const m = String(market || 'a');
   const exact = feeRulesMap.get(`${m}:${cat}`);
   if (exact) return exact;
-  const fallback = feeRulesMap.get(`${m}:all`);
+  const fallback = feeRulesMap.get(`${m}:all`) || feeRulesMap.get(`${m}:*`);
   if (fallback) return fallback;
   return {
     market: m,

@@ -180,7 +180,7 @@ module.exports = (r, app) => {
       for (const { p, qty } of lines) {
         const fifo = consumeFifoCost(q, { userId: user.id, productId: p.id, qty, orderId: id });
         costTotal += fifo.totalCost;
-        if (fifo.costIsEstimated) anyEstimated = true;
+        if (fifo.costMissing || (fifo.usedFallback && Number(p.cost_is_estimated || 0) === 1)) anyEstimated = true;
         q('INSERT INTO order_items (order_id,product_id,name,qty,price,cost) VALUES (?,?,?,?,?,?)')
           .run(id, p.id, p.name, qty, p.price, fifo.unitCostAvg);
       }

@@ -1617,6 +1617,7 @@ const renderOrdersTable = (d) => {
             <button class="btn btn-gh btn-sm" data-a="set-status" data-id="${o.id}" data-s="2">تم التسليم ✓</button>
             <button class="btn btn-gh btn-sm" data-a="set-status" data-id="${o.id}" data-s="3" title="رفض العميل الاستلام">↩ مرتجع</button>` : ''}
           <button class="btn btn-gh btn-sm" style="color:var(--pr)" data-a="ai-order-msg" data-id="${o.id}">💬 رسالة ذكية</button>
+          <button class="btn btn-gh btn-sm" data-a="view-order-fees" data-id="${o.id}" title="تفصيل الرسوم وصافي الربح">🔍 الرسوم</button>
           <button class="btn btn-gh btn-sm" data-a="view-invoice" data-id="${o.id}">🧾 فاتورة</button>
         </div>`
       ];
@@ -1695,6 +1696,7 @@ views.pnl = (d) => {
       <div class="row-wrap" style="gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">
         <button type="button" class="btn btn-ac btn-sm" data-a="open-prod-batches-picker">+ دُفعة مخزون (FIFO)</button>
         <button type="button" class="btn btn-gh btn-sm" data-a="open-expense-modal">+ مصروف تشغيلي</button>
+        <button type="button" class="btn btn-gh btn-sm" data-a="open-fee-rules-modal">⚙️ قواعد عمولات المنصات</button>
         <button type="button" class="btn btn-gh btn-sm" data-a="open-settlement-csv-modal">📤 استيراد تسويات CSV</button>
         <button type="button" class="btn btn-gh btn-sm" data-a="pnl-export-csv">📥 تصدير P&L CSV</button>
       </div>
@@ -1778,7 +1780,7 @@ views.pnl = (d) => {
       </div>
       ${(d.products && d.products.length) ? `
         <div class="table-wrap">
-          <table>
+          <table class="pnl-products-table">
             <thead>
               <tr>
                 <th>المنتج / SKU</th>
@@ -2028,10 +2030,10 @@ const renderComplianceCard = (title, report) => {
 const renderPhotoStudioTab = () => {
   const ps = growthState.photoStudio;
   const aiPresets = [
-    { id: 'amazon_main_white', label: 'أبيض نقي #FFFFFF (أمازون)', desc: 'صورة رئيسية ١:١ احترافية' },
-    { id: 'noon_pearl_podium', label: 'منصة لؤلؤية ناعمة (نون)', desc: 'إضاءة استوديو فاخرة ٤:٥' },
-    { id: 'egyptian_lifestyle', label: 'مشهد استخدام منزلي مصري', desc: 'للمعرض وصفحات A+' },
-    { id: 'infographic_clean', label: 'خلفية عرض إنفوجرافيك', desc: 'مساحة نظيفة لنقاط البيع' }
+    { id: 'amazon_main_white', label: 'خلفية بيضاء رسمية لأمازون', desc: 'أبيض نقي #FFFFFF ١:١ بنسبة امتلاء ٨٥٪' },
+    { id: 'noon_pearl_podium', label: 'منصة عرض نون الفاخرة', desc: 'إضاءة استوديو لؤلؤية ٤:٥' },
+    { id: 'egyptian_lifestyle', label: 'تصوير لايف ستايل واقعي', desc: 'مشهد استخدام مصري لمعرض الصور و A+' },
+    { id: 'infographic_clean', label: 'تصميم إنفوجرافيك للمزايا', desc: 'خلفية نظيفة بمساحة لنقاط البيع' }
   ];
   const hasAfter = Boolean(ps.afterDataUrl);
   const hasBefore = Boolean(ps.beforeDataUrl);
@@ -2113,7 +2115,7 @@ const renderPhotoStudioTab = () => {
           </div>
 
           ${hasAfter ? `
-            <div class="ps-compare-wrap" data-testid="ps-compare-stage">
+            <div class="ps-compare-wrap ${ps.targetMarketplace === 'noon' ? 'ratio-4-5' : ''}" data-testid="ps-compare-stage">
               ${ps.compareMode === 'before' && hasBefore ? `
                 <img src="${ps.beforeDataUrl}" alt="الصورة الأصلية قبل التحسين" class="ps-compare-img">
               ` : ps.compareMode === 'after' ? `
@@ -2142,7 +2144,7 @@ const renderPhotoStudioTab = () => {
           `}
         </div>
 
-        <div class="grid-equal" style="gap:12px">
+        <div style="display:flex;flex-direction:column;gap:12px">
           ${renderComplianceCard('فحص شروط أمازون مصر (١:١)', ps.amazonCompliance)}
           ${renderComplianceCard('فحص شروط نون مصر (٤:٥)', ps.noonCompliance)}
         </div>
@@ -2623,6 +2625,7 @@ views.int = (d) => {
     </div>
   `;
 };
+views.integrations = views.int;
 
 // 5.7.0 صفحة خدمات الخبراء وإدارة الحسابات (#/services)
 views.services = (d) => {
@@ -2777,6 +2780,7 @@ const loaders = {
     if (invSync) state.inventorySync = invSync;
     return { runs: runsRes.runs || [], inventorySync: invSync };
   }),
+  integrations: () => loaders.int(),
   cod: () => api('GET', '/api/cod'),
   pay: () => api('GET', '/api/billing'),
   services: () => api('GET', '/api/services/requests'),
@@ -4220,7 +4224,7 @@ const boot = async () => {
 };
 
 const renderShell = (viewKey, data) => {
-  const navKey = viewKey === 'rep' ? 'pnl' : viewKey;
+  const navKey = viewKey === 'rep' ? 'pnl' : viewKey === 'integrations' ? 'int' : viewKey;
   const currentNav = NAV_LINKS.find(n => n.id === navKey) || NAV_LINKS[0];
   const mobileQuickLinks = [
     NAV_LINKS.find(x => x.id === 'dash'),
@@ -4564,7 +4568,10 @@ const openProductModal = (prod = null) => {
       <button class="btn" style="width:100%" data-a="save-prod">
         ${isEdit ? 'حفظ التعديلات ومزامنة المخزون والأسعار' : '🚀 نشر المنتج الآن'}
       </button>
-      ${isEdit ? `<button class="btn btn-er" style="width:100%;margin-top:8px" data-a="delete-prod" data-id="${prod.id}">🗑 حذف المنتج</button>` : ''}
+      ${isEdit ? `
+        <button type="button" class="btn btn-gh" style="width:100%;margin-top:8px" data-a="open-prod-studio-from-dlg" data-id="${prod.id}">🎨 استوديو الصور وفحص المطابقة</button>
+        <button class="btn btn-er" style="width:100%;margin-top:8px" data-a="delete-prod" data-id="${prod.id}">🗑 حذف المنتج</button>
+      ` : ''}
     `
   );
   renderModalProfitPreview();
@@ -6151,6 +6158,7 @@ actions['ps-auto-fix'] = () => {
     return showToast('⚠️ محرك الإصلاح الفوري غير محمّل');
   }
   const fixed = GROWTH.autoFixMarketplaceImage(ps.uploadedImg, {
+    targetMarketplace: ps.targetMarketplace || 'amazon',
     marketplace: ps.targetMarketplace || 'amazon',
     addSoftShadow: Boolean(ps.addSoftShadow)
   });
@@ -6165,9 +6173,28 @@ actions['ps-auto-fix'] = () => {
   renderApp(true);
 };
 
+actions['open-prod-studio-from-dlg'] = (el) => {
+  closeDlg();
+  actions['open-prod-studio'](el);
+};
+
 act('ps-ai-generate', async () => {
   const ps = growthState.photoStudio;
-  const sourceImage = ps.beforeDataUrl || ps.lastDataUrl;
+  let sourceImage = ps.beforeDataUrl || ps.lastDataUrl || '';
+  if (!sourceImage.startsWith('data:image/') && ps.uploadedImg) {
+    try {
+      const c = document.createElement('canvas');
+      const w = Math.min(1200, ps.uploadedImg.naturalWidth || ps.uploadedImg.width || 800);
+      const h = Math.min(1200, ps.uploadedImg.naturalHeight || ps.uploadedImg.height || 800);
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(ps.uploadedImg, 0, 0, w, h);
+      sourceImage = c.toDataURL('image/png');
+    } catch (_) {}
+  }
   if (!sourceImage || !sourceImage.startsWith('data:image/')) {
     return showToast('⚠️ ارفع صورة المنتج بصيغة PNG أو JPG أو WEBP أولًا لتوليد مشهد Gemini');
   }
@@ -6187,9 +6214,10 @@ act('ps-ai-generate', async () => {
       actions['ps-auto-fix']();
       return;
     }
-    if (r.image && r.image.url) {
-      ps.afterDataUrl = r.image.url;
-      ps.afterSource = 'gemini';
+    const genUrl = r.imageUrl || (r.image && r.image.url) || '';
+    if (genUrl) {
+      ps.afterDataUrl = genUrl;
+      ps.afterSource = 'ai_studio';
       ps.compareMode = 'split';
       if (ps.productId) await loadPhotoStudioGallery(ps.productId);
       const img = new Image();
@@ -6198,7 +6226,7 @@ act('ps-ai-generate', async () => {
         ps.afterCompliance = GROWTH.auditImageElement(img, ps.targetMarketplace || 'amazon');
         renderApp(true);
       };
-      img.src = r.image.url;
+      img.src = genUrl;
       showToast('🤖 تم توليد المشهد الاحترافي بالذكاء الاصطناعي بنجاح ✓', 4200);
       renderApp(true);
     }
@@ -6295,8 +6323,66 @@ actions['pnl-export-csv'] = () => {
   const qs = new URLSearchParams({ market: state.pnlMarket || 'all' });
   if (state.pnlFrom) qs.set('from', state.pnlFrom);
   if (state.pnlTo) qs.set('to', state.pnlTo);
-  window.location.href = `/api/finance/pnl/export.csv?${qs}`;
+  downloadFile(`/api/finance/pnl/export.csv?${qs}`, 'orderflow-pnl.csv', 'تقرير الربحية P&L CSV');
 };
+
+act('open-fee-rules-modal', async () => {
+  const res = await api('GET', '/api/finance/fee-rules');
+  const rules = (res && res.rules) || [];
+  const allMkts = [['a', 'أمازون مصر'], ['n', 'نون مصر'], ['j', 'جوميا'], ['t', 'ترينديول'], ['k', 'كنز']];
+  openDialog('⚙️ قواعد عمولات المنصات والتقدير (للطلبات غير المسوّاة)', `
+    <p class="mu" style="font-size:12.5px;margin-bottom:12px">خصّص نسبة العمولة، رسوم التجهيز FBA/FBN، رسوم الإغلاق، ومُضاعِف شحن المرتجع لكل منصة عند احتساب الطلبات التقديرية.</p>
+    <form data-submit="save-fee-rule-submit" style="background:var(--bg);padding:12px;border-radius:10px;border:1px solid var(--bd);margin-bottom:14px">
+      <div class="grid-equal" style="gap:8px">
+        <div>
+          <label for="fr-mkt">المنصة</label>
+          <select id="fr-mkt">${allMkts.map(([k, lbl]) => `<option value="${k}">${lbl}</option>`).join('')}</select>
+        </div>
+        <div>
+          <label for="fr-comm">نسبة العمولة (٪)</label>
+          <input id="fr-comm" type="number" min="0" max="60" step="0.5" value="12" required>
+        </div>
+      </div>
+      <div class="grid-equal" style="gap:8px">
+        <div>
+          <label for="fr-fulf">رسوم تجهيز FBA/FBN (ج.م)</label>
+          <input id="fr-fulf" type="number" min="0" step="0.5" value="0">
+        </div>
+        <div>
+          <label for="fr-close">رسوم إغلاق ثابتة (ج.م)</label>
+          <input id="fr-close" type="number" min="0" step="0.5" value="0">
+        </div>
+      </div>
+      <label for="fr-rto">مُضاعِف شحن المرتجع (RTO Multiplier — افتراضي ١.٨)</label>
+      <input id="fr-rto" type="number" min="0" max="5" step="0.1" value="1.8">
+      <button type="submit" class="btn btn-ac btn-sm" style="width:100%">حفظ قاعدة المنصة ✓</button>
+    </form>
+    ${rules.length ? renderTable(
+      ['المنصة', 'العمولة', 'التجهيز', 'الإغلاق', 'مضاعف RTO'],
+      rules.map((rl) => [
+        renderMarketChip(rl.market),
+        `<b>${fmtNum(rl.commissionPct)}٪</b>`,
+        fmtEGP(rl.fulfillmentFee),
+        fmtEGP(rl.closingFee),
+        `${fmtNum(rl.rtoShipMultiplier)}×`
+      ])
+    ) : '<p class="mu" style="margin:0;font-size:12.5px">تُستخدم حاليًا القيم الافتراضية للأسواق المصرية (أمازون ١٢٪ · نون ١٠٪ · جوميا ١١٪ · ترينديول ١٥٪ · كنز ١٢٪).</p>'}
+  `);
+});
+
+act('save-fee-rule-submit', async () => {
+  await api('PUT', '/api/finance/fee-rules', {
+    market: $('#fr-mkt').value,
+    cat: 'all',
+    commissionPct: num($('#fr-comm').value),
+    fulfillmentFee: num($('#fr-fulf').value),
+    closingFee: num($('#fr-close').value),
+    rtoShipMultiplier: num($('#fr-rto').value) || 1.8
+  });
+  showToast('✓ تم تحديث قاعدة عمولة المنصة وإعادة حساب الأرباح');
+  await actions['open-fee-rules-modal']();
+  renderApp(true);
+});
 
 async function openFifoBatchesModal(productId) {
   const pid = Number(productId);

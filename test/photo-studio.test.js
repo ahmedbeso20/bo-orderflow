@@ -204,3 +204,43 @@ test('POST /api/ai/photo-studio rejects invalid Magic Bytes & SVG, enforces quot
   });
   assert.equal(quotaRes.status, 429);
 });
+
+test('public/js/growth-suite.js evaluateImageCompliance exposes metrics & check schema expected by UI, and photo-studio falls back cleanly without GEMINI_API_KEY', async (t) => {
+  const growth = require('../public/js/growth-suite.js');
+  const goodRgba = makeSyntheticImage(200, 200, [255, 255, 255], [20, 60, 110], 0.85);
+  const rep = growth.evaluateImageCompliance({
+    width: 1600,
+    height: 1600,
+    sampleWidth: 200,
+    sampleHeight: 200,
+    rgbaPixels: goodRgba,
+    marketplace: 'amazon'
+  });
+  assert.equal(rep.passed, true);
+  assert.equal(rep.score, 100);
+  assert.equal(rep.metrics.width, 1600);
+  assert.equal(rep.metrics.height, 1600);
+  assert.equal(rep.metrics.borderHex, '#FFFFFF');
+  assert.ok(rep.checks.every((c) => c.passed === true && typeof c.titleAr === 'string' && c.titleAr.length > 0 && typeof c.code === 'string'));
+
+  // Off-white #EFEFEF 800x800 image with 45% centered product must report ~45% fill (not 100%)
+  const offWhiteRgba = makeSyntheticImage(800, 800, [239, 239, 239], [30, 80, 140], 0.45);
+  const offRep = growth.evaluateImageCompliance({ width: 800, height: 800, rgbaPixels: offWhiteRgba, marketplace: 'amazon' });
+  assert.equal(offRep.passed, false);
+  assert.equal(offRep.metrics.borderHex, '#EFEFEF');
+  assert.ok(offRep.metrics.fillRatio >= 0.40 && offRep.metrics.fillRatio <= 0.55, `Expected ~0.45 fill ratio, got ${offRep.metrics.fillRatio}`);
+
+  // Test clean fallback when GEMINI_API_KEY is empty
+  const app = createApp({ dbFile: ':memory:', secret: 'f'.repeat(48), trustProxy: true, geminiKey: '' });
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  t.after(() => app.close());
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  const c = new Client(base, '10.99.4.9');
+  assert.equal((await c.post('/api/auth/demo', {})).status, 200);
+  const fbRes = await c.post('/api/ai/photo-studio', {
+    imageDataUrl: VALID_PNG_DATA_URL,
+    preset: 'amazon_main_white'
+  });
+  assert.equal(fbRes.status, 200);
+  assert.equal(fbRes.data.source, 'client-studio-fallback');
+});

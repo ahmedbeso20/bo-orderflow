@@ -8,7 +8,7 @@ const DAY = 86400000;
 // الإيراد/العمولات/صافي الربح لكل طلب غير ملغي وغير مرفوض مع تفضيل الرسوم الفعلية المسوّاة (settled) عند توفرها
 const REV = "CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' THEN total ELSE 0 END";
 const FEES = `CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' THEN CASE WHEN COALESCE(fees_source, 'estimated') != 'estimated' AND actual_market_fees IS NOT NULL THEN actual_market_fees + COALESCE(other_platform_fees, 0) + COALESCE(ad_fee_alloc, 0) ELSE total * ${FEE_RATE_SQL} END ELSE 0 END`;
-const NET = `CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' THEN total - (CASE WHEN COALESCE(fees_source, 'estimated') != 'estimated' AND actual_market_fees IS NOT NULL THEN actual_market_fees + COALESCE(other_platform_fees, 0) + COALESCE(ad_fee_alloc, 0) ELSE total * ${FEE_RATE_SQL} END) - cost_total - COALESCE(packaging_total, 0) - ship_fee WHEN status = 3 AND approval_status != 'rejected' THEN -(CASE WHEN COALESCE(return_ship_fee, 0) > 0 THEN return_ship_fee ELSE ship_fee * 1.8 END) ELSE 0 END`;
+const NET = `CASE WHEN status NOT IN (3, 4) AND approval_status != 'rejected' THEN total - (CASE WHEN COALESCE(fees_source, 'estimated') != 'estimated' AND actual_market_fees IS NOT NULL THEN actual_market_fees + COALESCE(other_platform_fees, 0) + COALESCE(ad_fee_alloc, 0) ELSE total * ${FEE_RATE_SQL} END) - cost_total - COALESCE(packaging_total, 0) - ship_fee WHEN status = 3 AND approval_status != 'rejected' THEN -(ship_fee + (CASE WHEN COALESCE(return_ship_fee, 0) > 0 THEN return_ship_fee ELSE ship_fee * 0.8 END) + COALESCE(actual_market_fees, 0) + COALESCE(packaging_total, 0)) ELSE 0 END`;
 
 
 module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter, logAudit }) => {
@@ -73,7 +73,7 @@ module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter,
     const missingCogsCount = Number(q('SELECT COUNT(*) n FROM products WHERE user_id = ? AND (cost <= 0 OR COALESCE(cost_is_estimated, 0) = 1)').get(user.id)?.n || 0);
 
     return {
-      range, market: market || 'all', source: sourceFilter, hasActiveConnection,
+      range, market: market || 'all', source: sourceFilter, hasActiveConnection, missingCogsCount,
       kpis: {
         gross: round2(cur.gross), net: round2(cur.net), fees: round2(cur.fees), orders: cur.orders,
         delivered: Number(cur.delivered || 0),
@@ -623,7 +623,8 @@ module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter,
 
   r.put('/api/finance/fee-rules', ({ user, body }) => {
     const market = oneOf(body.market, Object.keys(MARKETS), 'السوق');
-    const cat = text(body.cat || '*', 'الفئة', { min: 1, max: 40 });
+    const rawCat = String(body.cat || 'all').trim();
+    const cat = text(rawCat === '*' || !rawCat ? 'all' : rawCat, 'الفئة', { min: 1, max: 40 });
     const commissionPct = money(body.commissionPct ?? body.commission_pct ?? 10, 'نسبة العمولة', { min: 0, max: 60 });
     const fulfillmentFee = money(body.fulfillmentFee ?? body.fulfillment_fee ?? 0, 'رسوم التجهيز', { min: 0, max: 10000 });
     const closingFee = money(body.closingFee ?? body.closing_fee ?? 0, 'رسوم الإغلاق', { min: 0, max: 10000 });
@@ -638,8 +639,20 @@ module.exports = (r, { q, tx, cfg, model, cipher, connectors, couriers, limiter,
          rto_ship_multiplier = excluded.rto_ship_multiplier,
          updated_at = excluded.updated_at`)
       .run(user.id, market, cat, commissionPct, fulfillmentFee, closingFee, rtoMult, now);
-    const rules = q('SELECT * FROM market_fee_rules WHERE user_id = ? ORDER BY market, cat').all(user.id);
-    return { ok: true, rules };
+    const rows = q('SELECT * FROM market_fee_rules WHERE user_id = ? ORDER BY market, cat').all(user.id);
+    return {
+      ok: true,
+      rules: rows.map((row) => ({
+        id: row.id,
+        market: row.market,
+        cat: row.cat,
+        commissionPct: Number(row.commission_pct || 0),
+        fulfillmentFee: Number(row.fulfillment_fee || 0),
+        closingFee: Number(row.closing_fee || 0),
+        rtoShipMultiplier: Number(row.rto_ship_multiplier || 1.8),
+        updatedAt: row.updated_at
+      }))
+    };
   });
 
   /** تفصيل الرسوم والأرباح لطلب محدد (Order Fee Drilldown) */

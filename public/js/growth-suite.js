@@ -474,11 +474,11 @@
   /**
    * 7. مدقق مطابقة صور المنتجات لمواصفات أمازون مصر ونون (Pixel-Level Compliance Auditor)
    */
-  function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'amazon', actualWidth, actualHeight } = {}) {
-    const w = Math.max(0, Math.floor(Number(width) || 0));
-    const h = Math.max(0, Math.floor(Number(height) || 0));
-    const trueW = Math.max(w, Math.floor(Number(actualWidth) || w));
-    const trueH = Math.max(h, Math.floor(Number(actualHeight) || h));
+  function evaluateImageCompliance({ width, height, sampleWidth, sampleHeight, rgbaPixels, marketplace = 'amazon', actualWidth, actualHeight } = {}) {
+    const trueW = Math.max(0, Math.floor(Number(actualWidth ?? width) || 0));
+    const trueH = Math.max(0, Math.floor(Number(actualHeight ?? height) || 0));
+    const w = Math.max(0, Math.floor(Number(sampleWidth ?? width) || 0));
+    const h = Math.max(0, Math.floor(Number(sampleHeight ?? height) || 0));
     const mkt = String(marketplace || 'amazon').toLowerCase();
     const isNoon = mkt === 'noon' || mkt === 'n' || mkt === 'trendyol' || mkt === 't';
     const checks = [];
@@ -545,11 +545,15 @@
     if (hasPixels) {
       const bx = Math.max(1, Math.floor(w * 0.04));
       const by = Math.max(1, Math.floor(h * 0.04));
+      const bStepX = Math.max(1, Math.floor(w / 240));
+      const bStepY = Math.max(1, Math.floor(h / 240));
       let bTotal = 0, bWhite = 0, sumR = 0, sumG = 0, sumB = 0;
-      let minX = w, minY = h, maxX = -1, maxY = -1;
 
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y += bStepY) {
+        const inYBorder = y < by || y >= h - by;
+        for (let x = 0; x < w; x += bStepX) {
+          const inXBorder = x < bx || x >= w - bx;
+          if (!inYBorder && !inXBorder) continue;
           const idx = (y * w + x) * 4;
           const r = rgbaPixels[idx];
           const g = rgbaPixels[idx + 1];
@@ -558,23 +562,17 @@
           const er = a < 255 ? Math.round((r * a + 255 * (255 - a)) / 255) : r;
           const eg = a < 255 ? Math.round((g * a + 255 * (255 - a)) / 255) : g;
           const eb = a < 255 ? Math.round((b * a + 255 * (255 - a)) / 255) : b;
-
-          if (x < bx || x >= w - bx || y < by || y >= h - by) {
-            bTotal++;
-            sumR += er; sumG += eg; sumB += eb;
-            if (er >= 253 && eg >= 253 && eb >= 253) bWhite++;
-          }
-          if (a > 20 && (er < 245 || eg < 245 || eb < 245)) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
+          bTotal++;
+          sumR += er; sumG += eg; sumB += eb;
+          if (er >= 253 && eg >= 253 && eb >= 253) bWhite++;
         }
       }
 
+      const bgRefR = bTotal > 0 ? sumR / bTotal : 255;
+      const bgRefG = bTotal > 0 ? sumG / bTotal : 255;
+      const bgRefB = bTotal > 0 ? sumB / bTotal : 255;
       if (bTotal > 0) {
-        borderHex = rgbToHex(sumR / bTotal, sumG / bTotal, sumB / bTotal);
+        borderHex = rgbToHex(bgRefR, bgRefG, bgRefB);
         borderWhitePct = Math.round((bWhite / bTotal) * 1000) / 10;
       }
 
@@ -593,9 +591,38 @@
       }
       checks.push({ id: 'white_background', labelAr: 'خلفية بيضاء نقية (#FFFFFF)', status: bgStatus, value: borderHex, messageAr: bgMsg, fixHintAr: bgHint });
 
+      const scanStepX = Math.max(1, Math.floor(w / 320));
+      const scanStepY = Math.max(1, Math.floor(h / 320));
+      const isBgBright = bgRefR >= 220 && bgRefG >= 220 && bgRefB >= 220;
+      let minX = w, minY = h, maxX = -1, maxY = -1;
+
+      for (let y = 0; y < h; y += scanStepY) {
+        for (let x = 0; x < w; x += scanStepX) {
+          const idx = (y * w + x) * 4;
+          const a = rgbaPixels[idx + 3];
+          if (a < 20) continue;
+          const r = rgbaPixels[idx];
+          const g = rgbaPixels[idx + 1];
+          const b = rgbaPixels[idx + 2];
+          const er = a < 255 ? Math.round((r * a + 255 * (255 - a)) / 255) : r;
+          const eg = a < 255 ? Math.round((g * a + 255 * (255 - a)) / 255) : g;
+          const eb = a < 255 ? Math.round((b * a + 255 * (255 - a)) / 255) : b;
+
+          const isPureWhite = er >= 248 && eg >= 248 && eb >= 248;
+          const distFromBg = Math.abs(er - bgRefR) + Math.abs(eg - bgRefG) + Math.abs(eb - bgRefB);
+          const isForeground = isBgBright ? (!isPureWhite && distFromBg > 24) : (distFromBg > 36);
+          if (isForeground) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
       if (maxX >= minX && maxY >= minY) {
-        const fw = maxX - minX + 1;
-        const fh = maxY - minY + 1;
+        const fw = Math.min(w, maxX - minX + scanStepX);
+        const fh = Math.min(h, maxY - minY + scanStepY);
         fillRatio = Math.round(Math.max(fw / w, fh / h) * 1000) / 1000;
       }
 
@@ -622,16 +649,43 @@
       checks.push({ id: 'fill_ratio', labelAr: 'نسبة ملء المنتج في الإطار (85%)', status: 'warn', value: '—', messageAr: 'ارفع صورة لقياس نسبة ملء المنتج.', fixHintAr: '' });
     }
 
+    const normalizedChecks = checks.map((c) => {
+      const codeMap = {
+        resolution: 'RESOLUTION',
+        aspect_ratio: 'ASPECT_RATIO',
+        white_background: 'PURE_WHITE_BG',
+        fill_ratio: 'FRAME_FILL_RATIO'
+      };
+      const passedCheck = c.status === 'pass';
+      const severity = c.status === 'pass' ? 'ok' : c.status === 'warn' ? 'warning' : 'error';
+      return {
+        ...c,
+        code: codeMap[c.id] || String(c.id || '').toUpperCase(),
+        passed: passedCheck,
+        severity,
+        titleAr: c.messageAr || c.labelAr
+      };
+    });
+
+    const aspectRatio = trueH > 0 ? Math.round((trueW / trueH) * 1000) / 1000 : 0;
     return {
       marketplace: isNoon ? 'noon' : 'amazon',
       score: Math.min(100, Math.round(score)),
-      passed: score >= 85 && checks.every((c) => c.status !== 'fail'),
+      passed: score >= 85 && normalizedChecks.every((c) => c.severity !== 'error'),
+      metrics: {
+        width: trueW,
+        height: trueH,
+        aspectRatio,
+        borderWhitePct,
+        borderHex,
+        fillRatio
+      },
       borderHex,
       borderWhitePct,
       fillRatio,
       width: trueW,
       height: trueH,
-      checks
+      checks: normalizedChecks
     };
   }
 
@@ -661,7 +715,8 @@
    */
   function autoFixMarketplaceImage(sourceImgOrCanvas, opts = {}) {
     if (!sourceImgOrCanvas || typeof document === 'undefined') return null;
-    const targetMarketplace = opts.targetMarketplace === 'noon' ? 'noon' : 'amazon';
+    const rawMkt = String(opts.targetMarketplace || opts.marketplace || 'amazon').toLowerCase();
+    const targetMarketplace = (rawMkt === 'noon' || rawMkt === 'n') ? 'noon' : 'amazon';
     const fillTarget = Math.min(0.9, Math.max(0.76, Number(opts.fillTarget) || 0.85));
     const removeNearWhiteBg = opts.removeNearWhiteBg !== false;
     const addSoftShadow = Boolean(opts.addSoftShadow);
