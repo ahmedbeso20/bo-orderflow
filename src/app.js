@@ -591,6 +591,15 @@ function createApp(overrides = {}) {
     outboxTimer.unref();
   }
 
+  // معالجة طابور مزامنة المخزون اللحظي لمنع البيع الزائد كل 30 ثانية
+  let inventorySyncTimer = null;
+  if (cfg.dbFile && cfg.dbFile !== ':memory:' && typeof app.connectors.processInventorySyncQueue === 'function') {
+    inventorySyncTimer = setInterval(() => {
+      app.connectors.processInventorySyncQueue({ limit: 25 }).catch((e) => logger.error('inventory_sync_error', { error: e?.message || String(e) }));
+    }, 30_000);
+    inventorySyncTimer.unref();
+  }
+
   let courierPollTimer = null;
   if (cfg.courierPollIntervalMin > 0 && typeof app.couriers.pollOpenShipments === 'function') {
     courierPollTimer = setInterval(() => {
@@ -689,7 +698,7 @@ function createApp(overrides = {}) {
     let body = {};
     let raw = Buffer.alloc(0);
     if (method !== 'GET') {
-      raw = await readBody(req);
+      raw = await readBody(req, route.maxBody || 1_000_000);
       if (raw.length) {
         if (!/^application\/json/i.test(req.headers['content-type'] || '')) throw new HttpError(415, 'نوع المحتوى غير مدعوم');
         try { body = JSON.parse(raw.toString('utf8')); } catch { throw new HttpError(400, 'صيغة JSON غير صالحة'); }
@@ -754,10 +763,12 @@ function createApp(overrides = {}) {
   server.maxHeadersCount = 64;
 
   const close = async () => {
+    app.connectors.stop?.();
     clearInterval(purgeTimer);
     if (autoSyncTimer) clearInterval(autoSyncTimer);
     if (backupTimer) clearInterval(backupTimer);
     if (outboxTimer) clearInterval(outboxTimer);
+    if (inventorySyncTimer) clearInterval(inventorySyncTimer);
     if (courierPollTimer) clearInterval(courierPollTimer);
     limiter.stop();
     await new Promise((resolve) => { server.close(resolve); server.closeAllConnections?.(); });

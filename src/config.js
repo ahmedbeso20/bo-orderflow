@@ -167,6 +167,7 @@ function load(o = {}) {
     trustProxyHops,
     geminiKey: o.geminiKey ?? e.GEMINI_API_KEY ?? '',
     geminiModel: o.geminiModel || e.GEMINI_MODEL || 'gemini-2.5-flash',
+    geminiImageModel: o.geminiImageModel || e.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image',
     ownerName: String(o.ownerName ?? e.OWNER_NAME ?? 'مالك منصة OrderFlow').trim(),
     ownerEmail,
     ownerPhone,

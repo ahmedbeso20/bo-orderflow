@@ -4611,3 +4611,246 @@ dialog.dlg-wide .dlg-head {
     scroll-behavior: auto !important;
   }
 }
+
+/* ==========================================================================
+   10. Real-Time Inventory Sync, Sellerboard P&L & Photo Compliance Studio
+   ========================================================================== */
+.sync-dots-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.sync-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--bd);
+  background: var(--bg-sub);
+  color: var(--tx-sec);
+  white-space: nowrap;
+}
+
+.sync-pill--ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
+}
+
+.sync-pill--pending {
+  background: var(--wn-soft);
+  color: var(--wn);
+  border-color: color-mix(in srgb, var(--wn) 28%, transparent);
+}
+
+.sync-pill--err {
+  background: var(--er-soft);
+  color: var(--er);
+  border-color: color-mix(in srgb, var(--er) 28%, transparent);
+}
+
+.pnl-periods-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.pnl-period-card {
+  text-align: start;
+  cursor: pointer;
+  background: var(--bg-elev);
+  border: 1.5px solid var(--bd);
+  border-radius: var(--radius-md);
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.pnl-period-card:hover {
+  border-color: color-mix(in srgb, var(--pr) 55%, var(--bd));
+  transform: translateY(-1px);
+}
+
+.pnl-period-card.active {
+  border-color: var(--pr);
+  background: color-mix(in srgb, var(--pr) 5%, var(--bg-elev));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--pr) 14%, transparent);
+}
+
+.pnl-period-net {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.pnl-waterfall-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--bd);
+  font-size: 13.5px;
+}
+
+.pnl-waterfall-row:last-child {
+  border-bottom: none;
+}
+
+.pnl-waterfall-row.total {
+  background: color-mix(in srgb, var(--pr) 7%, var(--bg-sub));
+  border-radius: 10px;
+  margin-top: 8px;
+  font-weight: 800;
+  font-size: 15px;
+  border-bottom: none;
+}
+
+tr.pnl-losing-row td {
+  background: color-mix(in srgb, var(--er) 7%, transparent);
+}
+
+.compliance-card {
+  border: 1px solid var(--bd);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  padding: 14px;
+  margin-top: 12px;
+}
+
+.compliance-score-ring {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: 15px;
+  flex-shrink: 0;
+  border: 3px solid var(--ok);
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.compliance-score-ring.warn {
+  border-color: var(--wn);
+  color: var(--wn);
+  background: var(--wn-soft);
+}
+
+.compliance-score-ring.fail {
+  border-color: var(--er);
+  color: var(--er);
+  background: var(--er-soft);
+}
+
+.compliance-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--bd);
+  font-size: 12.5px;
+}
+
+.compliance-check-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.ps-compare-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 460px;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--bd);
+  background: #ffffff;
+  margin: 0 auto;
+}
+
+.ps-compare-wrap.ratio-4-5 {
+  aspect-ratio: 4 / 5;
+}
+
+.ps-compare-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #ffffff;
+}
+
+.ps-compare-after-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.ps-compare-label {
+  position: absolute;
+  top: 10px;
+  padding: 3px 9px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 800;
+  background: rgba(15, 23, 42, 0.78);
+  color: #ffffff;
+  z-index: 3;
+}
+
+.ps-gallery-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 8px;
+  width: 100%;
+  margin-top: 12px;
+}
+
+.ps-gallery-tile {
+  border: 1.5px solid var(--bd);
+  border-radius: 10px;
+  padding: 5px;
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+}
+
+.ps-gallery-tile.main {
+  border-color: var(--pr);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--pr) 18%, transparent);
+}
+
+.ps-gallery-tile img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+@media (max-width: 1120px) {
+  .pnl-periods-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .pnl-periods-grid {
+    grid-template-columns: 1fr;
+  }
+}

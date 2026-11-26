@@ -164,6 +164,70 @@ module.exports = (r, app) => {
     return { ok: true, ...out, items: connectors.listOutbox ? connectors.listOutbox(user.id, 20) : [] };
   });
 
+  /** طابور مزامنة المخزون اللحظي لمنع البيع الزائد (Anti-Overselling) */
+  r.get('/api/integrations/inventory-sync', ({ user }) => {
+    if (!connectors.getInventorySyncOverview) {
+      return { stats: { pending: 0, syncedLast24h: 0, failed: 0 }, jobs: [], byProduct: {} };
+    }
+    return connectors.getInventorySyncOverview(user.id);
+  });
+
+  r.post('/api/integrations/inventory-sync/push-all', async ({ user, ip }) => {
+    if (user.is_demo) {
+      return {
+        ok: true,
+        demo: true,
+        enqueued: 0,
+        processed: { processed: 0, synced: 0, retried: 0, failed: 0 },
+        message: 'الحساب التجريبي للعرض فقط — اربط حسابك الحقيقي لدفع المخزون مباشرًة للأسواق.',
+        ...(connectors.getInventorySyncOverview ? connectors.getInventorySyncOverview(user.id) : { stats: { pending: 0, syncedLast24h: 0, failed: 0 }, jobs: [], byProduct: {} })
+      };
+    }
+    if (!limiter.hit(`inv-push-all:${user.id}`, 10, 600_000)) {
+      throw new HttpError(429, 'طلبات دفع مخزون متكررة، انتظر قليلًا ثم حاول مجددًا');
+    }
+    const res = await connectors.pushAllApprovedInventory(user.id);
+    logAudit(user.id, 'integration.inventory_push_all', 'inventory', null, { enqueued: res.enqueued }, ip);
+    return {
+      ok: true,
+      ...res,
+      ...connectors.getInventorySyncOverview(user.id),
+      message: res.enqueued > 0
+        ? `تمت جدولة ومزامنة ${res.enqueued} عملية تحديث مخزون عبر المنصات المربوطة.`
+        : 'لا توجد منتجات مفعّلة للمزامنة التلقائية على منصات مربوطة حاليًا.'
+    };
+  });
+
+  r.post('/api/integrations/inventory-sync/:jobId/retry', async ({ user, params }) => {
+    if (user.is_demo) {
+      return { ok: true, demo: true, ...(connectors.getInventorySyncOverview ? connectors.getInventorySyncOverview(user.id) : {}) };
+    }
+    const res = await connectors.retryInventorySyncJob(user.id, params.jobId);
+    return { ok: true, ...res, ...connectors.getInventorySyncOverview(user.id) };
+  });
+
+  /** سحب التسويات والرسوم المالية الحقيقية من المنصة (Amazon SP-API Finances) */
+  r.post('/api/integrations/connections/:platform/sync-finances', async ({ user, params, body, ip }) => {
+    noDemo(user);
+    const platform = oneOf(params.platform, PLATFORM_KEYS, 'المنصة');
+    if (!limiter.hit(`conn-fin:${user.id}`, 15, 600_000)) {
+      throw new HttpError(429, 'طلبات سحب التسويات كثيرة، انتظر قليلًا');
+    }
+    const res = await connectors.syncFinances(user.id, platform, body?.sinceIso);
+    if (!res.ok) {
+      throw new HttpError(res.live === false ? 400 : 502, res.error || res.reason || 'تعذّر سحب التسويات المالية من المنصة');
+    }
+    logAudit(user.id, 'integration.finances_synced', 'marketplace', null, {
+      platform,
+      matchedOrders: res.matchedOrders,
+      feeLinesInserted: res.feeLinesInserted
+    }, ip);
+    return {
+      ...res,
+      message: `تمت مطابقة ${res.matchedOrders} طلبًا وإدراج ${res.feeLinesInserted} بند رسوم فعلي من ${platform === 'a' ? 'أمازون مصر' : platform}.`
+    };
+  });
+
   /** ربط Amazon SP-API بضغطة واحدة عبر LWA OAuth (يستخدم Cookie موقّعة HttpOnly للتحقق من state) */
   const crypto = require('node:crypto');
   const { parseCookies } = require('../http');

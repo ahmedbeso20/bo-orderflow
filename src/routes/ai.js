@@ -1,5 +1,8 @@
 'use strict';
-const { HttpError, text, integer, nowIso, parseJson } = require('../util');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { HttpError, bad, text, integer, nowIso, parseJson } = require('../util');
 const { MARKETS, PLANS } = require('../domain');
 const ai = require('../ai');
 
@@ -116,4 +119,127 @@ module.exports = (r, app) => {
     saveCache(user, 'market', market);
     return { market };
   });
+
+  /** استوديو الصور الذكي للمنتجات (Gemini Image + التحقق من Magic Bytes + حفظ مباشر في معرض المنتج) */
+  r.post('/api/ai/photo-studio', async ({ user, body }) => {
+    const rawInput = String(body.dataUrl || body.imageBase64 || body.image || '').trim();
+    if (!rawInput) throw bad('أرسل صورة المنتج بصيغة Base64 (PNG أو JPEG أو WEBP).');
+    if (/^data:image\/svg/i.test(rawInput) || /<svg[\s>]/i.test(rawInput)) {
+      throw bad('ملفات SVG غير مسموحة لأسباب أمنية. ارفع صورة PNG أو JPEG أو WEBP فقط.');
+    }
+
+    let base64Str = rawInput;
+    let mimeHint = '';
+    const dataUrlMatch = rawInput.match(/^data:([^;]+);base64,(.+)$/is);
+    if (dataUrlMatch) {
+      mimeHint = String(dataUrlMatch[1] || '').toLowerCase();
+      if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(mimeHint)) {
+        throw bad('صيغة الصورة غير مدعومة. يُسمح بـ PNG أو JPEG أو WEBP فقط.');
+      }
+      base64Str = dataUrlMatch[2];
+    }
+
+    const cleanB64 = base64Str.replace(/\s+/g, '');
+    if (cleanB64.length > Math.ceil(4 * 1024 * 1024 * 1.4)) {
+      throw bad('حجم الصورة كبير جدًا (الحد الأقصى ٤ ميجابايت).');
+    }
+    const imageBuffer = Buffer.from(cleanB64, 'base64');
+    const detected = ai.detectStudioImageMagicBytes(imageBuffer);
+    if (!detected) {
+      throw bad('محتوى الملف لا يطابق صورة PNG أو JPEG أو WEBP صالحة (فشل التحقق من Magic Bytes).');
+    }
+
+    const preset = Object.prototype.hasOwnProperty.call(ai.STUDIO_PRESETS, body.preset)
+      ? body.preset
+      : 'amazon_main_white';
+    const aspectRatio = body.aspectRatio === '4:5' ? '4:5' : '1:1';
+    const customHint = text(body.customHint || '', 'التعليمات الإضافية', { max: 220, optional: true });
+    let product = null;
+    if (body.productId !== undefined && body.productId !== null && body.productId !== '') {
+      const pid = integer(body.productId, 'المنتج', { min: 1, max: 2 ** 31 });
+      product = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(pid, user.id);
+      if (!product) throw new HttpError(404, 'المنتج غير موجود');
+    }
+
+    const productName = product?.name || text(body.productName || 'المنتج', 'اسم المنتج', { max: 140, optional: true });
+    const category = product?.cat || text(body.category || '', 'الفئة', { max: 60, optional: true });
+
+    if (cfg.geminiKey) {
+      quota(user);
+    }
+
+    const gen = await ai.generateProductStudioImage(cfg, {
+      imageBuffer,
+      mimeType: detected.mime,
+      productName,
+      category,
+      preset,
+      customHint,
+      aspectRatio
+    });
+
+    if (gen.source === 'client-studio-fallback') {
+      return {
+        ok: true,
+        source: 'client-studio-fallback',
+        preset: gen.preset,
+        notice: gen.notice
+      };
+    }
+
+    const uploadsDir = path.resolve(cfg.uploadsDir);
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    const filename = `prod-studio-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${gen.ext}`;
+    fs.writeFileSync(path.join(uploadsDir, filename), gen.buffer);
+    const imageUrl = `/api/uploads/products/${filename}`;
+    const now = nowIso();
+    try {
+      q('INSERT INTO user_uploads (user_id, filename, size_bytes, created_at) VALUES (?, ?, ?, ?)')
+        .run(user.id, filename, gen.buffer.length, now);
+    } catch (_) {}
+
+    let imageRecord = null;
+    let updatedProduct = null;
+    if (product) {
+      const setAsMain = Boolean(body.setAsMain);
+      const countRow = q('SELECT COUNT(*) n FROM product_images WHERE user_id = ? AND product_id = ?').get(user.id, product.id);
+      if (Number(countRow?.n || 0) >= 7) {
+        const oldest = q("SELECT id FROM product_images WHERE user_id = ? AND product_id = ? AND role != 'main' ORDER BY id ASC LIMIT 1").get(user.id, product.id);
+        if (oldest) q('DELETE FROM product_images WHERE id = ?').run(oldest.id);
+      }
+      if (setAsMain) {
+        q("UPDATE product_images SET role = 'gallery' WHERE user_id = ? AND product_id = ? AND role = 'main'").run(user.id, product.id);
+        q('UPDATE products SET image = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(imageUrl, now, product.id, user.id);
+      }
+      const role = setAsMain ? 'main' : 'gallery';
+      const width = aspectRatio === '4:5' ? 1280 : 1600;
+      const height = 1600;
+      const imgId = Number(q(`INSERT INTO product_images
+        (user_id, product_id, url, role, preset, width, height, compliance_score, compliance_json, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai_studio', ?)`)
+        .run(user.id, product.id, imageUrl, role, preset, width, height, Number(body.complianceScore || 95), body.compliance ? JSON.stringify(body.compliance).slice(0, 4000) : '', now).lastInsertRowid);
+      imageRecord = {
+        id: imgId,
+        productId: product.id,
+        url: imageUrl,
+        role,
+        preset,
+        width,
+        height,
+        source: 'ai_studio',
+        createdAt: now
+      };
+      updatedProduct = model.productOf(q('SELECT * FROM products WHERE id = ?').get(product.id));
+    }
+
+    return {
+      ok: true,
+      source: gen.source,
+      model: gen.model,
+      preset: gen.preset,
+      imageUrl,
+      imageRecord,
+      product: updatedProduct
+    };
+  }, { maxBody: 6_500_000 });
 };

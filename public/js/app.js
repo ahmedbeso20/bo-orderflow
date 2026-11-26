@@ -184,7 +184,13 @@ const DEFAULT_UI = {
   adminApprovalType: 'all',
   adminPaymentStatus: 'all',
   adminPaymentQuery: '',
-  adminAuditAction: ''
+  adminAuditAction: '',
+  inventorySync: null,
+  pnlMarket: 'all',
+  pnlFrom: '',
+  pnlTo: '',
+  pnlPeriodKey: 'thisMonth',
+  pnlLastData: null
 };
 
 let me = null;                    // المستخدم الحالي (null = زائر)
@@ -208,10 +214,25 @@ const growthState = {
     productId: '',
     preset: 'pure-white',
     ratio: '1:1',
+    targetMarketplace: 'amazon',
+    aiPreset: 'amazon_main_white',
+    customHint: '',
+    addSoftShadow: false,
     badgeText: 'أصلي ١٠٠٪',
     title: '',
     priceText: '',
     uploadedImg: null,
+    beforeDataUrl: '',
+    afterDataUrl: '',
+    afterWidth: 1600,
+    afterHeight: 1600,
+    afterSource: 'auto_fix',
+    compareMode: 'split',
+    compareSplit: 50,
+    amazonCompliance: null,
+    noonCompliance: null,
+    afterCompliance: null,
+    gallery: [],
     lastDataUrl: ''
   },
   aiChat: [
@@ -655,6 +676,7 @@ const NAV_LINKS = [
   { id: 'ord', icon: 'ord', group: 'ops', title: 'الطلبات والفواتير', badge: () => counts.pendingOrders || '' },
   { id: 'returns', icon: 'returns', group: 'ops', title: 'المرتجعات' },
   { id: 'customers', icon: 'customers', group: 'ops', title: 'العملاء' },
+  { id: 'pnl', icon: 'trendUp', group: 'fin', title: 'ربحية المتجر (P&L)' },
   { id: 'cod', icon: 'cod', group: 'fin', title: 'تحصيلات الشحن COD' },
   { id: 'pay', icon: 'pay', group: 'fin', title: 'شباك الدفع والاشتراك', badge: () => (planInfo && planInfo.id === 'free' ? 'ترقية' : '') },
   { id: 'calc', icon: 'calc', group: 'fin', title: 'حاسبة الأرباح' },
@@ -1489,26 +1511,47 @@ const renderProductsTable = () => {
     return matchesQuery && matchesStock;
   });
 
+  const syncByProduct = (state.inventorySync && state.inventorySync.byProduct) || {};
+  const ALL_MKTS = { ...MARKETPLACES, ...MARKETPLACES_EXTRA };
+
   return renderTable(
-    ['المنتج', 'SKU', 'الأسواق النشطة', 'التكلفة', 'سعر البيع', 'هامش الربح', 'المخزون', 'حالة الاعتماد', 'إجراءات'],
+    ['المنتج', 'SKU', 'الأسواق والمزامنة اللحظية', 'التكلفة', 'سعر البيع', 'هامش الربح', 'المخزون والأمان', 'حالة الاعتماد', 'إجراءات'],
     filtered.map(p => {
       const margin = p.price ? ((p.price - p.cost) / p.price) * 100 : 0;
       const sb = getStockBadge(p.stock);
+      const safety = Number(p.safetyStock || 0);
+      const publishable = Math.max(0, Number(p.stock || 0) - safety);
+      const pSync = syncByProduct[p.id] || {};
+      const mktList = ['a', 'n', 'j', 't', 'k'].filter(k => k === 'a' || k === 'n' || k === 'j' || p.markets.includes(k) || pSync[k]);
+      const syncBadgesHtml = Object.entries(pSync).map(([pk, info]) => {
+        const mName = (ALL_MKTS[pk] && ALL_MKTS[pk].short) || pk.toUpperCase();
+        const cls = info.status === 'synced' ? 'sync-pill--ok' : info.status === 'failed' ? 'sync-pill--err' : 'sync-pill--wait';
+        const icon = info.status === 'synced' ? '✓' : info.status === 'failed' ? '!' : '⟳';
+        const tip = info.status === 'failed'
+          ? `${ALL_MKTS[pk]?.name || pk}: فشل التحديث — ${info.lastError || ''}`
+          : `${ALL_MKTS[pk]?.name || pk}: ${info.status === 'synced' ? 'متزامن' : 'جاري التحديث'} (${info.lastStock ?? publishable})`;
+        return `<span class="sync-pill ${cls}" title="${esc(tip)}">${icon} ${esc(mName)}</span>`;
+      }).join('');
       return [
         `<div class="row" style="gap:10px">${renderProdThumb(p)}<div><b>${esc(p.name)}</b>${renderSourceBadge(p.source)}<br><small class="mu">${esc(p.cat || 'عام')}</small></div></div>`,
         `<code dir="ltr" style="background:var(--bg-sub);padding:2px 7px;border-radius:6px">${esc(p.sku)}</code>`,
-        `<div class="row" style="gap:5px;justify-content:flex-end">${['a', 'n', 'j'].map(k => `
-          <span style="cursor:pointer;opacity:${p.markets.includes(k) ? '1' : '0.25'}" data-a="toggle-prod-mkt" data-id="${p.id}" data-m="${k}" title="اضغط لتفعيل/إيقاف السوق">
-            ${renderMarketChip(k)}
-          </span>
-        `).join('')}</div>`,
-        fmtEGP(p.cost),
+        `<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+          <div class="row" style="gap:5px;justify-content:flex-end">${mktList.map(k => `
+            <span style="cursor:pointer;opacity:${p.markets.includes(k) ? '1' : '0.25'}" data-a="toggle-prod-mkt" data-id="${p.id}" data-m="${k}" title="اضغط لتفعيل/إيقاف السوق">
+              ${renderMarketChip(k)}
+            </span>
+          `).join('')}</div>
+          ${syncBadgesHtml ? `<div class="sync-dots-row">${syncBadgesHtml}</div>` : ''}
+        </div>`,
+        `<div>${fmtEGP(p.cost)}${p.cost <= 0 || p.costIsEstimated ? `<br><span class="badge wn" style="font-size:10.5px;margin-top:3px">تكلفة غير مؤكدة</span>` : ''}${p.packagingCost > 0 ? `<br><small class="mu">تغليف: ${fmtEGP(p.packagingCost)}</small>` : ''}</div>`,
         `<b>${fmtEGP(p.price)}</b>`,
         renderBadge(fmtNum(margin) + '٪', margin >= 25 ? 'ok' : margin >= 12 ? 'wn' : 'er'),
-        `<div><b>${fmtNum(p.stock)}</b> ${renderBadge(sb.text, sb.cls)}</div>`,
+        `<div><b>${fmtNum(p.stock)}</b> ${renderBadge(sb.text, sb.cls)}${safety > 0 ? `<br><small class="mu">أمان: ${fmtNum(safety)} · منشور: ${fmtNum(publishable)}</small>` : ''}</div>`,
         renderApprovalBadge(p.approvalStatus, p.rejectReason),
-        `<div class="row" style="gap:6px;justify-content:flex-end">
+        `<div class="row" style="gap:5px;flex-wrap:wrap;justify-content:flex-end">
           <button class="btn btn-gh btn-sm" data-a="edit-prod" data-id="${p.id}">✎ تعديل</button>
+          <button class="btn btn-gh btn-sm" data-a="open-prod-batches" data-id="${p.id}" title="إدارة دُفعات التكلفة FIFO">📦 دُفعات</button>
+          <button class="btn btn-gh btn-sm" data-a="open-prod-studio" data-id="${p.id}" title="تحسين وفحص الصورة بالاستوديو">🎨 الاستوديو</button>
           <button class="btn btn-gh btn-sm" data-a="quick-restock" data-id="${p.id}">+١٠</button>
         </div>`
       ];
@@ -1596,6 +1639,211 @@ views.ord = (d) => `
     <div id="ord-table-box">${renderOrdersTable(d)}</div>
   </div>
 `;
+
+// 5.3.5 صفحة ربحية المتجر الحقيقية بالقرش (Sellerboard-Grade P&L — #/pnl و #/rep)
+const EXPENSE_CATEGORIES = {
+  ads: 'إعلانات ممولة (PPC / Meta)',
+  rent: 'إيجار مخزن / مكتب',
+  salaries: 'رواتب وفريق عمل',
+  packaging_bulk: 'خامات تغليف بالجملة',
+  software: 'اشتراكات وبرامج',
+  photography: 'تصوير منتجات',
+  other: 'مصاريف تشغيلية أخرى'
+};
+
+views.pnl = (d) => {
+  if (!d || d.__error) return errorState('تعذّر تحميل تقرير الربحية الحقيقية', d?.__error || '');
+  state.pnlLastData = d;
+  const periodsMap = d.periods || {};
+  const periodKeys = ['today', 'yesterday', 'last7d', 'thisMonth', 'lastMonth'];
+  const selectedKey = (state.pnlFrom && state.pnlTo) ? 'custom' : (periodsMap[state.pnlPeriodKey] ? state.pnlPeriodKey : 'thisMonth');
+  const activeSummary = selectedKey === 'custom' ? (d.selected || periodsMap.thisMonth) : (periodsMap[selectedKey] || d.selected);
+  const expenses = d.expenses || [];
+  const allMkts = [['all', 'كل الأسواق'], ['a', 'أمازون مصر'], ['n', 'نون مصر'], ['j', 'جوميا'], ['t', 'ترينديول'], ['k', 'كنز']];
+
+  const wfRow = (label, val, cls = '', isNeg = false, isTotal = false) => `
+    <div class="pnl-waterfall-row ${isTotal ? 'pnl-waterfall-row--total' : ''}">
+      <span>${label}</span>
+      <b class="${cls}">${isNeg && val > 0 ? '− ' : ''}${fmtEGP(val)}</b>
+    </div>
+  `;
+
+  return `
+    ${d.missingCogsCount > 0 ? `
+      <div class="card" style="margin-bottom:16px;border-inline-start:4px solid var(--wn);background:var(--bg-soft, var(--bg))">
+        <div class="row-wrap" style="gap:10px;align-items:center">
+          <span style="font-size:18px" aria-hidden="true">⚠️</span>
+          <div class="sp">
+            <b style="display:block;margin-bottom:2px">تنبيه دقة الربح الصافي</b>
+            <p class="mu" style="margin:0;font-size:13px">يوجد <b>${fmtNum(d.missingCogsCount)}</b> منتجات بدون تكلفة شراء مؤكدة — أدخل تكلفة دُفعات الشراء (FIFO) لحساب صافي ربح دقيق ١٠٠٪ بالجنيه والقرش.</p>
+          </div>
+          <a class="btn btn-gh btn-sm" href="#/prod">مراجعة تكاليف المنتجات ◂</a>
+        </div>
+      </div>
+    ` : ''}
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="row-wrap" style="gap:8px;align-items:center">
+        ${allMkts.map(([k, lbl]) => `
+          <button type="button" class="pill ${state.pnlMarket === k ? 'on' : ''}" data-a="pnl-mkt-filter" data-v="${k}">${lbl}</button>
+        `).join('')}
+        <span class="sp"></span>
+        <input type="date" id="pnl-from" value="${esc(state.pnlFrom)}" aria-label="من تاريخ" style="width:auto;margin:0;padding:6px 10px">
+        <input type="date" id="pnl-to" value="${esc(state.pnlTo)}" aria-label="إلى تاريخ" style="width:auto;margin:0;padding:6px 10px">
+        <button type="button" class="btn btn-gh btn-sm" data-a="pnl-apply-dates">تطبيق الفترة</button>
+      </div>
+      <div class="row-wrap" style="gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">
+        <button type="button" class="btn btn-ac btn-sm" data-a="open-prod-batches-picker">+ دُفعة مخزون (FIFO)</button>
+        <button type="button" class="btn btn-gh btn-sm" data-a="open-expense-modal">+ مصروف تشغيلي</button>
+        <button type="button" class="btn btn-gh btn-sm" data-a="open-settlement-csv-modal">📤 استيراد تسويات CSV</button>
+        <button type="button" class="btn btn-gh btn-sm" data-a="pnl-export-csv">📥 تصدير P&L CSV</button>
+      </div>
+    </div>
+
+    <div class="pnl-periods-grid" style="margin-bottom:18px">
+      ${periodKeys.map((pk) => {
+        const p = periodsMap[pk];
+        if (!p) return '';
+        const isSel = selectedKey === pk;
+        const pos = p.netProfit >= 0;
+        return `
+          <button type="button" class="card pnl-period-card ${isSel ? 'on' : ''}" data-a="pnl-select-period" data-v="${pk}" style="text-align:right;cursor:pointer">
+            <div class="row" style="margin-bottom:6px">
+              <span class="mu" style="font-size:12.5px;font-weight:700">${esc(p.label)}</span>
+              <span class="sp"></span>
+              ${renderBadge(fmtNum(p.orderCount) + ' طلب', isSel ? 'pr' : '')}
+            </div>
+            <div style="font-size:13px" class="mu">المبيعات: <b style="color:var(--tx)">${fmtEGP(p.grossSales)}</b></div>
+            <div class="${pos ? 'ok-tx' : 'er-tx'}" style="font-size:20px;font-weight:800;margin:6px 0">${pos ? '+' : ''}${fmtEGP(p.netProfit)}</div>
+            <div class="row" style="font-size:11.5px;gap:8px;flex-wrap:wrap">
+              <span class="mu">هامش: <b>${fmtNum(p.netMarginPct)}٪</b></span>
+              <span class="mu">ROI: <b>${fmtNum(p.roiPct)}٪</b></span>
+              <span class="mu">مسوّى: <b>${fmtNum(p.settledOrdersPct)}٪</b></span>
+            </div>
+          </button>
+        `;
+      }).join('')}
+    </div>
+
+    <div class="grid-2" style="margin-bottom:20px">
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <h3>شلال صافي الربح التفصيلي — ${esc(activeSummary?.label || 'هذا الشهر')}</h3>
+          <span class="sp"></span>
+          ${renderBadge(`${fmtNum(activeSummary?.settledOrdersPct || 0)}٪ مسوّى فعليًا`, (activeSummary?.settledOrdersPct || 0) >= 50 ? 'ok' : 'wn')}
+        </div>
+        ${activeSummary ? `
+          ${wfRow('إجمالي المبيعات (Gross Sales)', activeSummary.grossSales, 'pr-tx')}
+          ${wfRow('قيمة المرتجعات ورفض الاستلام (معلوماتي)', activeSummary.refundsAndRtoValue, 'mu')}
+          ${wfRow('عمولات المنصات (Referral / Commission)', activeSummary.marketplaceCommissions, 'er-tx', true)}
+          ${wfRow('رسوم الشحن والتجهيز (FBA / FBM / Courier)', activeSummary.shippingAndFulfillmentFees, 'er-tx', true)}
+          ${wfRow('خسارة شحن المرتجعات (ذهاب وعودة RTO)', activeSummary.rtoShippingLoss, 'er-tx', true)}
+          ${wfRow('تكلفة البضاعة المباعة (FIFO COGS)', activeSummary.cogsFifo, 'er-tx', true)}
+          ${wfRow('تكلفة التغليف والكراتين', activeSummary.packagingCost, 'er-tx', true)}
+          ${wfRow('مصاريف الإعلانات الممولة (PPC / Ads)', activeSummary.adSpend, 'er-tx', true)}
+          ${wfRow('رسوم منصة إضافية', activeSummary.otherFees, 'er-tx', true)}
+          ${wfRow('ضريبة القيمة المضافة على الرسوم (VAT 14%)', activeSummary.vat, 'er-tx', true)}
+          ${wfRow('مصاريف تشغيلية مخصّصة للفترة (Pro-rated)', activeSummary.operatingExpenses, 'er-tx', true)}
+          ${wfRow('صافي الربح الحقيقي (Net Profit)', activeSummary.netProfit, activeSummary.netProfit >= 0 ? 'ok-tx' : 'er-tx', false, true)}
+        ` : ''}
+      </div>
+
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <h3>المصاريف التشغيلية والإعلانية</h3>
+          <span class="sp"></span>
+          <button type="button" class="btn btn-gh btn-sm" data-a="open-expense-modal">+ إضافة مصروف</button>
+        </div>
+        <p class="mu" style="font-size:12.5px;margin-bottom:12px">المصاريف الشهرية المتكررة تُقسّم تناسبيًا على عدد أيام الفترة المختارة تلقائيًا (مثال: ٣٠٠٠ ج.م شهريًا = ١٠٠٠ ج.م لفترة ١٠ أيام).</p>
+        ${expenses.length ? renderTable(
+          ['المصروف', 'التصنيف', 'التكرار', 'المبلغ', 'التاريخ', ''],
+          expenses.slice(0, 12).map((e) => [
+            `<b>${esc(e.title)}</b>`,
+            `<small class="mu">${esc(EXPENSE_CATEGORIES[e.category] || e.category)}</small>`,
+            renderBadge(e.recurrence === 'monthly' ? 'شهري (تناسبي)' : 'مرة واحدة', e.recurrence === 'monthly' ? 'pr' : ''),
+            `<b>${fmtEGP(e.amount)}</b>`,
+            `<small class="mu">${esc(e.expenseDate)}</small>`,
+            `<button type="button" class="btn btn-er btn-sm" data-a="delete-expense" data-id="${e.id}" aria-label="حذف ${esc(e.title)}">✕</button>`
+          ])
+        ) : emptyState('🧾', 'لا توجد مصاريف تشغيلية مسجّلة', 'سجّل الإيجار أو الإعلانات أو الرواتب لتُخصم بدقة من صافي ربح المتجر.')}
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px">
+      <div class="row-wrap" style="margin-bottom:12px">
+        <div>
+          <h3 style="margin:0">ربحية وعائد الاستثمار (ROI) لكل منتج</h3>
+          <small class="mu">المنتجات الخاسرة تظهر أولًا باللون الأحمر لتعديل السعر أو تقليل المرتجعات فورًا.</small>
+        </div>
+      </div>
+      ${(d.products && d.products.length) ? `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>المنتج / SKU</th>
+                <th>مباع / مرتجع</th>
+                <th>نسبة المرتجع</th>
+                <th>الإيراد</th>
+                <th>الرسوم والشحن</th>
+                <th>تكلفة FIFO</th>
+                <th>صافي الربح</th>
+                <th>الهامش / ROI</th>
+                <th>إجراء</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${d.products.map((pr) => `
+                <tr class="${pr.isLosing ? 'pnl-losing-row' : ''}">
+                  <td>
+                    <b>${esc(pr.name)}</b>
+                    <br><code dir="ltr" style="font-size:11px">${esc(pr.sku)}</code>
+                    ${pr.isLosing ? ` <span class="badge er">خاسر — راجع السعر أو المرتجعات</span>` : ''}
+                    ${pr.costMissing ? ` <span class="badge wn">تكلفة غير مؤكدة</span>` : ''}
+                  </td>
+                  <td><b>${fmtNum(pr.unitsSold)}</b> / <span class="er-tx">${fmtNum(pr.unitsReturned)}</span></td>
+                  <td>${renderBadge(fmtNum(pr.returnRatePct) + '٪', pr.returnRatePct >= 15 ? 'er' : pr.returnRatePct >= 8 ? 'wn' : 'ok')}</td>
+                  <td>${fmtEGP(pr.revenue)}</td>
+                  <td class="er-tx">− ${fmtEGP(pr.fees)}</td>
+                  <td>${fmtEGP(pr.cogs)}</td>
+                  <td><b class="${pr.netProfit >= 0 ? 'ok-tx' : 'er-tx'}">${pr.netProfit >= 0 ? '+' : ''}${fmtEGP(pr.netProfit)}</b></td>
+                  <td><b>${fmtNum(pr.marginPct)}٪</b><br><small class="mu">ROI ${fmtNum(pr.roiPct)}٪</small></td>
+                  <td>${pr.productId ? `<button type="button" class="btn btn-gh btn-sm" data-a="open-prod-batches" data-id="${pr.productId}">📦 دُفعات</button>` : '—'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : emptyState('📊', 'لا توجد مبيعات في هذه الفترة بعد', 'عند تسجيل أو مزامنة الطلبات سيظهر هنا تحليل الربحية والـ ROI لكل منتج.')}
+    </div>
+
+    <div class="card">
+      <div class="row-wrap" style="margin-bottom:12px">
+        <div>
+          <h3 style="margin:0">حالة تسوية الطلبات وتفصيل الرسوم</h3>
+          <small class="mu">تمييز واضح بين الطلبات المحسوبة من تسويات المنصات الفعلية (API / CSV) وبين التقدير التلقائي.</small>
+        </div>
+      </div>
+      ${(d.orders && d.orders.length) ? renderTable(
+        ['الطلب', 'السوق', 'الإجمالي', 'تكلفة FIFO', 'الرسوم والشحن', 'صافي الربح', 'مصدر الرسوم', 'تفصيل'],
+        d.orders.map((o) => {
+          const settled = o.feesSource && o.feesSource !== 'estimated';
+          return [
+            `<b>#${arDigits(o.no)}</b>${o.externalRef ? `<br><code dir="ltr" style="font-size:11px">${esc(o.externalRef)}</code>` : ''}`,
+            renderMarketChip(o.market),
+            `<b>${fmtEGP(o.total)}</b>`,
+            fmtEGP(o.cogsFifo),
+            `<span class="er-tx">− ${fmtEGP(o.feesTotal + o.packagingCost)}</span>`,
+            `<b class="${o.netProfit >= 0 ? 'ok-tx' : 'er-tx'}">${o.netProfit >= 0 ? '+' : ''}${fmtEGP(o.netProfit)}</b>`,
+            settled ? renderBadge('محسوب فعليًا من التسوية ✓', 'ok') : renderBadge('تقديري', 'wn'),
+            `<button type="button" class="btn btn-gh btn-sm" data-a="view-order-fees" data-id="${o.id}">🔍 تفصيل الرسوم</button>`
+          ];
+        })
+      ) : '<p class="mu" style="margin:0;font-size:13px">لا توجد طلبات ضمن الفترة المحددة.</p>'}
+    </div>
+  `;
+};
+views.rep = views.pnl;
 
 // 5.4 صفحة تحصيلات الشحن COD (#/cod)
 const COURIER_TITLES = { bosta: 'بوسطة (Bosta)', aramex: 'أرامكس (Aramex)', mylerz: 'مايلرز (Mylerz)' };
@@ -1741,80 +1989,185 @@ const renderAIListingCards = (data) => {
   `;
 };
 
+const renderComplianceCard = (title, report) => {
+  if (!report) {
+    return `<div class="compliance-card"><b style="font-size:13.5px">${title}</b><p class="mu" style="margin:6px 0 0;font-size:12.5px">اختر منتجًا أو ارفع صورة لتشغيل الفحص بالبكسل فورًا.</p></div>`;
+  }
+  const scoreCls = report.score >= 85 ? 'ok' : report.score >= 60 ? 'wn' : 'er';
+  return `
+    <div class="compliance-card">
+      <div class="row" style="gap:10px;margin-bottom:8px">
+        <div class="compliance-score-ring compliance-score-ring--${scoreCls}">${fmtNum(report.score)}٪</div>
+        <div class="sp">
+          <b style="display:block;font-size:13.5px">${title}</b>
+          <small class="mu">${report.passed ? 'مطابقة وجاهزة للنشر ✓' : 'تحتاج تحسينًا قبل النشر'} · ${fmtNum(report.metrics.width)}×${fmtNum(report.metrics.height)}px</small>
+        </div>
+        <span title="لون الحواف المكتشف" style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px" dir="ltr">
+          <i style="width:16px;height:16px;border-radius:4px;border:1px solid var(--bd);background:${esc(report.metrics.borderHex)}"></i>
+          ${esc(report.metrics.borderHex)}
+        </span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        ${(report.checks || []).map((c) => `
+          <div class="compliance-check-row compliance-check-row--${c.status}">
+            <span>${c.status === 'pass' ? '✓' : c.status === 'warn' ? '!' : '✕'}</span>
+            <div class="sp">
+              <b>${esc(c.titleAr)}</b> <small class="mu">(${esc(c.measured)} / ${esc(c.target)})</small>
+              ${c.status !== 'pass' && c.fixHintAr ? `<div class="mu" style="font-size:11.5px">${esc(c.fixHintAr)}</div>` : ''}
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+};
+
 const renderPhotoStudioTab = () => {
   const ps = growthState.photoStudio;
-  const presets = [
-    { id: 'pure-white', label: 'أبيض نقي #FFFFFF (أمازون / نون)', desc: 'معتمد للصورة الرئيسية' },
-    { id: 'studio-pearl', label: 'استوديو لؤلؤي فاخر', desc: 'إضاءة ناعمة + شارة جودة' },
-    { id: 'promo-ocean', label: 'عرض ترويجي مميز', desc: 'للسوشيال وصفحات A+' }
+  const aiPresets = [
+    { id: 'amazon_main_white', label: 'أبيض نقي #FFFFFF (أمازون)', desc: 'صورة رئيسية ١:١ احترافية' },
+    { id: 'noon_pearl_podium', label: 'منصة لؤلؤية ناعمة (نون)', desc: 'إضاءة استوديو فاخرة ٤:٥' },
+    { id: 'egyptian_lifestyle', label: 'مشهد استخدام منزلي مصري', desc: 'للمعرض وصفحات A+' },
+    { id: 'infographic_clean', label: 'خلفية عرض إنفوجرافيك', desc: 'مساحة نظيفة لنقاط البيع' }
   ];
+  const hasAfter = Boolean(ps.afterDataUrl);
+  const hasBefore = Boolean(ps.beforeDataUrl);
   return `
     <div class="grid-2">
       <div class="card">
         <div class="row" style="margin-bottom:8px">
-          <h3>استوديو صور المنتجات الذكي</h3>
+          <h3>استوديو صور المنتجات الذكي وفحص مطابقة أمازون ونون</h3>
           <span class="sp"></span>
-          <span class="ai-badge">${ico('camera', 13)} Photo Studio</span>
+          <span class="ai-badge">${ico('camera', 13)} AI Photo Studio</span>
         </div>
-        <p class="mu" style="font-size:13.5px;margin-bottom:14px">جهّز صور منتجاتك بمقاسات وخلفيات متوافقة مع شروط أمازون مصر ونون وجوميا واحفظها مباشرة على منتجك في الكتالوج.</p>
+        <p class="mu" style="font-size:13.5px;margin-bottom:14px">افحص صور منتجاتك بالبكسل وفق شروط أمازون مصر (١٦٠٠×١٦٠٠ أبيض نقي وإشغال ٨٥٪) ونون (٤:٥)، وأصلحها بضغطة زر أو ولّد مشهدًا احترافيًا بـ Gemini.</p>
 
-        <label for="ps-prod-sel">اختر منتجًا من كتالوجك (لتطبيق الصورة عليه مباشرة)</label>
+        <label for="ps-prod-sel">١. اختر منتجًا من كتالوجك (لحفظ الصورة أو إضافتها للمعرض)</label>
         <select id="ps-prod-sel" data-i="ps-select-prod">
           <option value="">— اختر منتجًا من الكتالوج —</option>
           ${products.map((p) => `<option value="${p.id}" ${String(ps.productId) === String(p.id) ? 'selected' : ''}>${esc(p.name)} (${fmtEGP(p.price)})</option>`).join('')}
         </select>
 
-        <label for="ps-file-in">ارفع صورة المنتج (PNG / JPG — اختياري)</label>
-        <input id="ps-file-in" type="file" accept="image/*" data-i="ps-upload-file" style="padding:8px">
+        <label for="ps-file-in">٢. ارفع صورة المنتج الخام (PNG / JPG / WEBP حتى ٤ ميجابايت)</label>
+        <input id="ps-file-in" type="file" accept="image/png,image/jpeg,image/webp" data-i="ps-upload-file" style="padding:8px">
 
-        <label>اختر نمط الخلفية</label>
-        <div class="ps-presets-grid">
-          ${presets.map((pr) => `
-            <button type="button" class="ps-preset-btn ${ps.preset === pr.id ? 'on' : ''}" data-a="ps-preset" data-v="${pr.id}">
-              <b>${pr.label}</b>
-              <small class="mu">${pr.desc}</small>
-            </button>
-          `).join('')}
-        </div>
-
-        <div class="grid-equal" style="gap:12px;margin-top:12px">
+        <div class="grid-equal" style="gap:10px;margin-top:8px">
           <div>
-            <label for="ps-title-in">عنوان العرض (في نمط الاستوديو والعرض)</label>
-            <input id="ps-title-in" value="${esc(ps.title)}" placeholder="مثال: سماعة أنكر Soundcore R50i" data-i="ps-text-change">
-          </div>
-          <div>
-            <label for="ps-badge-in">شارة الجودة / العرض</label>
-            <input id="ps-badge-in" value="${esc(ps.badgeText)}" placeholder="مثال: أصلي ١٠٠٪ · ضمان سنة" data-i="ps-text-change">
-          </div>
-        </div>
-
-        <div class="grid-equal" style="gap:12px">
-          <div>
-            <label for="ps-price-in">السعر المعروض (اختياري)</label>
-            <input id="ps-price-in" value="${esc(ps.priceText)}" placeholder="مثال: ٧٥٠ ج.م" data-i="ps-text-change">
-          </div>
-          <div>
-            <label>مقاس الصورة</label>
+            <label>المنصة المستهدفة للإصلاح الفوري</label>
             <div class="seg-rail" style="width:100%">
-              <button type="button" class="pill sp ${ps.ratio === '1:1' ? 'on' : ''}" data-a="ps-ratio" data-v="1:1">1:1 مربع (أمازون)</button>
-              <button type="button" class="pill sp ${ps.ratio === '4:5' ? 'on' : ''}" data-a="ps-ratio" data-v="4:5">4:5 عمودي (نون)</button>
+              <button type="button" class="pill sp ${ps.targetMarketplace === 'amazon' ? 'on' : ''}" data-a="ps-target-mkt" data-v="amazon">أمازون 1600×1600</button>
+              <button type="button" class="pill sp ${ps.targetMarketplace === 'noon' ? 'on' : ''}" data-a="ps-target-mkt" data-v="noon">نون 1280×1600</button>
             </div>
           </div>
+          <div style="display:flex;align-items:flex-end;padding-bottom:6px">
+            <label class="row" style="cursor:pointer;margin:0;color:var(--tx);font-weight:600">
+              <input type="checkbox" data-i="ps-toggle-shadow" style="width:auto;min-height:auto;margin:0" ${ps.addSoftShadow ? 'checked' : ''}>
+              <span>إضافة ظل استوديو ناعم أسفل المنتج</span>
+            </label>
+          </div>
         </div>
 
-        <div class="row-wrap" style="margin-top:14px;gap:10px">
-          <button type="button" class="btn btn-ac sp" data-a="ps-save-to-prod" id="btn-ps-save">${ico('checkCircle', 16)} حفظ الصورة للمنتج في الكتالوج</button>
-          <button type="button" class="btn btn-gh" data-a="ps-download">${ico('download', 16)} تحميل JPG</button>
+        <button type="button" class="btn btn-ac" id="btn-ps-autofix" data-a="ps-auto-fix" style="width:100%;margin-top:12px">
+          ✨ إصلاح تلقائي فوري لشروط أمازون ونون (${ps.targetMarketplace === 'noon' ? '١٢٨٠×١٦٠٠' : '١٦٠٠×١٦٠٠'})
+        </button>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--bd)">
+          <label>٣. أو ولّد مشهدًا بالذكاء الاصطناعي (Gemini Image Studio)</label>
+          <div class="ps-presets-grid">
+            ${aiPresets.map((pr) => `
+              <button type="button" class="ps-preset-btn ${ps.aiPreset === pr.id ? 'on' : ''}" data-a="ps-ai-preset" data-v="${pr.id}">
+                <b>${pr.label}</b>
+                <small class="mu">${pr.desc}</small>
+              </button>
+            `).join('')}
+          </div>
+          <label for="ps-hint-in" style="margin-top:10px">توجيه إضافي للمشهد (اختياري)</label>
+          <input id="ps-hint-in" value="${esc(ps.customHint || '')}" placeholder="مثال: إضاءة طبيعية دافئة على سطح رخامي فاتح" data-i="ps-hint-change">
+          <button type="button" class="btn btn-gh" id="btn-ps-ai-gen" data-a="ps-ai-generate" style="width:100%">
+            🤖 توليد مشهد بالذكاء الاصطناعي (Gemini)
+          </button>
+        </div>
+
+        <div class="row-wrap" style="margin-top:14px;gap:8px;padding-top:12px;border-top:1px solid var(--bd)">
+          <button type="button" class="btn btn-ok sp" data-a="ps-save-gallery" data-role="main" id="btn-ps-save-main">${ico('checkCircle', 15)} اعتماد كصورة رئيسية للمنتج</button>
+          <button type="button" class="btn btn-gh" data-a="ps-save-gallery" data-role="gallery" id="btn-ps-save-gal">+ إضافة لمعرض المنتج</button>
+          <button type="button" class="btn btn-gh" data-a="ps-download">${ico('download', 15)} تحميل PNG</button>
         </div>
       </div>
 
-      <div class="card photo-studio-stage">
-        <div class="row" style="width:100%;margin-bottom:10px">
-          <b>المعاينة الحية للصورة (${ps.ratio})</b>
-          <span class="sp"></span>
-          <span class="meta-inline ok">دقة عالية 800px</span>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card photo-studio-stage">
+          <div class="row-wrap" style="width:100%;margin-bottom:10px;gap:8px">
+            <b>${hasAfter ? 'مقارنة قبل / بعد الإصلاح' : 'المعاينة الحية للصورة'}</b>
+            <span class="sp"></span>
+            ${hasAfter ? `
+              <div class="seg-rail">
+                <button type="button" class="pill ${ps.compareMode === 'split' ? 'on' : ''}" data-a="ps-compare-mode" data-v="split">قبل / بعد</button>
+                <button type="button" class="pill ${ps.compareMode === 'after' ? 'on' : ''}" data-a="ps-compare-mode" data-v="after">النهائية</button>
+                <button type="button" class="pill ${ps.compareMode === 'before' ? 'on' : ''}" data-a="ps-compare-mode" data-v="before">الأصلية</button>
+              </div>
+            ` : `<span class="meta-inline ok">${ps.targetMarketplace === 'noon' ? '1280×1600' : '1600×1600'}</span>`}
+          </div>
+
+          ${hasAfter ? `
+            <div class="ps-compare-wrap" data-testid="ps-compare-stage">
+              ${ps.compareMode === 'before' && hasBefore ? `
+                <img src="${ps.beforeDataUrl}" alt="الصورة الأصلية قبل التحسين" class="ps-compare-img">
+              ` : ps.compareMode === 'after' ? `
+                <img src="${ps.afterDataUrl}" alt="الصورة النهائية بعد الإصلاح" class="ps-compare-img">
+              ` : `
+                <div class="ps-split-box">
+                  <img src="${ps.afterDataUrl}" alt="بعد الإصلاح" class="ps-compare-img">
+                  ${hasBefore ? `<img src="${ps.beforeDataUrl}" alt="قبل الإصلاح" class="ps-compare-img ps-compare-overlay" style="clip-path:inset(0 0 0 ${ps.compareSplit}%)">` : ''}
+                  <div class="ps-split-divider" style="left:${ps.compareSplit}%"></div>
+                </div>
+                <div class="row" style="gap:10px;margin-top:8px;width:100%">
+                  <small class="mu">بعد التحسين</small>
+                  <input type="range" min="0" max="100" value="${ps.compareSplit}" data-i="ps-compare-slider" aria-label="شريط مقارنة قبل وبعد" class="sp" style="margin:0">
+                  <small class="mu">الأصلية</small>
+                </div>
+              `}
+            </div>
+            ${ps.afterCompliance ? `
+              <div class="row" style="width:100%;margin-top:8px;gap:8px">
+                ${renderBadge(`نتيجة المطابقة بعد الإصلاح: ${fmtNum(ps.afterCompliance.score)}٪`, ps.afterCompliance.passed ? 'ok' : 'wn')}
+                <span class="mu" style="font-size:12px">${fmtNum(ps.afterCompliance.metrics.width)}×${fmtNum(ps.afterCompliance.metrics.height)}px · إشغال ${fmtNum(ps.afterCompliance.metrics.fillRatio)}٪</span>
+              </div>
+            ` : ''}
+          ` : `
+            <canvas id="ps-canvas" class="ps-canvas" width="800" height="800" aria-label="معاينة صورة المنتج في الاستوديو"></canvas>
+          `}
         </div>
-        <canvas id="ps-canvas" class="ps-canvas" width="800" height="800" aria-label="معاينة صورة المنتج في الاستوديو"></canvas>
+
+        <div class="grid-equal" style="gap:12px">
+          ${renderComplianceCard('فحص شروط أمازون مصر (١:١)', ps.amazonCompliance)}
+          ${renderComplianceCard('فحص شروط نون مصر (٤:٥)', ps.noonCompliance)}
+        </div>
+
+        ${ps.productId ? `
+          <div class="card">
+            <div class="row" style="margin-bottom:8px">
+              <b>معرض صور المنتج (${fmtNum((ps.gallery || []).length)} / ٧)</b>
+              <span class="sp"></span>
+              <small class="mu">صورة رئيسية + ٦ صور معرض</small>
+            </div>
+            ${(ps.gallery && ps.gallery.length) ? `
+              <div class="ps-gallery-strip">
+                ${ps.gallery.map((g) => `
+                  <div class="ps-gallery-tile ${g.role === 'main' ? 'is-main' : ''}">
+                    <img src="${esc(g.url)}" alt="صورة منتج">
+                    <div class="row" style="justify-content:space-between;gap:4px;margin-top:6px">
+                      ${g.role === 'main'
+                        ? renderBadge('رئيسية ★', 'ok')
+                        : `<button type="button" class="btn btn-gh btn-sm" style="padding:3px 6px;font-size:11px" data-a="ps-set-gallery-main" data-id="${g.id}">تعيين رئيسية</button>`}
+                      <button type="button" class="btn btn-er btn-sm" style="padding:3px 6px;font-size:11px" data-a="ps-del-gallery-img" data-id="${g.id}" aria-label="حذف الصورة">✕</button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            ` : '<p class="mu" style="margin:0;font-size:12.5px">لا توجد صور محفوظة في المعرض لهذا المنتج بعد.</p>'}
+          </div>
+        ` : ''}
       </div>
     </div>
   `;
@@ -2185,6 +2538,11 @@ views.int = (d) => {
                     <button type="button" class="btn btn-sm btn-ok" data-a="sync-api-conn" data-k="${item.key}">
                       ${ico('sync', 14)} سحب البيانات
                     </button>
+                    ${item.key === 'a' ? `
+                      <button type="button" class="btn btn-sm btn-gh" data-a="sync-finances-conn" data-k="a" title="سحب بنود الرسوم والتسويات الفعلية من أمازون">
+                        💰 سحب تسويات أمازون
+                      </button>
+                    ` : ''}
                   ` : ''}
                 </div>
               </div>
@@ -2205,6 +2563,45 @@ views.int = (d) => {
         }).join('')}
       </div>
     `).join('')}
+
+    ${(() => {
+      const inv = (d && d.inventorySync) || state.inventorySync || { counts: { pending: 0, synced24h: 0, failed: 0 }, jobs: [] };
+      const c = inv.counts || { pending: 0, synced24h: 0, failed: 0 };
+      const jobs = inv.jobs || [];
+      return `
+        <div class="card" style="margin-top:22px">
+          <div class="row-wrap" style="gap:10px;margin-bottom:14px;align-items:center">
+            <div class="sp">
+              <h3 style="margin:0 0 4px">مزامنة المخزون اللحظية عبر المنصات (منع البيع الزائد)</h3>
+              <small class="mu">عند وصول أي طلب جديد أو تعديل كمية، يدفع OrderFlow الكمية المحدثة (بعد خصم مخزون الأمان) تلقائيًا لكل المنصات المتصلة مع إعادة محاولة ذكية.</small>
+            </div>
+            <button type="button" class="btn btn-ac btn-sm" data-a="inv-push-all" id="btn-inv-push-all">⚡ دفع المخزون لكل المنصات الآن</button>
+          </div>
+          <div class="grid-kpi" style="margin-bottom:14px">
+            <div class="card kpi-card"><span class="mu" style="font-size:12.5px">قيد الانتظار / التنفيذ</span><b>${fmtNum(c.pending)}</b><div>${renderBadge('طابور حي', 'wn')}</div></div>
+            <div class="card kpi-card"><span class="mu" style="font-size:12.5px">تم تحديثه خلال ٢٤ ساعة</span><b>${fmtNum(c.synced24h)}</b><div>${renderBadge('متزامن ✓', 'ok')}</div></div>
+            <div class="card kpi-card"><span class="mu" style="font-size:12.5px">فشل التحديث</span><b>${fmtNum(c.failed)}</b><div>${renderBadge(c.failed > 0 ? 'يتطلب إعادة محاولة' : 'سليم', c.failed > 0 ? 'er' : 'ok')}</div></div>
+          </div>
+          ${jobs.length ? renderTable(
+            ['المنتج / SKU القناة', 'المنصة', 'الكمية المدفوعة', 'الحالة', 'المحاولات / آخر تحديث', 'إجراء'],
+            jobs.slice(0, 15).map((j) => [
+              `<b>${esc(j.productName || 'منتج')}</b><br><code dir="ltr" style="font-size:11px">${esc(j.channelSku || j.productSku || '')}</code>`,
+              renderMarketChip(j.platform),
+              `<b>${fmtNum(j.desiredStock)}</b>`,
+              j.status === 'synced'
+                ? renderBadge('متزامن ✓', 'ok')
+                : j.status === 'failed'
+                  ? `<div>${renderBadge('فشل التحديث', 'er')}${j.lastError ? `<br><small class="er-tx" style="font-size:11px">${esc(j.lastError)}</small>` : ''}</div>`
+                  : renderBadge('جاري التحديث ⟳', 'wn'),
+              `<small class="mu">${fmtNum(j.attempts || 0)} محاولة · ${timeAgo(j.updatedAt || j.createdAt)}</small>`,
+              j.status === 'failed'
+                ? `<button type="button" class="btn btn-gh btn-sm" data-a="inv-retry-job" data-id="${j.id}">↻ إعادة المحاولة</button>`
+                : '—'
+            ])
+          ) : '<p class="mu" style="font-size:13px;margin:0">لا توجد عمليات دفع مخزون مسجّلة حتى الآن. فعّل مفاتيح API لأي منصة واضغط «دفع المخزون لكل المنصات الآن».</p>'}
+        </div>
+      `;
+    })()}
 
     <div class="card" style="margin-top:22px">
       <h3 style="margin-bottom:12px">آخر ١٠ عمليات مزامنة مع الأسواق</h3>
@@ -2351,12 +2748,32 @@ const demoBanner = () => `
   </div>
 `;
 
+const loadPnlData = async () => {
+  const qs = new URLSearchParams({ market: state.pnlMarket || 'all' });
+  if (state.pnlFrom) qs.set('from', state.pnlFrom);
+  if (state.pnlTo) qs.set('to', state.pnlTo);
+  const [pnl, exp] = await Promise.all([
+    api('GET', `/api/finance/pnl?${qs}`),
+    api('GET', '/api/finance/expenses').catch(() => ({ expenses: [] }))
+  ]);
+  return { ...pnl, expenses: exp.expenses || [] };
+};
+
 const loaders = {
   dash: () => api('GET', `/api/dashboard?range=${state.range}&market=${state.marketFilter}&source=${encodeURIComponent(state.sourceFilter || 'all')}`),
+  prod: () => api('GET', '/api/integrations/inventory-sync').then((r) => { state.inventorySync = r; return r; }).catch(() => null),
   ord: () => api('GET', `/api/orders?${new URLSearchParams({ status: state.orderStatusFilter, q: state.orderQuery, page: state.orderPage })}`),
   returns: () => api('GET', '/api/returns'),
   customers: () => api('GET', `/api/customers?${new URLSearchParams({ q: state.customerQuery })}`),
-  int: () => api('GET', '/api/integrations/sync-runs').catch(() => ({ runs: [] })),
+  pnl: loadPnlData,
+  rep: loadPnlData,
+  int: () => Promise.all([
+    api('GET', '/api/integrations/sync-runs').catch(() => ({ runs: [] })),
+    api('GET', '/api/integrations/inventory-sync').catch(() => null)
+  ]).then(([runsRes, invSync]) => {
+    if (invSync) state.inventorySync = invSync;
+    return { runs: runsRes.runs || [], inventorySync: invSync };
+  }),
   cod: () => api('GET', '/api/cod'),
   pay: () => api('GET', '/api/billing'),
   services: () => api('GET', '/api/services/requests'),
@@ -3800,12 +4217,13 @@ const boot = async () => {
 };
 
 const renderShell = (viewKey, data) => {
-  const currentNav = NAV_LINKS.find(n => n.id === viewKey) || NAV_LINKS[0];
+  const navKey = viewKey === 'rep' ? 'pnl' : viewKey;
+  const currentNav = NAV_LINKS.find(n => n.id === navKey) || NAV_LINKS[0];
   const mobileQuickLinks = [
     NAV_LINKS.find(x => x.id === 'dash'),
     NAV_LINKS.find(x => x.id === 'prod'),
     NAV_LINKS.find(x => x.id === 'ord'),
-    NAV_LINKS.find(x => x.id === 'pay')
+    NAV_LINKS.find(x => x.id === 'pnl')
   ];
   const renderNavGroup = (groupKey, label) => {
     const items = NAV_LINKS.filter(x => x.group === groupKey);
@@ -3814,7 +4232,7 @@ const renderShell = (viewKey, data) => {
       ${items.map(item => {
         const count = item.badge ? item.badge() : '';
         return `
-          <a href="#/${item.id}" class="nav-item ${item.id === viewKey ? 'on' : ''}">
+          <a href="#/${item.id}" class="nav-item ${item.id === navKey ? 'on' : ''}">
             ${ico(item.icon, 18)}
             <span>${item.title}</span>
             ${count ? `<b class="nav-count">${typeof count === 'number' ? fmtNum(count) : esc(count)}</b>` : ''}
@@ -4071,8 +4489,28 @@ const openProductModal = (prod = null) => {
         </div>
       </div>
       <div id="pm-profit-preview" style="background:var(--bg);padding:10px 12px;border-radius:8px;margin-bottom:12px;font-size:12.5px"></div>
-      <label for="pm-stock">الكمية المتاحة في المخزون</label>
-      <input id="pm-stock" type="number" inputmode="numeric" value="${isEdit ? prod.stock : 20}">
+      <div class="grid-equal" style="gap:10px">
+        <div>
+          <label for="pm-stock">الكمية المتاحة في المخزون</label>
+          <input id="pm-stock" type="number" inputmode="numeric" value="${isEdit ? prod.stock : 20}">
+        </div>
+        <div>
+          <label for="pm-safety">مخزون الأمان الاحتياطي (Safety Stock)</label>
+          <input id="pm-safety" type="number" min="0" inputmode="numeric" value="${isEdit ? (prod.safetyStock || 0) : 0}" placeholder="0">
+        </div>
+      </div>
+      <div class="grid-equal" style="gap:10px">
+        <div>
+          <label for="pm-pack">تكلفة التغليف للقطعة (ج.م)</label>
+          <input id="pm-pack" type="number" min="0" step="0.5" inputmode="decimal" value="${isEdit ? (prod.packagingCost || 0) : 0}" placeholder="0">
+        </div>
+        <div style="display:flex;align-items:flex-end;padding-bottom:12px">
+          <label class="row" style="cursor:pointer;margin:0;color:var(--tx);font-weight:600">
+            <input type="checkbox" id="pm-autopush" style="width:auto;min-height:auto;margin:0" ${!isEdit || prod.autoPushStock !== false ? 'checked' : ''}>
+            <span>مزامنة لحظية للمخزون (منع البيع الزائد)</span>
+          </label>
+        </div>
+      </div>
       <label for="pm-image">صورة المنتج (ارفع ملف صورة أو أدخل رابطًا)</label>
       <div class="row" style="gap:10px;margin-bottom:8px">
         <div id="pm-img-preview">${renderProdThumb({ name: isEdit ? prod.name : 'منتج', image: currentImg }, 42)}</div>
@@ -4093,22 +4531,48 @@ const openProductModal = (prod = null) => {
           </button>
         `).join('')}
       </div>
-      <label style="margin-bottom:8px">الأسواق المطلوب النشر عليها</label>
-      <div class="row-wrap" style="margin-bottom:16px">
-        ${['a', 'n', 'j'].map(k => `
-          <label class="row" style="cursor:pointer;color:var(--tx);font-weight:600">
-            <input type="checkbox" class="pm-mkt" value="${k}" style="width:auto;min-height:auto;margin:0" ${!isEdit || prod.markets.includes(k) ? 'checked' : ''}>
-            ${renderMarketChip(k)} ${MARKETPLACES[k].name}
-          </label>
-        `).join('')}
+      <label style="margin-bottom:8px">الأسواق المطلوب النشر والمزامنة عليها</label>
+      <div class="row-wrap" style="margin-bottom:12px">
+        ${['a', 'n', 'j', 't', 'k'].map(k => {
+          const mk = MARKETPLACES[k] || MARKETPLACES_EXTRA[k];
+          return `
+            <label class="row" style="cursor:pointer;color:var(--tx);font-weight:600">
+              <input type="checkbox" class="pm-mkt" value="${k}" style="width:auto;min-height:auto;margin:0" ${!isEdit ? (k === 'a' || k === 'n' || k === 'j' ? 'checked' : '') : (prod.markets.includes(k) ? 'checked' : '')}>
+              ${renderMarketChip(k)} ${mk.name}
+            </label>
+          `;
+        }).join('')}
       </div>
+      <details style="margin-bottom:14px;background:var(--bg);padding:10px 12px;border-radius:10px;border:1px solid var(--bd)">
+        <summary style="cursor:pointer;font-weight:700;font-size:13px">🔗 أكواد القنوات المخصصة (Channel SKU Mapping — اختياري)</summary>
+        <p class="mu" style="font-size:12px;margin:6px 0 10px">إذا كان للمنتج كود SKU مختلف على منصة محددة (مثل أمازون أو نون)، أدخله هنا لتتم المزامنة الثنائية بدقة.</p>
+        <div class="grid-equal" style="gap:8px">
+          ${['a', 'n', 'j', 't', 'k'].map(k => {
+            const mk = MARKETPLACES[k] || MARKETPLACES_EXTRA[k];
+            return `
+              <div>
+                <label for="pm-ch-${k}" style="font-size:11.5px">${mk.name}</label>
+                <input id="pm-ch-${k}" dir="ltr" placeholder="${isEdit ? esc(prod.sku) : 'SKU-CH'}" style="margin-bottom:4px">
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </details>
       <button class="btn" style="width:100%" data-a="save-prod">
-        ${isEdit ? 'حفظ التعديلات ومزامنة الأسعار' : '🚀 نشر المنتج الآن'}
+        ${isEdit ? 'حفظ التعديلات ومزامنة المخزون والأسعار' : '🚀 نشر المنتج الآن'}
       </button>
       ${isEdit ? `<button class="btn btn-er" style="width:100%;margin-top:8px" data-a="delete-prod" data-id="${prod.id}">🗑 حذف المنتج</button>` : ''}
     `
   );
   renderModalProfitPreview();
+  if (isEdit) {
+    api('GET', `/api/products/${prod.id}/channels`).then((res) => {
+      for (const link of (res && res.channels) || []) {
+        const inp = $(`#pm-ch-${link.platform}`);
+        if (inp) inp.value = link.channelSku || '';
+      }
+    }).catch(() => {});
+  }
 };
 
 inputs['pm-img-sync'] = (el) => {
@@ -4782,15 +5246,27 @@ act('save-prod', async () => {
     cat: $('#pm-cat').value.trim() || 'عام',
     price,
     cost: cost === '' ? Math.round(price * 0.6) : num(cost),
+    costIsEstimated: cost === '',
     stock: num($('#pm-stock').value) || 0,
+    safetyStock: Math.max(0, Math.floor(num($('#pm-safety')?.value) || 0)),
+    packagingCost: Math.max(0, num($('#pm-pack')?.value) || 0),
+    autoPushStock: $('#pm-autopush') ? $('#pm-autopush').checked : true,
     image: $('#pm-image')?.value.trim() || '',
     markets: [...document.querySelectorAll('.pm-mkt:checked')].map((c) => c.value).join('') || 'a'
   };
   const r = id ? await api('PUT', `/api/products/${id}`, body) : await api('POST', '/api/products', body);
   upsertProducts([r.product]);
   applyMeta(r);
+
+  const channels = ['a', 'n', 'j', 't', 'k']
+    .map((k) => ({ platform: k, channelSku: ($('#pm-ch-' + k)?.value || '').trim() }))
+    .filter((c) => c.channelSku);
+  if (channels.length && r.product && r.product.id) {
+    await api('PUT', `/api/products/${r.product.id}/channels`, { channels }).catch(() => {});
+  }
+
   closeDlg();
-  showToast(id ? 'تم تحديث المنتج ومزامنته مع المنصات ✓' : 'تم نشر المنتج الجديد (قيد مراجعة واعتماد الإدارة) ✓');
+  showToast(id ? 'تم تحديث المنتج وجدولة مزامنة المخزون مع المنصات ✓' : 'تم نشر المنتج الجديد (قيد مراجعة واعتماد الإدارة) ✓');
   renderApp(true);
 });
 
@@ -5516,104 +5992,498 @@ inputs['radar-select-prod'] = (el) => {
   if (inp && el.value) inp.value = el.value;
 };
 
-inputs['ps-select-prod'] = (el) => {
+async function runPhotoStudioAudit(imgEl) {
   const ps = growthState.photoStudio;
-  ps.productId = el.value;
-  const prod = products.find((p) => String(p.id) === String(el.value));
+  if (!imgEl || typeof GROWTH.auditImageElement !== 'function') return;
+  try {
+    ps.amazonCompliance = GROWTH.auditImageElement(imgEl, 'amazon');
+    ps.noonCompliance = GROWTH.auditImageElement(imgEl, 'noon');
+  } catch (_) {}
+}
+
+async function loadPhotoStudioGallery(productId) {
+  const ps = growthState.photoStudio;
+  if (!productId) { ps.gallery = []; return; }
+  try {
+    const r = await api('GET', `/api/products/${productId}/images`);
+    ps.gallery = (r && r.images) || [];
+  } catch (_) {
+    ps.gallery = [];
+  }
+}
+
+actions['open-prod-studio'] = async (el) => {
+  const id = el.dataset.id;
+  const ps = growthState.photoStudio;
+  ps.productId = String(id || '');
+  ps.afterDataUrl = '';
+  ps.afterCompliance = null;
+  growthState.aiTab = 'photo';
+  const prod = products.find((p) => String(p.id) === String(id));
   if (prod) {
     ps.title = prod.name;
     ps.priceText = fmtEGP(prod.price);
-    if ($('#ps-title-in')) $('#ps-title-in').value = ps.title;
-    if ($('#ps-price-in')) $('#ps-price-in').value = ps.priceText;
+    await loadPhotoStudioGallery(prod.id);
     if (prod.image) {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.onload = () => { ps.uploadedImg = img; redrawPhotoStudioCanvas(); };
+      img.onload = () => {
+        ps.uploadedImg = img;
+        ps.beforeDataUrl = prod.image;
+        runPhotoStudioAudit(img);
+        renderApp(true);
+      };
       img.src = prod.image;
     } else {
       ps.uploadedImg = null;
-      redrawPhotoStudioCanvas();
+      ps.beforeDataUrl = '';
+      ps.amazonCompliance = null;
+      ps.noonCompliance = null;
     }
-  } else {
-    redrawPhotoStudioCanvas();
   }
+  go('#/ai');
+};
+
+inputs['ps-select-prod'] = async (el) => {
+  const ps = growthState.photoStudio;
+  ps.productId = el.value;
+  ps.afterDataUrl = '';
+  ps.afterCompliance = null;
+  const prod = products.find((p) => String(p.id) === String(el.value));
+  await loadPhotoStudioGallery(prod ? prod.id : '');
+  if (prod) {
+    ps.title = prod.name;
+    ps.priceText = fmtEGP(prod.price);
+    if (prod.image) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        ps.uploadedImg = img;
+        ps.beforeDataUrl = prod.image;
+        runPhotoStudioAudit(img);
+        renderApp(true);
+      };
+      img.onerror = () => { ps.uploadedImg = null; ps.beforeDataUrl = ''; renderApp(true); };
+      img.src = prod.image;
+      return;
+    }
+  }
+  ps.uploadedImg = null;
+  ps.beforeDataUrl = '';
+  ps.amazonCompliance = null;
+  ps.noonCompliance = null;
+  renderApp(true);
 };
 
 inputs['ps-upload-file'] = (el) => {
   const file = el.files && el.files[0];
   if (!file) return;
+  if (file.size > 4 * 1024 * 1024) return showToast('⚠️ الحد الأقصى لحجم الصورة ٤ ميجابايت');
   const reader = new FileReader();
   reader.onload = () => {
     const img = new Image();
     img.onload = () => {
-      growthState.photoStudio.uploadedImg = img;
-      redrawPhotoStudioCanvas();
+      const ps = growthState.photoStudio;
+      ps.uploadedImg = img;
+      ps.beforeDataUrl = String(reader.result || '');
+      ps.afterDataUrl = '';
+      ps.afterCompliance = null;
+      runPhotoStudioAudit(img);
+      renderApp(true);
     };
     img.src = reader.result;
   };
   reader.readAsDataURL(file);
 };
 
-inputs['ps-text-change'] = () => {
+inputs['ps-hint-change'] = (el) => {
+  growthState.photoStudio.customHint = el.value;
+};
+
+inputs['ps-toggle-shadow'] = (el) => {
+  growthState.photoStudio.addSoftShadow = Boolean(el.checked);
+};
+
+inputs['ps-compare-slider'] = (el) => {
+  const val = Number(el.value) || 50;
+  growthState.photoStudio.compareSplit = val;
+  const ov = document.querySelector('.ps-compare-overlay');
+  const div = document.querySelector('.ps-split-divider');
+  if (ov) ov.style.clipPath = `inset(0 0 0 ${val}%)`;
+  if (div) div.style.left = `${val}%`;
+};
+
+actions['ps-target-mkt'] = (el) => {
+  growthState.photoStudio.targetMarketplace = el.dataset.v === 'noon' ? 'noon' : 'amazon';
+  growthState.photoStudio.ratio = growthState.photoStudio.targetMarketplace === 'noon' ? '4:5' : '1:1';
+  renderApp(true);
+};
+
+actions['ps-ai-preset'] = (el) => {
+  growthState.photoStudio.aiPreset = el.dataset.v || 'amazon_main_white';
+  renderApp(true);
+};
+
+actions['ps-compare-mode'] = (el) => {
+  growthState.photoStudio.compareMode = el.dataset.v || 'split';
+  renderApp(true);
+};
+
+actions['ps-auto-fix'] = () => {
   const ps = growthState.photoStudio;
-  if ($('#ps-title-in')) ps.title = $('#ps-title-in').value;
-  if ($('#ps-badge-in')) ps.badgeText = $('#ps-badge-in').value;
-  if ($('#ps-price-in')) ps.priceText = $('#ps-price-in').value;
-  redrawPhotoStudioCanvas();
-};
-
-actions['ps-preset'] = (el) => {
-  growthState.photoStudio.preset = el.dataset.v || 'pure-white';
+  if (!ps.uploadedImg) {
+    redrawPhotoStudioCanvas();
+    if (!ps.lastDataUrl) return showToast('⚠️ ارفع صورة المنتج أو اختر منتجًا له صورة أولًا');
+    const tmp = new Image();
+    tmp.onload = () => {
+      ps.uploadedImg = tmp;
+      ps.beforeDataUrl = ps.lastDataUrl;
+      runPhotoStudioAudit(tmp);
+      actions['ps-auto-fix']();
+    };
+    tmp.src = ps.lastDataUrl;
+    return;
+  }
+  if (typeof GROWTH.autoFixMarketplaceImage !== 'function') {
+    return showToast('⚠️ محرك الإصلاح الفوري غير محمّل');
+  }
+  const fixed = GROWTH.autoFixMarketplaceImage(ps.uploadedImg, {
+    marketplace: ps.targetMarketplace || 'amazon',
+    addSoftShadow: Boolean(ps.addSoftShadow)
+  });
+  ps.afterDataUrl = fixed.dataUrl;
+  ps.afterWidth = fixed.width;
+  ps.afterHeight = fixed.height;
+  ps.afterSource = 'auto_fix';
+  ps.afterCompliance = fixed.compliance;
+  ps.compareMode = 'split';
+  ps.compareSplit = 50;
+  showToast(`✨ تم إصلاح الصورة فورًا (${fixed.width}×${fixed.height}) — درجة المطابقة ${fmtNum(fixed.compliance.score)}٪ ✓`, 4200);
   renderApp(true);
 };
 
-actions['ps-ratio'] = (el) => {
-  growthState.photoStudio.ratio = el.dataset.v || '1:1';
-  renderApp(true);
-};
+act('ps-ai-generate', async () => {
+  const ps = growthState.photoStudio;
+  const sourceImage = ps.beforeDataUrl || ps.lastDataUrl;
+  if (!sourceImage || !sourceImage.startsWith('data:image/')) {
+    return showToast('⚠️ ارفع صورة المنتج بصيغة PNG أو JPG أو WEBP أولًا لتوليد مشهد Gemini');
+  }
+  const btn = $('#btn-ps-ai-gen');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> جاري التوليد بـ Gemini...'; }
+  try {
+    const r = await api('POST', '/api/ai/photo-studio', {
+      productId: ps.productId ? Number(ps.productId) : null,
+      imageDataUrl: sourceImage,
+      preset: ps.aiPreset || 'amazon_main_white',
+      marketplace: ps.targetMarketplace || 'amazon',
+      customHint: ps.customHint || '',
+      setAsMain: false
+    });
+    if (r.source === 'client-studio-fallback') {
+      showToast(r.message || 'مفتاح Gemini غير مفعّل — تم تشغيل الإصلاح التلقائي الفوري بديلًا', 4800);
+      actions['ps-auto-fix']();
+      return;
+    }
+    if (r.image && r.image.url) {
+      ps.afterDataUrl = r.image.url;
+      ps.afterSource = 'gemini';
+      ps.compareMode = 'split';
+      if (ps.productId) await loadPhotoStudioGallery(ps.productId);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        ps.afterCompliance = GROWTH.auditImageElement(img, ps.targetMarketplace || 'amazon');
+        renderApp(true);
+      };
+      img.src = r.image.url;
+      showToast('🤖 تم توليد المشهد الاحترافي بالذكاء الاصطناعي بنجاح ✓', 4200);
+      renderApp(true);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '🤖 توليد مشهد بالذكاء الاصطناعي (Gemini)'; }
+  }
+});
 
 actions['ps-download'] = () => {
-  redrawPhotoStudioCanvas();
-  const dataUrl = growthState.photoStudio.lastDataUrl;
+  const ps = growthState.photoStudio;
+  let dataUrl = ps.afterDataUrl;
+  if (!dataUrl) {
+    redrawPhotoStudioCanvas();
+    dataUrl = ps.lastDataUrl;
+  }
   if (!dataUrl) return showToast('تعذّر تصدير الصورة حاليًا');
   const a = document.createElement('a');
   a.href = dataUrl;
-  a.download = `orderflow-studio-${Date.now()}.jpg`;
+  a.download = `orderflow-${ps.targetMarketplace || 'amazon'}-${Date.now()}.png`;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  showToast('تم تحميل صورة الاستوديو بنجاح');
+  showToast('تم تحميل صورة الاستوديو عالية الدقة بنجاح ✓');
 };
 
-act('ps-save-to-prod', async () => {
+act('ps-save-gallery', async (el) => {
   const ps = growthState.photoStudio;
-  if (!ps.productId) return showToast('اختر منتجًا من القائمة أولًا لحفظ الصورة عليه');
+  const role = el.dataset.role === 'main' ? 'main' : 'gallery';
+  if (!ps.productId) return showToast('⚠️ اختر منتجًا من القائمة أولًا لحفظ الصورة عليه');
   const prod = products.find((p) => String(p.id) === String(ps.productId));
   if (!prod) return showToast('المنتج المحدد غير موجود');
-  redrawPhotoStudioCanvas();
-  const dataUrl = ps.lastDataUrl;
-  if (!dataUrl) return showToast('تعذّر تجهيز الصورة');
-  const btn = $('#btn-ps-save');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> جاري الحفظ...'; }
-  try {
-    const res = await api('PUT', `/api/products/${prod.id}`, {
-      name: prod.name,
-      sku: prod.sku,
-      cat: prod.cat,
-      price: prod.price,
-      cost: prod.cost,
-      stock: prod.stock,
-      markets: prod.markets,
-      image: dataUrl
-    });
-    if (res && res.product) {
-      const idx = products.findIndex((p) => p.id === prod.id);
-      if (idx >= 0) products[idx] = res.product;
-    }
-    showToast(`تم حفظ صورة الاستوديو على «${prod.name}» بنجاح`);
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = `${ico('checkCircle', 16)} حفظ الصورة للمنتج في الكتالوج`; }
+  let imagePayload = ps.afterDataUrl;
+  if (!imagePayload) {
+    redrawPhotoStudioCanvas();
+    imagePayload = ps.lastDataUrl;
   }
+  if (!imagePayload) return showToast('⚠️ جهّز الصورة أو اضغط «إصلاح تلقائي فوري» أولًا');
+  const res = await api('POST', `/api/products/${prod.id}/images`, {
+    dataUrl: imagePayload.startsWith('data:image/') ? imagePayload : undefined,
+    url: imagePayload.startsWith('/') ? imagePayload : undefined,
+    role,
+    preset: ps.aiPreset || 'amazon_main_white',
+    width: ps.afterWidth || 1600,
+    height: ps.afterHeight || 1600,
+    complianceScore: ps.afterCompliance ? ps.afterCompliance.score : 0,
+    compliance: ps.afterCompliance || {},
+    source: ps.afterSource || 'auto_fix'
+  });
+  if (res && res.product) upsertProducts([res.product]);
+  await loadPhotoStudioGallery(prod.id);
+  showToast(role === 'main' ? `✓ تم اعتماد الصورة كصورة رئيسية لـ «${prod.name}»` : `✓ تمت إضافة الصورة لمعرض «${prod.name}»`);
+  renderApp(true);
+});
+
+act('ps-set-gallery-main', async (el) => {
+  const ps = growthState.photoStudio;
+  if (!ps.productId) return;
+  const r = await api('PUT', `/api/products/${ps.productId}/images/${el.dataset.id}/main`);
+  if (r && r.product) upsertProducts([r.product]);
+  await loadPhotoStudioGallery(ps.productId);
+  showToast('✓ تم تعيين الصورة كرئيسية للمنتج');
+  renderApp(true);
+});
+
+act('ps-del-gallery-img', async (el) => {
+  const ps = growthState.photoStudio;
+  if (!ps.productId) return;
+  await api('DELETE', `/api/products/${ps.productId}/images/${el.dataset.id}`);
+  await loadPhotoStudioGallery(ps.productId);
+  showToast('تم حذف الصورة من معرض المنتج');
+  renderApp(true);
+});
+
+/* إجراءات ربحية المتجر (P&L)، دُفعات FIFO، المصاريف، وتسويات CSV */
+actions['pnl-select-period'] = (el) => {
+  state.pnlPeriodKey = el.dataset.v || 'thisMonth';
+  state.pnlFrom = '';
+  state.pnlTo = '';
+  renderApp(true);
+};
+
+actions['pnl-mkt-filter'] = (el) => {
+  state.pnlMarket = el.dataset.v || 'all';
+  renderApp(true);
+};
+
+actions['pnl-apply-dates'] = () => {
+  state.pnlFrom = $('#pnl-from')?.value || '';
+  state.pnlTo = $('#pnl-to')?.value || '';
+  renderApp(true);
+};
+
+actions['pnl-export-csv'] = () => {
+  const qs = new URLSearchParams({ market: state.pnlMarket || 'all' });
+  if (state.pnlFrom) qs.set('from', state.pnlFrom);
+  if (state.pnlTo) qs.set('to', state.pnlTo);
+  window.location.href = `/api/finance/pnl/export.csv?${qs}`;
+};
+
+async function openFifoBatchesModal(productId) {
+  const pid = Number(productId);
+  if (!pid) return;
+  const r = await api('GET', `/api/products/${pid}/batches`);
+  const p = r.product;
+  const batches = r.batches || [];
+  openDialog(`📦 دُفعات المخزون والتكلفة (FIFO) — ${p.name}`, `
+    <p class="mu" style="font-size:12.5px;margin-bottom:12px">عند تسجيل أي طلب جديد، يخصم النظام تلقائيًا من أقدم دُفعة متبقية (FIFO) لحساب صافي الربح بدقة بالقرش.</p>
+    <form data-submit="add-fifo-batch-submit" style="background:var(--bg);padding:12px;border-radius:10px;border:1px solid var(--bd);margin-bottom:14px">
+      <input type="hidden" id="fb-pid" value="${p.id}">
+      <div class="grid-equal" style="gap:8px">
+        <div><label for="fb-qty">الكمية (وحدة)</label><input id="fb-qty" type="number" min="1" value="10" required></div>
+        <div><label for="fb-cost">تكلفة الوحدة (ج.م)</label><input id="fb-cost" type="number" min="0" step="0.5" value="${p.cost || 100}" required></div>
+      </div>
+      <div class="grid-equal" style="gap:8px">
+        <div><label for="fb-ship">شحن التوريد للوحدة (ج.م)</label><input id="fb-ship" type="number" min="0" step="0.5" value="0"></div>
+        <div><label for="fb-cust">جمارك/أخرى للوحدة (ج.م)</label><input id="fb-cust" type="number" min="0" step="0.5" value="0"></div>
+      </div>
+      <div class="grid-equal" style="gap:8px">
+        <div><label for="fb-code">كود الدُفعة (اختياري)</label><input id="fb-code" dir="ltr" placeholder="B-2026-01"></div>
+        <div style="display:flex;align-items:flex-end;padding-bottom:12px">
+          <label class="row" style="cursor:pointer;margin:0;color:var(--tx);font-weight:600">
+            <input type="checkbox" id="fb-add-stock" style="width:auto;min-height:auto;margin:0" checked>
+            <span>إضافة الكمية لمخزون المنتج</span>
+          </label>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-ac btn-sm" style="width:100%">+ تسجيل دُفعة FIFO جديدة</button>
+    </form>
+    ${batches.length ? renderTable(
+      ['الكود', 'التاريخ', 'المتبقي / الأصلي', 'التكلفة الواصلة', ''],
+      batches.map((b) => [
+        `<code dir="ltr">${esc(b.batchCode)}</code>`,
+        `<small class="mu">${fmtDate(b.purchasedAt)}</small>`,
+        `<b>${fmtNum(b.qtyRemaining)}</b> / ${fmtNum(b.qtyInitial)}`,
+        `<b>${fmtEGP(b.landedUnitCost)}</b>`,
+        `<button type="button" class="btn btn-er btn-sm" data-a="delete-fifo-batch" data-id="${b.id}" data-pid="${p.id}">✕</button>`
+      ])
+    ) : '<p class="mu" style="margin:0;font-size:12.5px">لا توجد دُفعات مسجّلة لهذا المنتج بعد.</p>'}
+  `);
+}
+
+act('open-prod-batches', async (el) => openFifoBatchesModal(el.dataset.id));
+
+actions['open-prod-batches-picker'] = () => {
+  if (!products.length) return showToast('أضف منتجًا أولًا في صفحة المنتجات');
+  openDialog('📦 اختر المنتج لإضافة دُفعة مخزون FIFO', `
+    <label for="fb-pick-prod">المنتج</label>
+    <select id="fb-pick-prod">${products.map((p) => `<option value="${p.id}">${esc(p.name)} (${esc(p.sku)})</option>`).join('')}</select>
+    <button type="button" class="btn btn-ac" style="width:100%" data-a="open-picked-prod-batches">فتح دُفعات المنتج ◂</button>
+  `);
+};
+
+act('open-picked-prod-batches', async () => {
+  const pid = $('#fb-pick-prod')?.value;
+  if (pid) await openFifoBatchesModal(pid);
+});
+
+act('add-fifo-batch-submit', async () => {
+  const pid = +$('#fb-pid').value;
+  const r = await api('POST', `/api/products/${pid}/batches`, {
+    qty: num($('#fb-qty').value),
+    unitCost: num($('#fb-cost').value),
+    inboundShipPerUnit: num($('#fb-ship').value),
+    customsOtherPerUnit: num($('#fb-cust').value),
+    batchCode: $('#fb-code')?.value.trim() || undefined,
+    addToStock: $('#fb-add-stock') ? $('#fb-add-stock').checked : true
+  });
+  if (r && r.product) upsertProducts([r.product]);
+  showToast('✓ تم تسجيل دُفعة المخزون FIFO وتحديث التكلفة المؤكدة');
+  await openFifoBatchesModal(pid);
+  renderApp(true);
+});
+
+act('delete-fifo-batch', async (el) => {
+  await api('DELETE', `/api/batches/${el.dataset.id}`);
+  showToast('تم حذف الدُفعة');
+  await openFifoBatchesModal(el.dataset.pid);
+  renderApp(true);
+});
+
+actions['open-expense-modal'] = () => {
+  openDialog('+ تسجيل مصروف تشغيلي أو إعلاني', `
+    <form data-submit="add-expense-submit">
+      <label for="ex-title">عنوان المصروف</label>
+      <input id="ex-title" placeholder="مثال: إيجار المخزن أو حملة إعلانات نون" required>
+      <div class="grid-equal" style="gap:10px">
+        <div>
+          <label for="ex-cat">التصنيف</label>
+          <select id="ex-cat">
+            ${Object.entries(EXPENSE_CATEGORIES).map(([k, lbl]) => `<option value="${k}">${lbl}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label for="ex-amt">المبلغ (ج.م)</label>
+          <input id="ex-amt" type="number" min="1" step="0.5" placeholder="3000" required>
+        </div>
+      </div>
+      <div class="grid-equal" style="gap:10px">
+        <div>
+          <label for="ex-rec">التكرار</label>
+          <select id="ex-rec">
+            <option value="once">مرة واحدة</option>
+            <option value="monthly">شهري متكرر (يُقسّم تناسبيًا)</option>
+          </select>
+        </div>
+        <div>
+          <label for="ex-date">التاريخ</label>
+          <input id="ex-date" type="date" value="${new Date().toISOString().slice(0, 10)}">
+        </div>
+      </div>
+      <button type="submit" class="btn btn-ac" style="width:100%">حفظ المصروف وخصمه من P&L</button>
+    </form>
+  `);
+};
+
+act('add-expense-submit', async () => {
+  await api('POST', '/api/finance/expenses', {
+    title: $('#ex-title').value.trim(),
+    category: $('#ex-cat').value,
+    amount: num($('#ex-amt').value),
+    recurrence: $('#ex-rec').value,
+    expenseDate: $('#ex-date').value
+  });
+  closeDlg();
+  showToast('✓ تم تسجيل المصروف وتحديث صافي الربح');
+  renderApp(true);
+});
+
+act('delete-expense', async (el) => {
+  await api('DELETE', `/api/finance/expenses/${el.dataset.id}`);
+  showToast('تم حذف المصروف');
+  renderApp(true);
+});
+
+actions['open-settlement-csv-modal'] = () => {
+  openDialog('📤 استيراد ملف تسويات المنصات (CSV)', `
+    <p class="mu" style="font-size:12.5px;margin-bottom:10px">ألصق بيانات تسوية نون أو جوميا أو أمازون بصيغة CSV لمطابقة الرسوم الفعلية لكل طلب بدقة.</p>
+    <form data-submit="import-settlement-csv-submit">
+      <label for="settle-csv-txt">محتوى CSV (الأعمدة: external_ref,market,commission,shipping_fee,return_penalty,ad_fee,vat)</label>
+      <textarea id="settle-csv-txt" rows="6" dir="ltr" placeholder="external_ref,market,commission,shipping_fee,return_penalty,ad_fee,vat&#10;1001,a,120,45,0,15,16.8" required></textarea>
+      <button type="submit" class="btn btn-ac" style="width:100%">استيراد ومطابقة التسويات ✓</button>
+    </form>
+  `);
+};
+
+act('import-settlement-csv-submit', async () => {
+  const csv = $('#settle-csv-txt')?.value || '';
+  const r = await api('POST', '/api/finance/settlements/import', { csv });
+  closeDlg();
+  showToast(`✓ تمت مطابقة ${fmtNum(r.matchedOrders)} طلب وإدراج ${fmtNum(r.feeLinesInserted)} بند رسوم فعلية`, 4500);
+  renderApp(true);
+});
+
+act('view-order-fees', async (el) => {
+  const r = await api('GET', `/api/orders/${el.dataset.id}/fees`);
+  const f = r.financials || {};
+  const lines = r.lines || [];
+  const batches = r.batches || [];
+  openDialog(`🔍 تفصيل الرسوم والربح الصافي — طلب #${arDigits(r.order.no)}`, `
+    <div class="row-wrap" style="margin-bottom:10px">
+      ${renderMarketChip(r.order.market)}
+      <b>${fmtEGP(r.order.total)}</b>
+      <span class="sp"></span>
+      ${f.isSettled ? renderBadge('تسوية فعلية ✓', 'ok') : renderBadge('تقديري', 'wn')}
+    </div>
+    <div style="background:var(--bg);padding:12px;border-radius:10px;margin-bottom:12px">
+      <div class="pnl-waterfall-row"><span>المبيعات</span><b>${fmtEGP(f.grossSales)}</b></div>
+      <div class="pnl-waterfall-row"><span>عمولة المنصة</span><b class="er-tx">− ${fmtEGP(f.marketplaceCommissions)}</b></div>
+      <div class="pnl-waterfall-row"><span>الشحن والتجهيز / المرتجع</span><b class="er-tx">− ${fmtEGP((f.shippingAndFulfillmentFees || 0) + (f.rtoShippingLoss || 0))}</b></div>
+      <div class="pnl-waterfall-row"><span>تكلفة البضاعة (FIFO)</span><b class="er-tx">− ${fmtEGP(f.cogsFifo)}</b></div>
+      <div class="pnl-waterfall-row"><span>التغليف + الإعلانات + ضريبة ١٤٪</span><b class="er-tx">− ${fmtEGP((f.packagingCost || 0) + (f.adSpend || 0) + (f.vat || 0) + (f.otherFees || 0))}</b></div>
+      <div class="pnl-waterfall-row pnl-waterfall-row--total"><span>صافي ربح الطلب</span><b class="${f.netProfit >= 0 ? 'ok-tx' : 'er-tx'}">${fmtEGP(f.netProfit)}</b></div>
+    </div>
+    ${lines.length ? `
+      <h4 style="margin:10px 0 6px;font-size:13.5px">بنود تسوية المنصة الفعلية</h4>
+      ${renderTable(
+        ['البند', 'الكود', 'المبلغ', 'الضريبة'],
+        lines.map((l) => [esc(l.feeLabel), `<code dir="ltr">${esc(l.feeCode)}</code>`, fmtEGP(l.amount), fmtEGP(l.vatAmount)])
+      )}
+    ` : '<p class="mu" style="font-size:12.5px">لم تُسحب بنود تسوية فعلية لهذا الطلب بعد — الحساب الحالي مبني على قواعد عمولة السوق.</p>'}
+    ${batches.length ? `
+      <h4 style="margin:10px 0 6px;font-size:13.5px">دُفعات FIFO المستهلكة</h4>
+      ${renderTable(
+        ['كود الدُفعة', 'الكمية', 'التكلفة الواصلة للوحدة'],
+        batches.map((b) => [`<code dir="ltr">${esc(b.batchCode)}</code>`, fmtNum(b.qty), fmtEGP(b.unitLandedCost)])
+      )}
+    ` : ''}
+  `);
 });
 
 async function sendSellerChatQuestion(qText) {
@@ -5891,6 +6761,25 @@ act('sync-api-conn', async (el) => {
   state.marketplaceConnections = r.connections || state.marketplaceConnections;
   await loadSession();
   showToast(`⟳ ${r.message || 'تم سحب بيانات المنصة بنجاح ✓'}`, 4500);
+  renderApp(true);
+});
+
+act('sync-finances-conn', async (el) => {
+  const key = el.dataset.k || 'a';
+  const r = await api('POST', `/api/integrations/connections/${key}/sync-finances`);
+  showToast(`💰 تمت تسوية ${fmtNum(r.settledOrders || 0)} طلب (${fmtNum(r.feeLinesInserted || 0)} بند رسوم فعلية) ✓`, 4800);
+  renderApp(true);
+});
+
+act('inv-push-all', async () => {
+  const r = await api('POST', '/api/integrations/inventory-sync/push-all');
+  showToast(`⚡ تم جدولة ودفع مخزون ${fmtNum(r.enqueued || 0)} قناة (نجح: ${fmtNum(r.processed?.synced || 0)}) ✓`, 4500);
+  renderApp(true);
+});
+
+act('inv-retry-job', async (el) => {
+  await api('POST', `/api/integrations/inventory-sync/${el.dataset.id}/retry`);
+  showToast('↻ تم إعادة محاولة دفع المخزون ✓');
   renderApp(true);
 });
 

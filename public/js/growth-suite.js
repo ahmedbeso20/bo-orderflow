@@ -466,6 +466,391 @@
     ctx.closePath();
   }
 
+  function rgbToHex(r, g, b) {
+    const toHex = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0').toUpperCase();
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+  }
+
+  /**
+   * 7. مدقق مطابقة صور المنتجات لمواصفات أمازون مصر ونون (Pixel-Level Compliance Auditor)
+   */
+  function evaluateImageCompliance({ width, height, rgbaPixels, marketplace = 'amazon', actualWidth, actualHeight } = {}) {
+    const w = Math.max(0, Math.floor(Number(width) || 0));
+    const h = Math.max(0, Math.floor(Number(height) || 0));
+    const trueW = Math.max(w, Math.floor(Number(actualWidth) || w));
+    const trueH = Math.max(h, Math.floor(Number(actualHeight) || h));
+    const mkt = String(marketplace || 'amazon').toLowerCase();
+    const isNoon = mkt === 'noon' || mkt === 'n' || mkt === 'trendyol' || mkt === 't';
+    const checks = [];
+    let score = 0;
+
+    // 1. Resolution check (30 pts)
+    const longest = Math.max(trueW, trueH);
+    const shortest = Math.min(trueW, trueH);
+    let resStatus = 'fail';
+    let resMsg = `الدقة الحالية ${trueW}×${trueH} أقل من الحد الأدنى المطلوب (1000px للتكبير).`;
+    let resHint = isNoon ? 'ارفع صورة بدقة 1280×1600 أو استخدم الإصلاح التلقائي.' : 'ارفع صورة بدقة 1600×1600 لتفعيل ميزة التكبير (Zoom) على أمازون.';
+    if (longest >= 1600 && shortest >= 1000) {
+      resStatus = 'pass';
+      resMsg = `دقة ممتازة (${trueW}×${trueH}) تدعم التكبير الكامل.`;
+      resHint = '';
+      score += 30;
+    } else if (longest >= 1000 && shortest >= 660) {
+      resStatus = 'warn';
+      resMsg = `الدقة مقبولة (${trueW}×${trueH}) ولكن يُفضّل 1600px على الأقل للتكبير الاحترافي.`;
+      resHint = 'اضغط «إصلاح تلقائي فوري» لرفع المقاس إلى 1600×1600 تلقائيًا.';
+      score += 20;
+    } else if (longest >= 500) {
+      resStatus = 'fail';
+      score += 6;
+    }
+    checks.push({ id: 'resolution', labelAr: 'الدقة ومقاس الصورة', status: resStatus, value: `${trueW}×${trueH}`, messageAr: resMsg, fixHintAr: resHint });
+
+    // 2. Aspect Ratio check (20 pts)
+    const ratio = trueH > 0 ? trueW / trueH : 0;
+    let ratioStatus = 'fail';
+    let ratioMsg = `نسبة الأبعاد (${ratio.toFixed(2)}) غير مطابقة لمتطلبات ${isNoon ? 'نون' : 'أمازون'}.`;
+    let ratioHint = isNoon ? 'نون تقبل 1:1 مربع أو 4:5 عمودي (1280×1600).' : 'الصورة الرئيسية في أمازون مصر يُفضّل أن تكون مربعة 1:1.';
+    if (isNoon) {
+      const is1to1 = Math.abs(ratio - 1) <= 0.03;
+      const is4to5 = Math.abs(ratio - 0.8) <= 0.03;
+      const isNoonPortrait = Math.abs(ratio - 0.73) <= 0.03;
+      if (is1to1 || is4to5 || isNoonPortrait) {
+        ratioStatus = 'pass';
+        ratioMsg = `نسبة الأبعاد (${is4to5 ? '4:5' : is1to1 ? '1:1' : '730:1000'}) مطابقة لشروط نون مصر.`;
+        ratioHint = '';
+        score += 20;
+      } else if (ratio >= 0.7 && ratio <= 1.2) {
+        ratioStatus = 'warn';
+        score += 10;
+      }
+    } else if (Math.abs(ratio - 1) <= 0.02) {
+      ratioStatus = 'pass';
+      ratioMsg = 'نسبة الأبعاد مربعة 1:1 مطابقة تمامًا لشروط أمازون مصر.';
+      ratioHint = '';
+      score += 20;
+    } else if (Math.abs(ratio - 1) <= 0.12) {
+      ratioStatus = 'warn';
+      ratioMsg = 'نسبة الأبعاد قريبة من 1:1 لكنها ليست مربعة تمامًا.';
+      score += 10;
+    }
+    checks.push({ id: 'aspect_ratio', labelAr: 'نسبة الأبعاد (Aspect Ratio)', status: ratioStatus, value: ratio ? `${ratio.toFixed(2)}:1` : '—', messageAr: ratioMsg, fixHintAr: ratioHint });
+
+    // 3. Outer 4% border pure white check (30 pts) & 4. Foreground fill ratio (20 pts)
+    let borderHex = '#FFFFFF';
+    let borderWhitePct = 0;
+    let fillRatio = 0;
+    const hasPixels = rgbaPixels && rgbaPixels.length >= w * h * 4 && w > 0 && h > 0;
+
+    if (hasPixels) {
+      const bx = Math.max(1, Math.floor(w * 0.04));
+      const by = Math.max(1, Math.floor(h * 0.04));
+      let bTotal = 0, bWhite = 0, sumR = 0, sumG = 0, sumB = 0;
+      let minX = w, minY = h, maxX = -1, maxY = -1;
+
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = (y * w + x) * 4;
+          const r = rgbaPixels[idx];
+          const g = rgbaPixels[idx + 1];
+          const b = rgbaPixels[idx + 2];
+          const a = rgbaPixels[idx + 3];
+          const er = a < 255 ? Math.round((r * a + 255 * (255 - a)) / 255) : r;
+          const eg = a < 255 ? Math.round((g * a + 255 * (255 - a)) / 255) : g;
+          const eb = a < 255 ? Math.round((b * a + 255 * (255 - a)) / 255) : b;
+
+          if (x < bx || x >= w - bx || y < by || y >= h - by) {
+            bTotal++;
+            sumR += er; sumG += eg; sumB += eb;
+            if (er >= 253 && eg >= 253 && eb >= 253) bWhite++;
+          }
+          if (a > 20 && (er < 245 || eg < 245 || eb < 245)) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
+      if (bTotal > 0) {
+        borderHex = rgbToHex(sumR / bTotal, sumG / bTotal, sumB / bTotal);
+        borderWhitePct = Math.round((bWhite / bTotal) * 1000) / 10;
+      }
+
+      let bgStatus = 'fail';
+      let bgMsg = `الخلفية عند الحواف لونها ${borderHex} وليست بيضاء نقية #FFFFFF (${borderWhitePct}٪ فقط أبيض نقي).`;
+      let bgHint = 'استخدم «إصلاح تلقائي فوري» لتفريغ الخلفية وتحويلها إلى أبيض نقي #FFFFFF.';
+      if (borderWhitePct >= 95) {
+        bgStatus = 'pass';
+        bgMsg = `خلفية بيضاء نقية ${borderHex} (${borderWhitePct}٪) مطابقة لسياسة المنصة.`;
+        bgHint = '';
+        score += 30;
+      } else if (borderWhitePct >= 75) {
+        bgStatus = 'warn';
+        bgMsg = `الخلفية شبه بيضاء (${borderHex}) وقد ترفضها مراجعة الجودة الآلية.`;
+        score += 15;
+      }
+      checks.push({ id: 'white_background', labelAr: 'خلفية بيضاء نقية (#FFFFFF)', status: bgStatus, value: borderHex, messageAr: bgMsg, fixHintAr: bgHint });
+
+      if (maxX >= minX && maxY >= minY) {
+        const fw = maxX - minX + 1;
+        const fh = maxY - minY + 1;
+        fillRatio = Math.round(Math.max(fw / w, fh / h) * 1000) / 1000;
+      }
+
+      let fillStatus = 'fail';
+      const fillPct = Math.round(fillRatio * 100);
+      let fillMsg = fillRatio === 0
+        ? 'لم يتم اكتشاف جسم المنتج بوضوح داخل الصورة.'
+        : fillRatio < 0.75
+          ? `المنتج يشغل ${fillPct}٪ فقط من الإطار (أصغر من المطلوب ٨٥٪).`
+          : `المنتج قريب جدًا من الحواف (${fillPct}٪ من الإطار).`;
+      let fillHint = 'الإصلاح التلقائي يضبط مقاس المنتج وتوسيطه تلقائيًا ليشغل ٨٥٪ من الإطار.';
+      if (fillRatio >= 0.75 && fillRatio <= 0.92) {
+        fillStatus = 'pass';
+        fillMsg = `نسبة ملء المنتج ممتازة (${fillPct}٪ من الإطار — المعيار المثالي ٨٥٪).`;
+        fillHint = '';
+        score += 20;
+      } else if (fillRatio >= 0.6 && fillRatio <= 0.96) {
+        fillStatus = 'warn';
+        score += 10;
+      }
+      checks.push({ id: 'fill_ratio', labelAr: 'نسبة ملء المنتج في الإطار (85%)', status: fillStatus, value: `${fillPct}٪`, messageAr: fillMsg, fixHintAr: fillHint });
+    } else {
+      checks.push({ id: 'white_background', labelAr: 'خلفية بيضاء نقية (#FFFFFF)', status: 'warn', value: '—', messageAr: 'ارفع صورة لفحص لون الخلفية بدقة البكسل.', fixHintAr: '' });
+      checks.push({ id: 'fill_ratio', labelAr: 'نسبة ملء المنتج في الإطار (85%)', status: 'warn', value: '—', messageAr: 'ارفع صورة لقياس نسبة ملء المنتج.', fixHintAr: '' });
+    }
+
+    return {
+      marketplace: isNoon ? 'noon' : 'amazon',
+      score: Math.min(100, Math.round(score)),
+      passed: score >= 85 && checks.every((c) => c.status !== 'fail'),
+      borderHex,
+      borderWhitePct,
+      fillRatio,
+      width: trueW,
+      height: trueH,
+      checks
+    };
+  }
+
+  function auditImageElement(sourceImgOrCanvas, marketplace = 'amazon') {
+    if (!sourceImgOrCanvas || typeof document === 'undefined') return null;
+    const trueW = sourceImgOrCanvas.naturalWidth || sourceImgOrCanvas.width || 0;
+    const trueH = sourceImgOrCanvas.naturalHeight || sourceImgOrCanvas.height || 0;
+    if (!trueW || !trueH) return null;
+    const maxSample = 240;
+    const scale = Math.min(1, maxSample / Math.max(trueW, trueH));
+    const sw = Math.max(16, Math.round(trueW * scale));
+    const sh = Math.max(16, Math.round(trueH * scale));
+    const c = document.createElement('canvas');
+    c.width = sw;
+    c.height = sh;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, sw, sh);
+    ctx.drawImage(sourceImgOrCanvas, 0, 0, sw, sh);
+    const data = ctx.getImageData(0, 0, sw, sh).data;
+    return evaluateImageCompliance({ width: sw, height: sh, actualWidth: trueW, actualHeight: trueH, rgbaPixels: data, marketplace });
+  }
+
+  /**
+   * 8. الإصلاح التلقائي الفوري بضغطة زر لشروط أمازون ونون (Flood-Fill + Auto-Scale 85% + 1600x1600)
+   */
+  function autoFixMarketplaceImage(sourceImgOrCanvas, opts = {}) {
+    if (!sourceImgOrCanvas || typeof document === 'undefined') return null;
+    const targetMarketplace = opts.targetMarketplace === 'noon' ? 'noon' : 'amazon';
+    const fillTarget = Math.min(0.9, Math.max(0.76, Number(opts.fillTarget) || 0.85));
+    const removeNearWhiteBg = opts.removeNearWhiteBg !== false;
+    const addSoftShadow = Boolean(opts.addSoftShadow);
+
+    const srcW = sourceImgOrCanvas.naturalWidth || sourceImgOrCanvas.width || 800;
+    const srcH = sourceImgOrCanvas.naturalHeight || sourceImgOrCanvas.height || 800;
+
+    // 1. Work canvas (capped at 1200px max for instant flood-fill)
+    const workScale = Math.min(1, 1200 / Math.max(srcW, srcH));
+    const ww = Math.max(32, Math.round(srcW * workScale));
+    const wh = Math.max(32, Math.round(srcH * workScale));
+    const workCanvas = document.createElement('canvas');
+    workCanvas.width = ww;
+    workCanvas.height = wh;
+    const wCtx = workCanvas.getContext('2d', { willReadFrequently: true });
+    wCtx.drawImage(sourceImgOrCanvas, 0, 0, ww, wh);
+    const imgData = wCtx.getImageData(0, 0, ww, wh);
+    const px = imgData.data;
+
+    // 2. Sample 4-corner border average background color
+    const samplePts = [
+      [0, 0], [ww - 1, 0], [0, wh - 1], [ww - 1, wh - 1],
+      [Math.floor(ww / 2), 0], [Math.floor(ww / 2), wh - 1],
+      [0, Math.floor(wh / 2)], [ww - 1, Math.floor(wh / 2)]
+    ];
+    let bgR = 0, bgG = 0, bgB = 0, bgCnt = 0;
+    for (const [sx, sy] of samplePts) {
+      const i = (sy * ww + sx) * 4;
+      if (px[i + 3] > 20) {
+        bgR += px[i]; bgG += px[i + 1]; bgB += px[i + 2]; bgCnt++;
+      }
+    }
+    if (bgCnt > 0) {
+      bgR /= bgCnt; bgG /= bgCnt; bgB /= bgCnt;
+    } else {
+      bgR = 255; bgG = 255; bgB = 255;
+    }
+
+    // 3. Edge-seeded BFS flood-fill (removes connected near-white/uniform studio bg while preserving interior whites)
+    if (removeNearWhiteBg) {
+      const visited = new Uint8Array(ww * wh);
+      const isBg = new Uint8Array(ww * wh);
+      const queue = new Int32Array(ww * wh);
+      let head = 0, tail = 0;
+      const colorDistSq = (idx) => {
+        const dr = px[idx] - bgR;
+        const dg = px[idx + 1] - bgG;
+        const db = px[idx + 2] - bgB;
+        return dr * dr + dg * dg + db * db;
+      };
+      const isNearWhiteNeutral = (idx) => {
+        const r = px[idx], g = px[idx + 1], b = px[idx + 2];
+        const minC = Math.min(r, g, b);
+        const maxC = Math.max(r, g, b);
+        return minC >= 205 && (maxC - minC) <= 28;
+      };
+      const tolSq = 46 * 46;
+      const trySeed = (x, y) => {
+        const p = y * ww + x;
+        if (visited[p]) return;
+        const idx = p * 4;
+        if (px[idx + 3] <= 20 || colorDistSq(idx) <= tolSq || isNearWhiteNeutral(idx)) {
+          visited[p] = 1;
+          isBg[p] = 1;
+          queue[tail++] = p;
+        }
+      };
+
+      for (let x = 0; x < ww; x++) { trySeed(x, 0); trySeed(x, wh - 1); }
+      for (let y = 0; y < wh; y++) { trySeed(0, y); trySeed(ww - 1, y); }
+
+      while (head < tail) {
+        const cur = queue[head++];
+        const cx = cur % ww;
+        const cy = (cur - cx) / ww;
+        const neighbors = [
+          cx > 0 ? cur - 1 : -1,
+          cx < ww - 1 ? cur + 1 : -1,
+          cy > 0 ? cur - ww : -1,
+          cy < wh - 1 ? cur + ww : -1
+        ];
+        for (let k = 0; k < 4; k++) {
+          const np = neighbors[k];
+          if (np < 0 || visited[np]) continue;
+          const nIdx = np * 4;
+          if (px[nIdx + 3] <= 20 || colorDistSq(nIdx) <= tolSq || isNearWhiteNeutral(nIdx)) {
+            visited[np] = 1;
+            isBg[np] = 1;
+            queue[tail++] = np;
+          }
+        }
+      }
+
+      // Apply transparency + 1px soft edge feathering
+      for (let p = 0; p < ww * wh; p++) {
+        if (isBg[p]) {
+          px[p * 4 + 3] = 0;
+        } else {
+          const x = p % ww;
+          const y = (p - x) / ww;
+          let bgAdj = 0;
+          if (x > 0 && isBg[p - 1]) bgAdj++;
+          if (x < ww - 1 && isBg[p + 1]) bgAdj++;
+          if (y > 0 && isBg[p - ww]) bgAdj++;
+          if (y < wh - 1 && isBg[p + ww]) bgAdj++;
+          if (bgAdj > 0) {
+            const idx = p * 4;
+            const d = Math.sqrt(colorDistSq(idx));
+            if (d < 72) {
+              px[idx + 3] = Math.round(px[idx + 3] * Math.min(1, Math.max(0.25, (d - 28) / 44)));
+            }
+          }
+        }
+      }
+      wCtx.putImageData(imgData, 0, 0);
+    }
+
+    // 4. Compute tight foreground bounding box
+    let minX = ww, minY = wh, maxX = -1, maxY = -1;
+    for (let y = 0; y < wh; y++) {
+      for (let x = 0; x < ww; x++) {
+        const idx = (y * ww + x) * 4;
+        const a = px[idx + 3];
+        if (a > 24 && (px[idx] < 248 || px[idx + 1] < 248 || px[idx + 2] < 248)) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX <= minX || maxY <= minY) {
+      minX = 0; minY = 0; maxX = ww - 1; maxY = wh - 1;
+    }
+    const cropW = maxX - minX + 1;
+    const cropH = maxY - minY + 1;
+
+    // 5. Render onto crisp high-resolution marketplace canvas
+    const targetW = targetMarketplace === 'noon' ? 1280 : 1600;
+    const targetH = 1600;
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = targetW;
+    outCanvas.height = targetH;
+    const oCtx = outCanvas.getContext('2d');
+    oCtx.fillStyle = '#FFFFFF';
+    oCtx.fillRect(0, 0, targetW, targetH);
+
+    // Scale so longest relative axis occupies exactly fillTarget (85%) without clipping either axis
+    const maxDrawW = targetW * fillTarget;
+    const maxDrawH = targetH * fillTarget;
+    const drawScale = Math.min(maxDrawW / cropW, maxDrawH / cropH);
+    const dw = Math.round(cropW * drawScale);
+    const dh = Math.round(cropH * drawScale);
+    const dx = Math.round((targetW - dw) / 2);
+    const dy = Math.round((targetH - dh) / 2);
+
+    if (addSoftShadow) {
+      oCtx.save();
+      const sy = Math.min(targetH * 0.93, dy + dh - 8);
+      const radGrad = oCtx.createRadialGradient(targetW / 2, sy, 10, targetW / 2, sy, dw * 0.42);
+      radGrad.addColorStop(0, 'rgba(15, 23, 42, 0.14)');
+      radGrad.addColorStop(1, 'rgba(15, 23, 42, 0)');
+      oCtx.fillStyle = radGrad;
+      oCtx.beginPath();
+      oCtx.ellipse(targetW / 2, sy, dw * 0.44, Math.max(18, Math.round(targetH * 0.022)), 0, 0, Math.PI * 2);
+      oCtx.fill();
+      oCtx.restore();
+    }
+
+    oCtx.imageSmoothingEnabled = true;
+    oCtx.imageSmoothingQuality = 'high';
+    oCtx.drawImage(workCanvas, minX, minY, cropW, cropH, dx, dy, dw, dh);
+
+    const pngDataUrl = outCanvas.toDataURL('image/png');
+    const amazonCompliance = auditImageElement(outCanvas, 'amazon');
+    const noonCompliance = auditImageElement(outCanvas, 'noon');
+    const compliance = targetMarketplace === 'noon' ? noonCompliance : amazonCompliance;
+
+    return {
+      canvas: outCanvas,
+      dataUrl: pngDataUrl,
+      width: targetW,
+      height: targetH,
+      compliance,
+      amazonCompliance,
+      noonCompliance
+    };
+  }
+
   return {
     PLATFORM_LOGO_ASSETS,
     PLATFORM_LOGOS: PLATFORM_LOGO_ASSETS,
@@ -475,6 +860,9 @@
     EXPERT_SERVICES_UI,
     SELLER_GUIDES,
     computeOnboardingProgress,
-    renderStudioPhotoOnCanvas
+    renderStudioPhotoOnCanvas,
+    evaluateImageCompliance,
+    auditImageElement,
+    autoFixMarketplaceImage
   };
 });

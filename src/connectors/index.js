@@ -5,6 +5,19 @@ const net = require('node:net');
 const zlib = require('node:zlib');
 const { HttpError, bad, round2, nowIso, parseJson } = require('../util');
 const { MARKETS } = require('../domain');
+const { consumeFifoCost, parseAmazonFinancialEvents } = require('../profit-engine');
+
+const INVENTORY_BACKOFF_SECONDS = [15, 60, 300, 900];
+
+function pushInventoryHttpError(providerLabel, res, action = 'دفع المخزون') {
+  const status = Number(res?.status || 0);
+  const msg = `${providerLabel}: فشل ${action} (HTTP ${status || 'ERR'})`;
+  const err = new Error(msg);
+  err.statusCode = status;
+  err.retryable = status === 0 || status === 429 || status >= 500;
+  if (status === 401 || status === 403) err.authFailure = true;
+  return err;
+}
 
 const PLATFORM_KEYS = ['a', 'n', 'j', 't', 'k'];
 const PLATFORM_SOURCE = Object.freeze({ a: 'amazon', n: 'noon', j: 'jumia', t: 'trendyol', k: 'kenzz' });
@@ -814,6 +827,63 @@ const ADAPTERS = {
       }), ctx.retryOpts);
       if (!res.ok) throw connectorHttpError('Amazon SP-API', res, 'تحديث مخزون');
       return { ok: true, sku, qty };
+    },
+
+    async pushInventory(creds, env, item, fetchFn, ctx = {}) {
+      const sku = String(item?.sku || '').trim();
+      const quantity = Math.max(0, Math.floor(Number(item?.quantity ?? 0) || 0));
+      const token = await this.getAccessToken(creds, fetchFn, ctx);
+      const base = env === 'sandbox' ? PLATFORM_SCHEMAS.a.sandboxBaseUrl : PLATFORM_SCHEMAS.a.defaultBaseUrl;
+      const sellerId = item?.sellerId || creds.sellerId;
+      const mpId = item?.marketplaceId || creds.marketplaceId || 'ARBP9OOSHTCHU';
+      const url = `${base}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(sku)}?marketplaceIds=${encodeURIComponent(mpId)}`;
+      const res = await callJson(fetchFn, url, {
+        method: 'PATCH',
+        headers: { 'x-amz-access-token': token, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          productType: 'PRODUCT',
+          patches: [{
+            op: 'replace',
+            path: '/attributes/fulfillment_availability',
+            value: [{ fulfillment_channel_code: 'DEFAULT', quantity }]
+          }]
+        })
+      });
+      if (!res.ok) throw pushInventoryHttpError('Amazon SP-API', res, 'دفع المخزون');
+      return { ok: true, sku, quantity };
+    },
+
+    async syncFinances(creds, env, sinceIso, fetchFn, ctx = {}) {
+      const token = await this.getAccessToken(creds, fetchFn, ctx);
+      const base = env === 'sandbox' ? PLATFORM_SCHEMAS.a.sandboxBaseUrl : PLATFORM_SCHEMAS.a.defaultBaseUrl;
+      const headers = { 'x-amz-access-token': token, accept: 'application/json' };
+      const postedAfter = sinceIso || new Date(Date.now() - 30 * 86400_000).toISOString();
+
+      const mergedByOrder = new Map();
+      const allServiceFees = [];
+      let nextToken = null;
+      for (let page = 0; page < 15; page++) {
+        const url = nextToken
+          ? `${base}/finances/v0/financialEvents?NextToken=${encodeURIComponent(nextToken)}`
+          : `${base}/finances/v0/financialEvents?PostedAfter=${encodeURIComponent(postedAfter)}`;
+        const res = await callWithRetry(() => callJson(fetchFn, url, { headers }), ctx.retryOpts);
+        if (!res.ok) throw connectorHttpError('Amazon SP-API Finances', res, 'سحب التسويات المالية');
+        const parsed = parseAmazonFinancialEvents(res.data);
+        for (const entry of parsed.orders) {
+          const prev = mergedByOrder.get(entry.externalRef);
+          if (prev) {
+            prev.feeLines.push(...entry.feeLines);
+            prev.hasRefund = prev.hasRefund || entry.hasRefund;
+          } else {
+            mergedByOrder.set(entry.externalRef, entry);
+          }
+        }
+        allServiceFees.push(...parsed.serviceFees);
+        nextToken = parsed.nextToken;
+        if (!nextToken) break;
+      }
+
+      return { orders: [...mergedByOrder.values()], serviceFees: allServiceFees };
     }
   },
 
@@ -994,6 +1064,19 @@ const ADAPTERS = {
       }), ctx.retryOpts);
       if (!res.ok) throw connectorHttpError('Noon Partners', res, 'تحديث مخزون');
       return { ok: true, sku, qty };
+    },
+
+    async pushInventory(creds, _env, item, fetchFn, ctx = {}) {
+      const sku = String(item?.sku || '').trim();
+      const quantity = Math.max(0, Math.floor(Number(item?.quantity ?? 0) || 0));
+      const { base, headers } = await this.getAuthHeaders(creds, fetchFn, ctx);
+      const res = await callJson(fetchFn, `${base}/partner/v1/inventory`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ partner_sku: sku, quantity })
+      });
+      if (!res.ok) throw pushInventoryHttpError('Noon Partners', res, 'دفع المخزون');
+      return { ok: true, sku, quantity };
     }
   },
 
@@ -1244,6 +1327,19 @@ const ADAPTERS = {
       }), ctx.retryOpts);
       if (!res.ok) throw connectorHttpError('Jumia Vendor Center', res, 'تحديث مخزون');
       return { ok: true, sku, qty };
+    },
+
+    async pushInventory(creds, env, item, fetchFn, ctx = {}) {
+      const sku = String(item?.sku || '').trim();
+      const quantity = Math.max(0, Math.floor(Number(item?.quantity ?? 0) || 0));
+      const { base, headers } = await this.getAuthHeaders(creds, env, fetchFn, ctx);
+      const res = await callJson(fetchFn, `${base}/feeds/products/stock`, {
+        method: 'PUT',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ sellerSku: sku, quantity })
+      });
+      if (!res.ok) throw pushInventoryHttpError('Jumia Vendor Center', res, 'دفع المخزون');
+      return { ok: true, sku, quantity };
     }
   },
 
@@ -1415,6 +1511,20 @@ const ADAPTERS = {
       }), ctx.retryOpts);
       if (!res.ok) throw connectorHttpError('Trendyol', res, 'تحديث مخزون');
       return { ok: true, sku, qty };
+    },
+
+    async pushInventory(creds, env, item, fetchFn) {
+      const sku = String(item?.sku || '').trim();
+      const quantity = Math.max(0, Math.floor(Number(item?.quantity ?? 0) || 0));
+      const base = env === 'sandbox' ? PLATFORM_SCHEMAS.t.sandboxBaseUrl : PLATFORM_SCHEMAS.t.defaultBaseUrl;
+      const sid = encodeURIComponent(creds.supplierId);
+      const res = await callJson(fetchFn, `${base}/integration/inventory/sellers/${sid}/products/price-and-inventory`, {
+        method: 'POST',
+        headers: { ...this.headers(creds), 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ barcode: sku, quantity }] })
+      });
+      if (!res.ok) throw pushInventoryHttpError('Trendyol', res, 'دفع المخزون');
+      return { ok: true, sku, quantity };
     }
   },
 
@@ -1556,6 +1666,22 @@ const ADAPTERS = {
       }), ctx.retryOpts);
       if (!res.ok) throw connectorHttpError('Kenzz', res, 'تحديث مخزون');
       return { ok: true, sku, qty };
+    },
+
+    async pushInventory(creds, env, item, fetchFn) {
+      const sku = String(item?.sku || '').trim();
+      const quantity = Math.max(0, Math.floor(Number(item?.quantity ?? 0) || 0));
+      const base = assertSafeExternalUrl(
+        creds.baseUrl || (env === 'sandbox' ? PLATFORM_SCHEMAS.k.sandboxBaseUrl : PLATFORM_SCHEMAS.k.defaultBaseUrl),
+        'رابط كنز API'
+      );
+      const res = await callJson(fetchFn, `${base}/products/${encodeURIComponent(sku)}/inventory`, {
+        method: 'PUT',
+        headers: { ...this.headers(creds), 'content-type': 'application/json' },
+        body: JSON.stringify({ sku, stock: quantity })
+      });
+      if (!res.ok) throw pushInventoryHttpError('Kenzz', res, 'دفع المخزون');
+      return { ok: true, sku, quantity };
     }
   }
 };
@@ -1569,6 +1695,8 @@ function createConnectors(app) {
   const tokenCache = new Map();
   const authFailCounts = new Map();
   let autoSyncRunning = false;
+  let inventoryQueueRunning = false;
+  let closed = false;
 
   const safeFetch = (url, init = {}) => cfg.fetch(url, init);
   const guardedFetch = cfg.dnsLookup
@@ -1791,38 +1919,59 @@ function createConnectors(app) {
 
         // 1) تحديث/إضافة المنتجات أولًا مع الحفاظ الكامل على تكلفة الشراء اليدوية التي أدخلها التاجر
         const syncedProductIds = new Set();
+        const stockAffectedProductIds = new Set();
         for (const p of pulled.products || []) {
           const sku = String(p.sku || '').slice(0, 40);
           if (!sku) continue;
           const incomingPrice = Number(p.price) > 0 ? round2(Number(p.price)) : 0;
           const incomingCost = Number(p.cost) > 0 ? round2(Number(p.cost)) : 0;
           const incomingStock = Math.max(0, Math.round(Number(p.stock) || 0));
-          const existing = q('SELECT id, price, cost, markets FROM products WHERE user_id = ? AND sku = ?').get(userId, sku);
+          const linkMatch = q('SELECT product_id FROM product_channel_links WHERE user_id = ? AND platform = ? AND LOWER(channel_sku) = LOWER(?)').get(userId, platform, sku);
+          const existing = (linkMatch && q('SELECT id, price, cost, cost_is_estimated, markets, stock FROM products WHERE id = ? AND user_id = ?').get(linkMatch.product_id, userId))
+            || q('SELECT id, price, cost, cost_is_estimated, markets, stock FROM products WHERE user_id = ? AND sku = ?').get(userId, sku);
+          let prodId;
           if (existing) {
             const mSet = new Set(String(existing.markets || '').split('').filter(Boolean));
             mSet.add(platform);
             const nextPrice = incomingPrice > 0 ? incomingPrice : Number(existing.price || 0);
             // لا نستبدل أبدًا تكلفة الشراء الحقيقية التي أدخلها التاجر؛ نحدّثها فقط إن كانت 0 ووصلت تكلفة من الـ API
             const nextCost = Number(existing.cost || 0) > 0 ? Number(existing.cost) : incomingCost;
-            q('UPDATE products SET name = ?, price = ?, cost = ?, stock = ?, markets = ?, updated_at = ? WHERE id = ?')
-              .run(String(p.name || sku).slice(0, 120), nextPrice, nextCost, incomingStock, [...mSet].join(''), now, existing.id);
-            syncedProductIds.add(Number(existing.id));
+            const nextCostEst = nextCost > 0 ? 0 : Number(existing.cost_is_estimated || 1);
+            q('UPDATE products SET name = ?, price = ?, cost = ?, cost_is_estimated = ?, stock = ?, markets = ?, updated_at = ? WHERE id = ?')
+              .run(String(p.name || sku).slice(0, 120), nextPrice, nextCost, nextCostEst, incomingStock, [...mSet].join(''), now, existing.id);
+            prodId = Number(existing.id);
+            syncedProductIds.add(prodId);
             updatedProducts++;
           } else {
-            const insProd = q(`INSERT INTO products (user_id, name, sku, cat, markets, price, cost, stock, approval_status, source, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`)
-              .run(userId, String(p.name || sku).slice(0, 120), sku, String(p.cat || 'عام').slice(0, 40), platform, incomingPrice, incomingCost, incomingStock, sourceName, now, now);
-            syncedProductIds.add(Number(insProd.lastInsertRowid));
+            const costIsEst = incomingCost > 0 ? 0 : 1;
+            const insProd = q(`INSERT INTO products (user_id, name, sku, cat, markets, price, cost, cost_is_estimated, stock, approval_status, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`)
+              .run(userId, String(p.name || sku).slice(0, 120), sku, String(p.cat || 'عام').slice(0, 40), platform, incomingPrice, incomingCost, costIsEst, incomingStock, sourceName, now, now);
+            prodId = Number(insProd.lastInsertRowid);
+            syncedProductIds.add(prodId);
             importedProducts++;
           }
+          q(`INSERT INTO product_channel_links (user_id, product_id, platform, channel_sku, external_id, sync_status, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'idle', ?)
+             ON CONFLICT(user_id, product_id, platform) DO UPDATE SET
+               channel_sku = COALESCE(NULLIF(product_channel_links.channel_sku, ''), excluded.channel_sku),
+               updated_at = excluded.updated_at`)
+            .run(userId, prodId, platform, sku, String(p.externalId || ''), now);
         }
 
-        // خريطة المنتجات بالـ SKU لربط order_items الحقيقية وحساب تكلفة الشراء الفعلية
-        const prodRows = q('SELECT id, sku, name, cost FROM products WHERE user_id = ?').all(userId);
+        // خريطة المنتجات بالـ SKU وبروابط القنوات المخصصة (product_channel_links) لربط order_items الحقيقية
+        const prodRows = q('SELECT id, sku, name, cost, packaging_cost, stock, safety_stock, auto_push_stock, markets FROM products WHERE user_id = ?').all(userId);
+        const prodById = new Map(prodRows.map((pr) => [Number(pr.id), pr]));
         const prodBySku = new Map(prodRows.map((pr) => [String(pr.sku).toLowerCase(), pr]));
         const prodByName = new Map(prodRows.map((pr) => [String(pr.name).toLowerCase(), pr]));
+        const linkRows = q('SELECT product_id, channel_sku FROM product_channel_links WHERE user_id = ? AND platform = ?').all(userId, platform);
+        const prodByChannelSku = new Map();
+        for (const lr of linkRows) {
+          const pr = prodById.get(Number(lr.product_id));
+          if (pr && lr.channel_sku) prodByChannelSku.set(String(lr.channel_sku).toLowerCase(), pr);
+        }
 
-        // 2) تحديث/إضافة الطلبات + ربط العملاء (CRM) + ربط order_items بالمنتجات الحقيقية
+        // 2) تحديث/إضافة الطلبات + ربط العملاء (CRM) + ربط order_items + استهلاك FIFO COGS + خصم المخزون
         const userRow = q('SELECT order_seq FROM users WHERE id = ?').get(userId);
         let nextSeq = Number(userRow?.order_seq || 1000);
         for (const o of pulled.orders || []) {
@@ -1863,22 +2012,23 @@ function createConnectors(app) {
 
           nextSeq += 1;
           const resolvedItems = [];
-          let matchedCostTotal = 0;
           if (Array.isArray(o.orderItems) && o.orderItems.length) {
             for (const it of o.orderItems) {
               const skuKey = String(it.sku || '').trim().toLowerCase();
               const nameKey = String(it.name || '').trim().toLowerCase();
-              const matched = (skuKey && prodBySku.get(skuKey)) || (nameKey && prodByName.get(nameKey)) || null;
+              const matched = (skuKey && prodByChannelSku.get(skuKey))
+                || (skuKey && prodBySku.get(skuKey))
+                || (nameKey && prodByName.get(nameKey))
+                || null;
               const qty = Math.max(1, Number(it.qty) || 1);
               const price = round2(Math.max(0, Number(it.price) || 0));
-              const unitCost = matched && Number(matched.cost) > 0 ? round2(Number(matched.cost)) : 0;
-              matchedCostTotal += unitCost * qty;
               resolvedItems.push({
                 productId: matched ? matched.id : null,
+                matched,
                 name: String(it.name || matched?.name || 'منتج').slice(0, 120),
                 qty,
                 price,
-                cost: unitCost
+                cost: matched && Number(matched.cost) > 0 ? round2(Number(matched.cost)) : 0
               });
             }
           }
@@ -1886,9 +2036,6 @@ function createConnectors(app) {
           const total = incomingTotal > 0
             ? incomingTotal
             : round2(resolvedItems.reduce((s, it) => s + it.price * it.qty, 0));
-          const allItemsCosted = resolvedItems.length > 0 && resolvedItems.every((it) => it.cost > 0);
-          const costEstimated = allItemsCosted ? 0 : 1;
-          const costTotal = round2(matchedCostTotal);
           const fulfillmentChannel = String(o.fulfillmentChannel || '').trim();
           const isMarketplaceFulfilled = /^(AFN|FBN|FBJ)$/i.test(fulfillmentChannel);
           const courier = String(o.courier || defaultCourier).slice(0, 60);
@@ -1909,14 +2056,14 @@ function createConnectors(app) {
           const cancelledAt = nextStatus === 4 ? now : null;
 
           const orderId = Number(q(`INSERT INTO orders
-             (user_id, customer_id, no, market, customer, phone, phone_hash, gov, address, pay, courier, total, cost_total, cost_estimated, ship_fee, fulfillment_channel, status, items, approval_status, external_ref, source, delivered_at, cancelled_at, return_reason, awb_number, tracking_url, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?)`)
+             (user_id, customer_id, no, market, customer, phone, phone_hash, gov, address, pay, courier, total, cost_total, packaging_total, cost_estimated, ship_fee, fulfillment_channel, status, items, approval_status, external_ref, source, delivered_at, cancelled_at, return_reason, awb_number, tracking_url, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?)`)
             .run(
               userId, customerId, nextSeq, platform,
               encName, encPhone, phHash, custGov, encAddr,
               String(o.pay || 'عند الاستلام'),
               courier,
-              total, costTotal, costEstimated, shipFee, fulfillmentChannel,
+              total, shipFee, fulfillmentChannel,
               nextStatus,
               String(o.items || `طلب ${MARKETS[platform]?.name || platform}`).slice(0, 240),
               extRef,
@@ -1929,15 +2076,32 @@ function createConnectors(app) {
               String(o.createdAt || now)
             ).lastInsertRowid);
 
+          let matchedCostTotal = 0;
+          let packagingTotal = 0;
+          let anyMissingCost = resolvedItems.length === 0;
           for (const it of resolvedItems) {
+            let unitCost = it.cost;
+            if (it.productId && nextStatus !== 4) {
+              const fifo = consumeFifoCost(q, { userId, productId: it.productId, qty: it.qty, orderId });
+              unitCost = fifo.unitCostAvg;
+              matchedCostTotal += fifo.totalCost;
+              packagingTotal += fifo.packagingTotal;
+              if (fifo.costMissing) anyMissingCost = true;
+            } else {
+              matchedCostTotal += unitCost * it.qty;
+              if (unitCost <= 0) anyMissingCost = true;
+            }
             q('INSERT INTO order_items (order_id, product_id, name, qty, price, cost) VALUES (?, ?, ?, ?, ?, ?)')
-              .run(orderId, it.productId, it.name, it.qty, it.price, it.cost);
-            // نخصم المخزون المحلي فقط إذا لم يُحدَّث المخزون الفعلي للمنتج في نفس المزامنة من سيرفر المنصة
+              .run(orderId, it.productId, it.name, it.qty, it.price, unitCost);
+            // خصم المخزون المركزي الذري لمرة واحدة لكل طلب جديد غير ملغي (ومزامنة باقي القنوات لمنع البيع الزائد)
             if (it.productId && !syncedProductIds.has(Number(it.productId)) && !isMarketplaceFulfilled && nextStatus !== 3 && nextStatus !== 4) {
               q('UPDATE products SET stock = MAX(0, stock - ?), updated_at = ? WHERE id = ? AND user_id = ?')
                 .run(it.qty, now, it.productId, userId);
+              stockAffectedProductIds.add(Number(it.productId));
             }
           }
+          q('UPDATE orders SET cost_total = ?, packaging_total = ?, cost_estimated = ? WHERE id = ?')
+            .run(round2(matchedCostTotal), round2(packagingTotal), anyMissingCost ? 1 : 0, orderId);
           importedOrders++;
         }
         q('UPDATE users SET order_seq = ?, last_sync_at = ? WHERE id = ?').run(nextSeq, now, userId);
@@ -1951,15 +2115,26 @@ function createConnectors(app) {
         q('UPDATE connector_sync_runs SET finished_at = ?, orders_new = ?, orders_updated = ?, error = \'\' WHERE id = ?')
           .run(now, importedOrders, updatedOrders, runId);
 
-        return stats;
+        return { ...stats, stockAffectedProductIds: [...stockAffectedProductIds] };
       });
 
+      // دفع تحديث المخزون اللحظي لباقي القنوات المتصلة (باستثناء المنصة التي ورد منها الطلب) لمنع البيع الزائد
+      let stockSyncQueued = 0;
+      for (const pid of summary.stockAffectedProductIds || []) {
+        stockSyncQueued += enqueueStockSyncForProduct(userId, pid, {
+          excludePlatform: platform,
+          reason: `order_imported:${platform}`
+        });
+      }
+
+      const { stockAffectedProductIds: _drop, ...cleanSummary } = summary;
       return {
         live: true,
         ok: true,
         platform,
         name: MARKETS[platform]?.name || platform,
-        ...summary,
+        ...cleanSummary,
+        stockSyncQueued,
         connection: formatRow(platform, getRow(userId, platform))
       };
     } catch (err) {
@@ -2119,6 +2294,372 @@ function createConnectors(app) {
       }));
   }
 
+  // ── Task 1: Two-Way Real-Time Anti-Overselling Inventory Sync Queue & Channel Links ──
+
+  function getProductChannelLinks(userId, productId = null) {
+    const rows = productId != null
+      ? q('SELECT * FROM product_channel_links WHERE user_id = ? AND product_id = ? ORDER BY platform ASC').all(userId, Number(productId))
+      : q('SELECT * FROM product_channel_links WHERE user_id = ? ORDER BY product_id DESC, platform ASC').all(userId);
+    return rows.map((r) => ({
+      id: r.id,
+      productId: r.product_id,
+      platform: r.platform,
+      platformName: MARKETS[r.platform]?.name || r.platform,
+      channelSku: r.channel_sku,
+      externalId: r.external_id || '',
+      lastPushedStock: r.last_pushed_stock == null ? null : Number(r.last_pushed_stock),
+      lastPushedAt: r.last_pushed_at || null,
+      syncStatus: r.sync_status || 'idle',
+      lastError: r.last_error || '',
+      updatedAt: r.updated_at
+    }));
+  }
+
+  function setProductChannelLinks(userId, productId, channelsInput = {}) {
+    const prod = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(Number(productId), userId);
+    if (!prod) throw new HttpError(404, 'المنتج غير موجود');
+    const now = nowIso();
+    const entries = Array.isArray(channelsInput)
+      ? channelsInput.map((c) => [c?.platform, c?.channelSku ?? c?.channel_sku, c?.externalId ?? c?.external_id ?? ''])
+      : Object.entries(channelsInput || {}).map(([platform, val]) => (
+        typeof val === 'object' && val !== null
+          ? [platform, val.channelSku ?? val.channel_sku ?? '', val.externalId ?? val.external_id ?? '']
+          : [platform, val, '']
+      ));
+
+    tx(() => {
+      for (const [platform, rawSku, rawExtId] of entries) {
+        if (!PLATFORM_KEYS.includes(platform)) continue;
+        const channelSku = String(rawSku || '').trim().slice(0, 80);
+        const externalId = String(rawExtId || '').trim().slice(0, 120);
+        if (!channelSku) {
+          q('DELETE FROM product_channel_links WHERE user_id = ? AND product_id = ? AND platform = ?')
+            .run(userId, prod.id, platform);
+          continue;
+        }
+        q(`INSERT INTO product_channel_links (user_id, product_id, platform, channel_sku, external_id, sync_status, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'idle', ?)
+           ON CONFLICT(user_id, product_id, platform) DO UPDATE SET
+             channel_sku = excluded.channel_sku,
+             external_id = COALESCE(NULLIF(excluded.external_id, ''), product_channel_links.external_id),
+             updated_at = excluded.updated_at`)
+          .run(userId, prod.id, platform, channelSku, externalId, now);
+      }
+    });
+    return getProductChannelLinks(userId, prod.id);
+  }
+
+  let immediateScheduled = false;
+  function scheduleInventoryQueueProcess() {
+    if (closed || immediateScheduled) return;
+    immediateScheduled = true;
+    setImmediate(() => {
+      immediateScheduled = false;
+      if (closed) return;
+      processInventorySyncQueue({ limit: 25 }).catch(() => {});
+    });
+  }
+
+  /**
+   * جدولة دفع المخزون الفعّال (stock - safety_stock) إلى جميع القنوات المتصلة للمنتج مع منع التكرار
+   */
+  function enqueueStockSyncForProduct(userId, productId, { excludePlatform = null, reason = '', force = false, autoProcess = true } = {}) {
+    if (closed) return 0;
+    const prod = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(Number(productId), userId);
+    if (!prod) return 0;
+    if (!force && Number(prod.auto_push_stock) === 0) return 0;
+
+    const publishedStock = Math.max(0, Math.floor(Number(prod.stock || 0)) - Math.max(0, Math.floor(Number(prod.safety_stock || 0))));
+    const activeConns = q(`SELECT platform FROM marketplace_connections
+      WHERE user_id = ? AND enabled = 1 AND creds_enc <> ''`).all(userId);
+    if (!activeConns.length) return 0;
+
+    const links = q('SELECT * FROM product_channel_links WHERE user_id = ? AND product_id = ?').all(userId, prod.id);
+    const linkByPlatform = new Map(links.map((l) => [l.platform, l]));
+    const marketSet = new Set(String(prod.markets || '').split('').filter(Boolean));
+    for (const l of links) marketSet.add(l.platform);
+
+    const now = nowIso();
+    let queued = 0;
+
+    for (const conn of activeConns) {
+      const p = conn.platform;
+      if (excludePlatform && p === excludePlatform) continue;
+      if (!marketSet.has(p)) continue;
+
+      const link = linkByPlatform.get(p);
+      const channelSku = String(link?.channel_sku || prod.sku || '').trim();
+      if (!channelSku) continue;
+
+      if (!force && link && link.sync_status === 'synced' && link.last_pushed_stock === publishedStock) {
+        continue;
+      }
+
+      // ضمان وجود رابط القناة لتتبع الحالة لحظيًا
+      if (!link) {
+        q(`INSERT INTO product_channel_links (user_id, product_id, platform, channel_sku, external_id, sync_status, updated_at)
+           VALUES (?, ?, ?, ?, '', 'pending', ?)
+           ON CONFLICT(user_id, product_id, platform) DO UPDATE SET sync_status = 'pending', updated_at = excluded.updated_at`)
+          .run(userId, prod.id, p, channelSku, now);
+      } else {
+        q("UPDATE product_channel_links SET sync_status = 'pending', updated_at = ? WHERE id = ?").run(now, link.id);
+      }
+
+      // منع التكرار: تحديث المهمة المعلّقة إن وُجدت لنفس (user_id, product_id, platform)
+      const pendingJob = q(`SELECT id FROM inventory_sync_queue
+        WHERE user_id = ? AND product_id = ? AND platform = ? AND status = 'pending'
+        ORDER BY id DESC LIMIT 1`).get(userId, prod.id, p);
+
+      if (pendingJob) {
+        q(`UPDATE inventory_sync_queue
+           SET channel_sku = ?, desired_stock = ?, reason = ?, next_retry_at = ?, updated_at = ?
+           WHERE id = ?`)
+          .run(channelSku, publishedStock, String(reason || ''), now, now, pendingJob.id);
+      } else {
+        q(`INSERT INTO inventory_sync_queue
+           (user_id, product_id, platform, channel_sku, desired_stock, reason, status, attempts, next_retry_at, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, '', ?, ?)`)
+          .run(userId, prod.id, p, channelSku, publishedStock, String(reason || ''), now, now, now);
+      }
+      queued++;
+    }
+
+    if (queued > 0 && autoProcess) {
+      scheduleInventoryQueueProcess();
+    }
+    return queued;
+  }
+
+  /**
+   * عامل الخلفية لطابور مزامنة المخزون (يدفع عبر adapter.pushInventory مع backoff أسي 15s / 60s / 300s / 900s)
+   */
+  async function processInventorySyncQueue({ limit = 25 } = {}) {
+    if (closed || inventoryQueueRunning) {
+      return { skipped: true, processed: 0, succeeded: 0, failed: 0, retrying: 0 };
+    }
+    inventoryQueueRunning = true;
+    let processed = 0;
+    let succeeded = 0;
+    let failed = 0;
+    let retrying = 0;
+    try {
+      const now = nowIso();
+      const jobs = q(`SELECT * FROM inventory_sync_queue
+        WHERE status = 'pending' AND next_retry_at <= ?
+        ORDER BY id ASC LIMIT ?`).all(now, Math.min(100, Math.max(1, Number(limit) || 25)));
+
+      for (const job of jobs) {
+        if (closed) break;
+        processed++;
+        const row = q('SELECT * FROM marketplace_connections WHERE user_id = ? AND platform = ? AND enabled = 1').get(job.user_id, job.platform);
+        const adapter = ADAPTERS[job.platform];
+        const tsNow = nowIso();
+
+        if (!row || !row.creds_enc || !adapter || typeof adapter.pushInventory !== 'function') {
+          const msg = 'لا يوجد اتصال API نشط لهذه المنصة';
+          q("UPDATE inventory_sync_queue SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+            .run(msg, tsNow, job.id);
+          q("UPDATE product_channel_links SET sync_status = 'error', last_error = ?, updated_at = ? WHERE user_id = ? AND product_id = ? AND platform = ?")
+            .run(msg, tsNow, job.user_id, job.product_id, job.platform);
+          failed++;
+          continue;
+        }
+
+        q("UPDATE inventory_sync_queue SET status = 'processing', updated_at = ? WHERE id = ?").run(tsNow, job.id);
+
+        try {
+          const creds = decryptRowCreds(row);
+          const linkRow = q('SELECT external_id FROM product_channel_links WHERE user_id = ? AND product_id = ? AND platform = ?')
+            .get(job.user_id, job.product_id, job.platform);
+          await adapter.pushInventory(
+            creds,
+            row.environment || 'production',
+            {
+              sku: job.channel_sku,
+              quantity: Math.max(0, Math.floor(Number(job.desired_stock) || 0)),
+              sellerId: creds.sellerId || '',
+              marketplaceId: creds.marketplaceId || '',
+              externalId: linkRow?.external_id || ''
+            },
+            guardedFetch,
+            {
+              userId: job.user_id,
+              tokenCache,
+              retryOpts: { ...retryOpts, maxRetries: 0 },
+              onCredentialsUpdated: (updated) => persistUpdatedCreds(job.user_id, job.platform, updated)
+            }
+          );
+
+          const doneAt = nowIso();
+          q("UPDATE inventory_sync_queue SET status = 'done', last_error = '', updated_at = ? WHERE id = ?")
+            .run(doneAt, job.id);
+          q(`INSERT INTO product_channel_links (user_id, product_id, platform, channel_sku, last_pushed_stock, last_pushed_at, sync_status, last_error, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'synced', '', ?)
+             ON CONFLICT(user_id, product_id, platform) DO UPDATE SET
+               last_pushed_stock = excluded.last_pushed_stock,
+               last_pushed_at = excluded.last_pushed_at,
+               sync_status = 'synced',
+               last_error = '',
+               updated_at = excluded.updated_at`)
+            .run(job.user_id, job.product_id, job.platform, job.channel_sku, job.desired_stock, doneAt, doneAt);
+          succeeded++;
+        } catch (err) {
+          const failAt = nowIso();
+          const attempts = Number(job.attempts || 0) + 1;
+          const errMsg = String(err?.message || 'فشل دفع تحديث المخزون للمنصة').slice(0, 300);
+          const isRetryable = err?.retryable !== false;
+          if (attempts >= 5 || !isRetryable) {
+            q("UPDATE inventory_sync_queue SET status = 'failed', attempts = ?, last_error = ?, updated_at = ? WHERE id = ?")
+              .run(attempts, errMsg, failAt, job.id);
+            q("UPDATE product_channel_links SET sync_status = 'error', last_error = ?, updated_at = ? WHERE user_id = ? AND product_id = ? AND platform = ?")
+              .run(errMsg, failAt, job.user_id, job.product_id, job.platform);
+            failed++;
+          } else {
+            const delaySec = INVENTORY_BACKOFF_SECONDS[Math.min(attempts - 1, INVENTORY_BACKOFF_SECONDS.length - 1)] || 900;
+            const nextRetry = new Date(Date.now() + delaySec * 1000).toISOString();
+            q("UPDATE inventory_sync_queue SET status = 'pending', attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+              .run(attempts, nextRetry, errMsg, failAt, job.id);
+            q("UPDATE product_channel_links SET sync_status = 'pending', last_error = ?, updated_at = ? WHERE user_id = ? AND product_id = ? AND platform = ?")
+              .run(errMsg, failAt, job.user_id, job.product_id, job.platform);
+            retrying++;
+          }
+        }
+      }
+      return { skipped: false, processed, succeeded, failed, retrying };
+    } finally {
+      inventoryQueueRunning = false;
+    }
+  }
+
+  function getInventorySyncOverview(userId) {
+    const since24h = new Date(Date.now() - 86400_000).toISOString();
+    const pending = Number(q("SELECT COUNT(*) n FROM inventory_sync_queue WHERE user_id = ? AND status IN ('pending','processing')").get(userId)?.n || 0);
+    const synced24h = Number(q("SELECT COUNT(*) n FROM inventory_sync_queue WHERE user_id = ? AND status = 'done' AND updated_at >= ?").get(userId, since24h)?.n || 0);
+    const failed = Number(q("SELECT COUNT(*) n FROM inventory_sync_queue WHERE user_id = ? AND status = 'failed'").get(userId)?.n || 0);
+
+    const jobs = q(`SELECT q.*, p.name AS product_name, p.sku AS product_sku
+      FROM inventory_sync_queue q
+      LEFT JOIN products p ON p.id = q.product_id
+      WHERE q.user_id = ?
+      ORDER BY q.id DESC LIMIT 30`).all(userId).map((j) => ({
+      id: j.id,
+      productId: j.product_id,
+      productName: j.product_name || '',
+      productSku: j.product_sku || '',
+      platform: j.platform,
+      platformName: MARKETS[j.platform]?.name || j.platform,
+      channelSku: j.channel_sku,
+      desiredStock: j.desired_stock,
+      reason: j.reason || '',
+      status: j.status,
+      attempts: j.attempts,
+      nextRetryAt: j.next_retry_at,
+      lastError: j.last_error || '',
+      createdAt: j.created_at,
+      updatedAt: j.updated_at
+    }));
+
+    const links = getProductChannelLinks(userId);
+    return { summary: { pending, synced24h, failed }, jobs, links };
+  }
+
+  function retryInventorySyncJob(userId, jobId) {
+    const job = q('SELECT * FROM inventory_sync_queue WHERE id = ? AND user_id = ?').get(Number(jobId) || 0, userId);
+    if (!job) throw new HttpError(404, 'مهمة مزامنة المخزون غير موجودة');
+    const now = nowIso();
+    q("UPDATE inventory_sync_queue SET status = 'pending', attempts = 0, next_retry_at = ?, last_error = '', updated_at = ? WHERE id = ?")
+      .run(now, now, job.id);
+    q("UPDATE product_channel_links SET sync_status = 'pending', last_error = '', updated_at = ? WHERE user_id = ? AND product_id = ? AND platform = ?")
+      .run(now, userId, job.product_id, job.platform);
+    scheduleInventoryQueueProcess();
+    return q('SELECT * FROM inventory_sync_queue WHERE id = ?').get(job.id);
+  }
+
+  function pushAllApprovedInventory(userId) {
+    const prods = q("SELECT id FROM products WHERE user_id = ? AND approval_status = 'approved'").all(userId);
+    let queued = 0;
+    for (const p of prods) {
+      queued += enqueueStockSyncForProduct(userId, p.id, { force: true, reason: 'manual_push_all', autoProcess: false });
+    }
+    if (queued > 0) scheduleInventoryQueueProcess();
+    return { queued, productsScanned: prods.length };
+  }
+
+  // ── Task 2: Real Marketplace Settlement Fee Pull (Amazon Finances API) ──
+
+  async function syncFinances(userId, platform, sinceIso = null) {
+    if (!PLATFORM_KEYS.includes(platform)) throw bad('منصة غير مدعومة');
+    const row = getRow(userId, platform);
+    if (!row || !row.creds_enc) {
+      throw bad(`أضف بيانات API الخاصة بمنصة ${MARKETS[platform]?.name || platform} أولًا.`);
+    }
+    const adapter = ADAPTERS[platform];
+    if (!adapter || typeof adapter.syncFinances !== 'function') {
+      throw bad('سحب التسويات المالية التلقائي عبر API متاح حاليًا لأمازون مصر؛ يمكنك رفع ملف تسويات نون وجوميا عبر استيراد CSV.');
+    }
+    const creds = decryptRowCreds(row);
+    const pulled = await adapter.syncFinances(creds, row.environment || 'production', sinceIso, guardedFetch, {
+      userId,
+      tokenCache,
+      retryOpts,
+      onCredentialsUpdated: (updated) => persistUpdatedCreds(userId, platform, updated)
+    });
+
+    const now = nowIso();
+    const summary = tx(() => {
+      let settledOrders = 0;
+      let feeLinesInserted = 0;
+      let unmatchedRefs = 0;
+
+      for (const entry of pulled.orders || []) {
+        const order = q('SELECT id, status FROM orders WHERE user_id = ? AND market = ? AND external_ref = ?')
+          .get(userId, platform, entry.externalRef);
+        if (!order) {
+          unmatchedRefs++;
+          continue;
+        }
+        // استبدال بنود التسوية السابقة لهذا الطلب لمنع التكرار (Idempotent)
+        q('DELETE FROM order_fee_lines WHERE user_id = ? AND order_id = ?').run(userId, order.id);
+
+        let marketFees = 0;
+        let adFees = 0;
+        let otherFees = 0;
+        let returnShipFee = 0;
+
+        for (const fl of entry.feeLines || []) {
+          q(`INSERT INTO order_fee_lines (user_id, order_id, external_ref, market, fee_code, fee_label, amount, vat_amount, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(userId, order.id, entry.externalRef, platform, fl.feeCode, fl.feeLabel, round2(fl.amount), round2(fl.vatAmount || 0), now);
+          feeLinesInserted++;
+
+          if (fl.category === 'ad') adFees += Number(fl.amount || 0);
+          else if (fl.category === 'other') otherFees += Number(fl.amount || 0);
+          else if (fl.feeCode === 'ReturnShippingFee') returnShipFee += Number(fl.amount || 0);
+          else marketFees += Number(fl.amount || 0);
+        }
+
+        q(`UPDATE orders
+           SET actual_market_fees = ?,
+               ad_fee_alloc = ?,
+               other_platform_fees = ?,
+               return_ship_fee = CASE WHEN ? > 0 THEN ? ELSE return_ship_fee END,
+               fees_source = 'api_settled',
+               financial_settled_at = ?
+           WHERE id = ?`)
+          .run(round2(marketFees), round2(adFees), round2(otherFees), round2(returnShipFee), round2(returnShipFee), now, order.id);
+        settledOrders++;
+      }
+
+      return { settledOrders, feeLinesInserted, unmatchedRefs };
+    });
+
+    return { ok: true, platform, ...summary };
+  }
+
+  function stop() {
+    closed = true;
+  }
+
   return {
     PLATFORM_KEYS,
     PLATFORM_SCHEMAS,
@@ -2131,7 +2672,16 @@ function createConnectors(app) {
     syncAllActiveConnections,
     enqueueStockPush,
     processSyncOutbox,
-    listOutbox
+    listOutbox,
+    getProductChannelLinks,
+    setProductChannelLinks,
+    enqueueStockSyncForProduct,
+    processInventorySyncQueue,
+    getInventorySyncOverview,
+    retryInventorySyncJob,
+    pushAllApprovedInventory,
+    syncFinances,
+    stop
   };
 }
 

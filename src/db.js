@@ -649,7 +649,142 @@ DROP TABLE courier_connections;
 ALTER TABLE courier_connections_new RENAME TO courier_connections;
 CREATE INDEX courier_connections_user ON courier_connections(user_id);
 `
-}];
+}, `
+-- الترحيل 12: مزامنة المخزون اللحظية ثنائية الاتجاه (منع البيع الزائد + مخزون الأمان + ربط SKU لكل قناة)
+ALTER TABLE products ADD COLUMN safety_stock INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN auto_push_stock INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE product_channel_links (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL CHECK (platform IN ('a', 'n', 'j', 't', 'k')),
+  channel_sku TEXT NOT NULL,
+  external_id TEXT NOT NULL DEFAULT '',
+  last_pushed_stock INTEGER,
+  last_pushed_at TEXT,
+  sync_status TEXT NOT NULL DEFAULT 'idle' CHECK (sync_status IN ('idle', 'pending', 'synced', 'error')),
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  UNIQUE (user_id, product_id, platform)
+);
+CREATE INDEX product_channel_links_lookup ON product_channel_links(user_id, platform, channel_sku);
+
+CREATE TABLE inventory_sync_queue (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL CHECK (platform IN ('a', 'n', 'j', 't', 'k')),
+  channel_sku TEXT NOT NULL,
+  desired_stock INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'done', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX inventory_sync_queue_due ON inventory_sync_queue(status, next_retry_at);
+CREATE INDEX inventory_sync_queue_dedup ON inventory_sync_queue(user_id, product_id, platform, status);
+`, `
+-- الترحيل 13: محرك صافي الربح الدقيق بالقرش، دُفعات المخزون FIFO COGS، تسويات المنصات، والمصاريف التشغيلية
+ALTER TABLE products ADD COLUMN packaging_cost REAL NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN cost_is_estimated INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE inventory_batches (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  batch_code TEXT NOT NULL,
+  qty_initial INTEGER NOT NULL,
+  qty_remaining INTEGER NOT NULL,
+  unit_cost REAL NOT NULL,
+  inbound_ship_per_unit REAL NOT NULL DEFAULT 0,
+  customs_other_per_unit REAL NOT NULL DEFAULT 0,
+  purchased_at TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX inventory_batches_fifo ON inventory_batches(user_id, product_id, purchased_at ASC, id ASC);
+
+CREATE TABLE order_item_batches (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL,
+  batch_id INTEGER NOT NULL REFERENCES inventory_batches(id) ON DELETE CASCADE,
+  qty INTEGER NOT NULL,
+  unit_landed_cost REAL NOT NULL
+);
+CREATE INDEX order_item_batches_order ON order_item_batches(order_id);
+
+ALTER TABLE orders ADD COLUMN packaging_total REAL NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN return_ship_fee REAL NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN actual_market_fees REAL;
+ALTER TABLE orders ADD COLUMN ad_fee_alloc REAL NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN other_platform_fees REAL NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN fees_source TEXT NOT NULL DEFAULT 'estimated';
+ALTER TABLE orders ADD COLUMN financial_settled_at TEXT;
+
+CREATE TABLE order_fee_lines (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+  external_ref TEXT NOT NULL DEFAULT '',
+  market TEXT NOT NULL,
+  fee_code TEXT NOT NULL,
+  fee_label TEXT NOT NULL,
+  amount REAL NOT NULL,
+  vat_amount REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX order_fee_lines_order ON order_fee_lines(order_id);
+CREATE INDEX order_fee_lines_user_ref ON order_fee_lines(user_id, external_ref);
+
+CREATE TABLE merchant_expenses (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT 'all',
+  amount REAL NOT NULL,
+  recurrence TEXT NOT NULL DEFAULT 'once' CHECK (recurrence IN ('once', 'monthly')),
+  expense_date TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX merchant_expenses_user_date ON merchant_expenses(user_id, expense_date);
+
+CREATE TABLE market_fee_rules (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  market TEXT NOT NULL,
+  cat TEXT NOT NULL DEFAULT 'all',
+  commission_pct REAL NOT NULL DEFAULT 12,
+  fulfillment_fee REAL NOT NULL DEFAULT 0,
+  closing_fee REAL NOT NULL DEFAULT 0,
+  rto_ship_multiplier REAL NOT NULL DEFAULT 1.8,
+  updated_at TEXT NOT NULL,
+  UNIQUE (user_id, market, cat)
+);
+`, `
+-- الترحيل 14: معرض صور المنتجات وفحص مطابقة شروط أمازون ونون (AI Photo Studio)
+CREATE TABLE product_images (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'gallery' CHECK (role IN ('main', 'gallery')),
+  preset TEXT NOT NULL DEFAULT '',
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  compliance_score INTEGER NOT NULL DEFAULT 0,
+  compliance_json TEXT NOT NULL DEFAULT '{}',
+  source TEXT NOT NULL DEFAULT 'upload',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX product_images_product ON product_images(user_id, product_id, role);
+`];
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');

@@ -398,11 +398,182 @@ function priceRadarBenchmark(name, catalogProducts = []) {
   return { name: cleanName, minPrice, avgPrice, maxPrice, recommended, platforms, text, source: 'benchmark', sources: [] };
 }
 
+const MAX_STUDIO_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB
+
+const STUDIO_PRESETS = {
+  amazon_main_white: {
+    id: 'amazon_main_white',
+    labelAr: 'خلفية بيضاء رسمية لأمازون',
+    descriptionAr: 'خلفية بيضاء نقية #FFFFFF مع إضاءة استوديو وملء 85% من الإطار',
+    prompt: (name, cat, hint) =>
+      `Professional Amazon.eg main e-commerce product photo of "${name}" (${cat || 'consumer product'}). Place the exact product centered on a 100% pure solid white #FFFFFF seamless studio background, occupying about 85% of the square frame. Crisp commercial softbox lighting, true-to-life colors, sharp edges, no text, no watermarks, no badges, no extra props, preserve exact product branding and details.${hint ? ` Extra direction: ${hint}` : ''}`
+  },
+  noon_pearl_podium: {
+    id: 'noon_pearl_podium',
+    labelAr: 'منصة عرض نون الفاخرة',
+    descriptionAr: 'منصة بيضاء لؤلؤية بظل أرضي ناعم متوافقة مع نون مصر',
+    prompt: (name, cat, hint) =>
+      `Luxury Noon Egypt commercial studio photo of "${name}" (${cat || 'consumer product'}) resting on a minimalist pearl-white matte geometric podium with a very soft natural contact shadow and bright clean off-white studio backdrop. Editorial e-commerce photography, razor-sharp focus, preserve exact product identity, zero text or logos added.${hint ? ` Extra direction: ${hint}` : ''}`
+  },
+  egyptian_lifestyle: {
+    id: 'egyptian_lifestyle',
+    labelAr: 'تصوير لايف ستايل واقعي',
+    descriptionAr: 'مشهد استخدام عصري دافئ يرفع معدل التحويل على السوشيال والأسواق',
+    prompt: (name, cat, hint) =>
+      `High-converting editorial lifestyle product photograph of "${name}" (${cat || 'consumer product'}) in a modern sunlit Cairo apartment setting with natural warm daylight, clean minimalist marble or oak surface, shallow depth of field. Preserve the exact product shape, color, and packaging cleanly in foreground focus, no overlaid text or watermarks.${hint ? ` Extra direction: ${hint}` : ''}`
+  },
+  infographic_clean: {
+    id: 'infographic_clean',
+    labelAr: 'تصميم إنفوجرافيك للمزايا',
+    descriptionAr: 'توزيع بصري نظيف يبرز المنتج بمساحة جانبية لعرض المزايا',
+    prompt: (name, cat, hint) =>
+      `Clean commercial e-commerce feature hero shot of "${name}" (${cat || 'consumer product'}) positioned cleanly with balanced negative space on a bright crisp studio gradient backdrop, dramatic soft rim lighting highlighting material texture and craftsmanship. High-resolution studio look, do not add unreadable gibberish text.${hint ? ` Extra direction: ${hint}` : ''}`
+  }
+};
+
+/** التحقق الصارم من Magic Bytes (PNG/JPEG/WEBP فقط — رفض SVG وأي بايتات مزيفة) */
+function detectStudioImageMagicBytes(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+  // فحص صريح لرفض SVG أو HTML/XML
+  const headText = buf.subarray(0, 64).toString('utf8').trimStart().toLowerCase();
+  if (headText.startsWith('<svg') || headText.startsWith('<?xml') || headText.startsWith('<!doctype') || headText.startsWith('<html')) {
+    return null;
+  }
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47
+    && buf[4] === 0x0D && buf[5] === 0x0A && buf[6] === 0x1A && buf[7] === 0x0A) {
+    return { ext: 'png', mime: 'image/png' };
+  }
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+    return { ext: 'jpg', mime: 'image/jpeg' };
+  }
+  if (buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return { ext: 'webp', mime: 'image/webp' };
+  }
+  return null;
+}
+
+async function generateProductStudioImage(cfg, { imageBuffer, mimeType, productName, category, preset = 'amazon_main_white', customHint = '', aspectRatio = '1:1' }) {
+  if (!Buffer.isBuffer(imageBuffer) || !imageBuffer.length) {
+    throw new HttpError(400, 'أرسل صورة منتج صالحة للمعالجة.');
+  }
+  if (imageBuffer.length > MAX_STUDIO_IMAGE_BYTES) {
+    throw new HttpError(400, 'حجم الصورة يتجاوز الحد الأقصى المسموح (٤ ميجابايت).');
+  }
+  const detected = detectStudioImageMagicBytes(imageBuffer);
+  if (!detected) {
+    throw new HttpError(400, 'صيغة الصورة غير صالحة. يُسمح بـ PNG أو JPEG أو WEBP فقط (ممنوع SVG والملفات غير الصورية).');
+  }
+  const presetObj = STUDIO_PRESETS[preset] || STUDIO_PRESETS.amazon_main_white;
+  const promptText = presetObj.prompt(str(productName || 'المنتج', 140), str(category || '', 60), str(customHint || '', 220));
+
+  if (!cfg.geminiKey) {
+    return {
+      source: 'client-studio-fallback',
+      preset: presetObj.id,
+      notice: 'مفتاح Gemini غير مضبوط على الخادم — استخدم المعالج المحلي الفوري لتجهيز الصورة بمقاس ١٦٠٠×١٦٠٠.'
+    };
+  }
+
+  const model = cfg.geminiImageModel || 'gemini-2.5-flash-image';
+  const base64Input = imageBuffer.toString('base64');
+  const effectiveMime = mimeType || detected.mime;
+  const isMockTest = cfg.fetch && cfg.fetch !== globalThis.fetch;
+
+  const extractImagePart = (json) => {
+    const parts = json?.candidates?.[0]?.content?.parts || [];
+    for (const part of parts) {
+      const inline = part?.inlineData || part?.inline_data;
+      if (inline && inline.data) {
+        return { data: inline.data, mimeType: inline.mimeType || inline.mime_type || 'image/png' };
+      }
+    }
+    return null;
+  };
+
+  try {
+    let rawOut = null;
+    if (isMockTest || !(genAiSdk && genAiSdk.GoogleGenAI)) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      const reqBody = {
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: effectiveMime, data: base64Input } },
+            { text: `${promptText} Target aspect ratio: ${aspectRatio === '4:5' ? '4:5' : '1:1'}.` }
+          ]
+        }],
+        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+      };
+      const res = await (cfg.fetch || fetch)(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': cfg.geminiKey,
+          'User-Agent': 'aistudio-build'
+        },
+        body: JSON.stringify(reqBody),
+        signal: AbortSignal.timeout(isMockTest ? 10_000 : 60_000)
+      });
+      if (!res.ok) {
+        throw new HttpError(502, `تعذر توليد الصورة عبر Gemini (HTTP ${res.status}).`, { code: 'AI_IMAGE_FAIL' });
+      }
+      const json = await res.json();
+      rawOut = extractImagePart(json);
+    } else {
+      const ai = new genAiSdk.GoogleGenAI({
+        apiKey: cfg.geminiKey,
+        httpOptions: {
+          headers: { 'User-Agent': 'aistudio-build' },
+          timeout: 60_000
+        }
+      });
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          { inlineData: { data: base64Input, mimeType: effectiveMime } },
+          `${promptText} Target aspect ratio: ${aspectRatio === '4:5' ? '4:5' : '1:1'}.`
+        ],
+        config: {
+          responseModalities: ['TEXT', 'IMAGE']
+        }
+      });
+      rawOut = extractImagePart(response);
+    }
+
+    if (!rawOut || !rawOut.data) {
+      return {
+        source: 'client-studio-fallback',
+        preset: presetObj.id,
+        notice: 'لم يُرجع النموذج صورة جديدة هذه المرة — يمكنك استخدام الإصلاح التلقائي المحلي فورًا.'
+      };
+    }
+
+    const outBuf = Buffer.from(String(rawOut.data).replace(/\s+/g, ''), 'base64');
+    const outDetected = detectStudioImageMagicBytes(outBuf);
+    if (!outDetected || outBuf.length > MAX_STUDIO_IMAGE_BYTES * 2) {
+      throw new HttpError(502, 'الصورة المُولدة غير صالحة، حاول مجددًا.', { code: 'AI_IMAGE_INVALID' });
+    }
+    return {
+      source: 'gemini-image',
+      preset: presetObj.id,
+      model,
+      buffer: outBuf,
+      mimeType: outDetected.mime,
+      ext: outDetected.ext
+    };
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    console.error('[gemini-photo-studio]', err?.message);
+    throw new HttpError(502, 'تعذر الاتصال باستوديو الصور الذكي حاليًا، يمكنك استخدام المعالج المحلي الفوري.', { code: 'AI_IMAGE_FAIL' });
+  }
+}
+
 module.exports = {
   gemini, resolveModelCandidates, supportsThinking,
   listingPrompt, templateListing, normalizeListing,
   advisorPrompt, normalizeAdvisor, rulesAdvisor,
   orderMessagePrompt, templateOrderMessage,
   sellerChatPrompt, rulesSellerAssistant, priceRadarBenchmark,
+  STUDIO_PRESETS, detectStudioImageMagicBytes, generateProductStudioImage,
   safeUrl, str
 };

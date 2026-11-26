@@ -54,7 +54,8 @@ function createRouter() {
       owner: opts.owner === true,
       moderator: opts.moderator === true,
       permission: opts.permission || null,
-      webhook: opts.webhook === true
+      webhook: opts.webhook === true,
+      maxBody: opts.maxBody || null
     });
   };
   return {

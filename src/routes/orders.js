@@ -3,6 +3,7 @@ const { HttpError, bad, text, integer, phone, email, oneOf, latin, round2, toCsv
 const { MARKETS, COURIERS, PAYMENTS, STATUS_NEXT } = require('../domain');
 const { invoicePage, awbPage } = require('../pages');
 const { sendText } = require('../http');
+const { consumeFifoCost, restoreFifoBatches } = require('../profit-engine');
 
 const STATUS_LABEL = ['قيد التجهيز', 'تم الشحن', 'تم التسليم', 'مرتجع', 'ملغي'];
 
@@ -22,6 +23,7 @@ module.exports = (r, app) => {
       q('UPDATE products SET stock = stock + ?, updated_at = ? WHERE id = ? AND user_id = ?').run(it.qty, nowIso(), it.product_id, uid);
       restored.push(it.product_id);
     }
+    try { restoreFifoBatches(q, { userId: uid, orderId }); } catch (_) {}
     return restored;
   };
 
@@ -39,12 +41,17 @@ module.exports = (r, app) => {
     }
   };
 
-  const enqueueRestocked = (uid, productIds) => {
-    if (!app.connectors || typeof app.connectors.enqueueStockPush !== 'function' || !productIds.length) return;
+  const enqueueRestocked = (uid, productIds, reason = 'order_stock_change') => {
+    if (!app.connectors || !productIds.length) return;
     for (const pid of productIds) {
       const prod = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(pid, uid);
       if (prod) {
-        try { app.connectors.enqueueStockPush(uid, prod); } catch (_) {}
+        if (typeof app.connectors.enqueueStockPush === 'function') {
+          try { app.connectors.enqueueStockPush(uid, prod); } catch (_) {}
+        }
+        if (typeof app.connectors.enqueueStockSyncForProduct === 'function') {
+          try { app.connectors.enqueueStockSyncForProduct(uid, pid, { reason }); } catch (_) {}
+        }
       }
     }
   };
@@ -142,7 +149,8 @@ module.exports = (r, app) => {
     const order = tx(() => { // خصم المخزون وتسجيل الطلب معًا: إما ينجح الاثنان أو لا شيء
       const now = nowIso();
       const lines = [];
-      let total = 0, cost = 0;
+      let total = 0;
+      let packagingTotal = 0;
       for (const [pid, qty] of wanted) {
         const p = q('SELECT * FROM products WHERE id = ? AND user_id = ?').get(pid, user.id);
         if (!p) throw bad('أحد المنتجات غير موجود');
@@ -151,25 +159,37 @@ module.exports = (r, app) => {
         if (!q('UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ? AND stock >= ?').run(qty, now, p.id, qty).changes) {
           throw new HttpError(409, `المخزون غير كافٍ لـ "${p.name}" (المتاح ${p.stock} قطعة)`);
         }
-        total += p.price * qty; cost += p.cost * qty;
+        total += p.price * qty;
+        packagingTotal += Number(p.packaging_cost || 0) * qty;
         lines.push({ p, qty });
       }
       const no = q('UPDATE users SET order_seq = order_seq + 1 WHERE id = ? RETURNING order_seq').get(user.id).order_seq;
       const itemsText = lines.map(({ p, qty }) => `${p.name}${qty > 1 ? ` (${qty} قطع)` : ''}`).join(' + ').slice(0, 500);
       const approvalStatus = user.role === 'owner' ? 'approved' : 'pending';
       const customerId = model.upsertCustomerForOrder({ userId: user.id, name: customer, phone: ph, gov, address, now });
-      const id = q(`INSERT INTO orders (user_id,no,market,customer,customer_id,phone,phone_hash,gov,address,pay,courier,total,cost_total,ship_fee,status,items,approval_status,reject_reason,source,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,'manual',?)`).run(
+      const id = Number(q(`INSERT INTO orders (user_id,no,market,customer,customer_id,phone,phone_hash,gov,address,pay,courier,total,cost_total,packaging_total,ship_fee,status,items,approval_status,reject_reason,source,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,'manual',?)`).run(
         user.id, no, market,
         model.enc(customer), customerId, model.enc(ph), model.phoneHash(ph),
         gov, model.enc(address), pay, courier,
-        Math.round(total * 100) / 100, Math.round(cost * 100) / 100, COURIERS[courier].fee, itemsText, approvalStatus, '', now
-      ).lastInsertRowid;
-      for (const { p, qty } of lines) q('INSERT INTO order_items (order_id,product_id,name,qty,price,cost) VALUES (?,?,?,?,?,?)').run(id, p.id, p.name, qty, p.price, p.cost);
+        round2(total), 0, round2(packagingTotal), COURIERS[courier].fee, itemsText, approvalStatus, '', now
+      ).lastInsertRowid);
+
+      let costTotal = 0;
+      let anyEstimated = false;
+      for (const { p, qty } of lines) {
+        const fifo = consumeFifoCost(q, { userId: user.id, productId: p.id, qty, orderId: id });
+        costTotal += fifo.totalCost;
+        if (fifo.costIsEstimated) anyEstimated = true;
+        q('INSERT INTO order_items (order_id,product_id,name,qty,price,cost) VALUES (?,?,?,?,?,?)')
+          .run(id, p.id, p.name, qty, p.price, fifo.unitCostAvg);
+      }
+      q('UPDATE orders SET cost_total = ?, cost_estimated = ? WHERE id = ?')
+        .run(round2(costTotal), anyEstimated ? 1 : 0, id);
       return q('SELECT * FROM orders WHERE id = ?').get(id);
     });
     const ids = [...wanted.keys()];
-    enqueueRestocked(user.id, ids);
+    enqueueRestocked(user.id, ids, 'manual_order_created');
     return { order: model.orderOf(order), products: productsByIds(user.id, ids), counts: model.counts(user.id) };
   });
 
@@ -194,7 +214,7 @@ module.exports = (r, app) => {
       }
       return { id: o.id, restored };
     });
-    enqueueRestocked(user.id, changed.restored);
+    enqueueRestocked(user.id, changed.restored, next === 3 ? 'order_returned' : 'order_cancelled');
     return { order: model.orderOf(find(user.id, changed.id)), products: productsByIds(user.id, changed.restored), counts: model.counts(user.id) };
   });
 
@@ -208,7 +228,7 @@ module.exports = (r, app) => {
       const restored = o.approval_status !== 'rejected' ? restoreOrderStock(o.id, user.id) : [];
       return { id: o.id, restored };
     });
-    enqueueRestocked(user.id, changed.restored);
+    enqueueRestocked(user.id, changed.restored, 'order_cancelled');
     return { order: model.orderOf(find(user.id, changed.id)), products: productsByIds(user.id, changed.restored), counts: model.counts(user.id) };
   });
 
